@@ -26,12 +26,17 @@
 //! `chunk().await` blocks forever and the task never notices. The
 //! backend emits a `:ping` comment every 15 s, so 45 s without any data
 //! is a reliable signal the stream is dead.
+//!
+//! Every request carries the app's API key (see api_key.rs). A 401/403 is
+//! logged as "unauthorized" (never the key itself) and retried with the same
+//! backoff, since the usual cause is a backend that has not finished
+//! starting with the shared key file yet.
 
 use std::time::Duration;
 
 use tauri::{AppHandle, Emitter};
 
-use crate::{ensure_dictate_window, SERVER_PORT};
+use crate::{ensure_dictate_window, resolve_app_api_key, SERVER_PORT};
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -41,13 +46,16 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// the pill from surfacing for minutes.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
-pub fn spawn_speak_monitor(app: AppHandle) {
+/// `api_key` is the bearer token for `/events/speak`, resolved by `.setup`.
+/// Pass `None` when that failed: the monitor then resolves it from the app
+/// data dir before each attempt, with the same backoff as a failed connect.
+pub fn spawn_speak_monitor(app: AppHandle, api_key: Option<String>) {
     tauri::async_runtime::spawn(async move {
-        run(app).await;
+        run(app, api_key).await;
     });
 }
 
-async fn run(app: AppHandle) {
+async fn run(app: AppHandle, mut api_key: Option<String>) {
     let url = format!("http://127.0.0.1:{}/events/speak", SERVER_PORT);
     let client = match reqwest::Client::builder().build() {
         Ok(c) => c,
@@ -61,7 +69,25 @@ async fn run(app: AppHandle) {
     let mut attempt: u32 = 0;
 
     loop {
-        let stream_result = stream_once(&client, &url, &app).await;
+        if api_key.is_none() {
+            match resolve_app_api_key(&app) {
+                Ok(key) => api_key = Some(key),
+                Err(e) => {
+                    attempt += 1;
+                    eprintln!(
+                        "speak_monitor: API key unavailable: {e} (attempt {attempt}, retry in {:?})",
+                        backoff
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+            }
+        }
+        let Some(key) = api_key.as_deref() else {
+            continue;
+        };
+        let stream_result = stream_once(&client, &url, key, &app).await;
         let had_success = matches!(stream_result, Ok(true));
 
         if had_success {
@@ -93,15 +119,22 @@ async fn run(app: AppHandle) {
 async fn stream_once(
     client: &reqwest::Client,
     url: &str,
+    api_key: &str,
     app: &AppHandle,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut resp = client
         .get(url)
+        .bearer_auth(api_key)
         .header("Accept", "text/event-stream")
         .send()
         .await?;
-    if !resp.status().is_success() {
-        return Err(format!("speak_monitor: backend returned {}", resp.status()).into());
+    let status = resp.status();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        // Never include the key here: this line ends up in the app log.
+        return Err(format!("unauthorized: backend rejected the API key ({status})").into());
+    }
+    if !status.is_success() {
+        return Err(format!("speak_monitor: backend returned {status}").into());
     }
     let mut buf = String::new();
     let mut saw_data = false;

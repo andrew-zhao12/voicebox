@@ -36,7 +36,32 @@
   "app": {
     "macOSPrivateApi": true,
     "security": {
-      "csp": null,
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "connect-src": "'self' ipc: http://ipc.localhost blob: http: https:",
+        "media-src": "'self' blob: http: https:",
+        "img-src": "'self' data: blob: http: https:",
+        "font-src": "'self' data:",
+        "object-src": "'none'",
+        "frame-src": "'none'",
+        "base-uri": "'self'",
+        "form-action": "'self'"
+      },
+      "devCsp": {
+        "default-src": "'self'",
+        "script-src": "'self' 'unsafe-inline'",
+        "style-src": "'self' 'unsafe-inline'",
+        "connect-src": "'self' ipc: http://ipc.localhost blob: http: https: ws://localhost:5173 http://localhost:5173",
+        "media-src": "'self' blob: http: https:",
+        "img-src": "'self' data: blob: http: https:",
+        "font-src": "'self' data:",
+        "object-src": "'none'",
+        "frame-src": "'none'",
+        "base-uri": "'self'",
+        "form-action": "'self'"
+      },
       "capabilities": ["default"]
     },
     "windows": [
@@ -53,7 +78,7 @@
         "titleBarStyle": "Overlay"
       }
     ],
-    "withGlobalTauri": true
+    "withGlobalTauri": false
   },
   "plugins": {
     "shell": {

@@ -23,6 +23,8 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["blocking", "json", "stream"] }
 hound = "3.5"
 base64 = "0.22"
+# API key generation (api_key.rs); already in Cargo.lock transitively at 0.8.
+rand = "0.8"
 cpal = "0.15"
 symphonia = { version = "0.5", features = ["all"] }
 scopeguard = "1.2.0"

@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod accessibility;
+mod api_key;
 mod audio_capture;
 mod audio_output;
 mod clipboard;
@@ -164,38 +165,42 @@ fn find_voicebox_pid_on_port(port: u16) -> Option<u32> {
     None
 }
 
-/// Check if a Voicebox server is responding on the given port.
+/// Check whether a Voicebox server that accepts our API key is responding on
+/// the given port.
 ///
-/// Sends an HTTP GET to `/health` and returns `true` only if the response
-/// is valid JSON matching the Voicebox `HealthResponse` schema — specifically
-/// `status` must be `"healthy"`, and both `model_loaded` and `gpu_available`
-/// must be present as booleans. This prevents misidentifying an unrelated
-/// service that happens to expose a `/health` endpoint.
+/// Sends an authenticated HTTP GET to `/health`. `Ok(true)` means the response
+/// is valid JSON matching the Voicebox `HealthResponse` schema — `status` must
+/// be `"healthy"`, and both `model_loaded` and `gpu_available` must be present
+/// as booleans (the backend only includes those fields for an authenticated
+/// caller; the keyless answer is a bare `{"status":"healthy","service":...}`).
+/// `Ok(false)` means the server answered 401/403, i.e. it rejected the key.
+/// `Err(())` means no answer, another non-2xx status, or a body that does not
+/// look like Voicebox, which prevents misidentifying an unrelated service that
+/// happens to expose a `/health` endpoint.
 #[allow(dead_code)] // Used in platform-specific cfg blocks
-fn check_health(port: u16) -> bool {
+fn check_health(port: u16, api_key: &str) -> Result<bool, ()> {
     let url = format!("http://127.0.0.1:{}/health", port);
-    match reqwest::blocking::Client::builder()
+    let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
-    {
-        Ok(client) => match client.get(&url).send() {
-            Ok(resp) => {
-                if !resp.status().is_success() {
-                    return false;
-                }
-                // Parse as JSON and validate Voicebox-specific fields
-                match resp.json::<serde_json::Value>() {
-                    Ok(body) => {
-                        body.get("status").and_then(|v| v.as_str()) == Some("healthy")
-                            && body.get("model_loaded").map(|v| v.is_boolean()).unwrap_or(false)
-                            && body.get("gpu_available").map(|v| v.is_boolean()).unwrap_or(false)
-                    }
-                    Err(_) => false,
-                }
-            }
-            Err(_) => false,
-        },
-        Err(_) => false,
+        .map_err(|_| ())?;
+    let resp = client.get(&url).bearer_auth(api_key).send().map_err(|_| ())?;
+    let status = resp.status();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Ok(false);
+    }
+    if !status.is_success() {
+        return Err(());
+    }
+    // Parse as JSON and validate Voicebox-specific fields
+    let body = resp.json::<serde_json::Value>().map_err(|_| ())?;
+    let is_voicebox = body.get("status").and_then(|v| v.as_str()) == Some("healthy")
+        && body.get("model_loaded").map(|v| v.is_boolean()).unwrap_or(false)
+        && body.get("gpu_available").map(|v| v.is_boolean()).unwrap_or(false);
+    if is_voicebox {
+        Ok(true)
+    } else {
+        Err(())
     }
 }
 
@@ -211,6 +216,11 @@ struct ServerState {
     /// default (ROCm preferred, then CUDA). Persisted to disk so the choice
     /// survives an app restart.
     backend_override: Mutex<Option<String>>,
+    /// Bearer key every request to the backend must carry. Resolved from the
+    /// app data dir (or the dev env overrides, see api_key.rs) in `.setup` and
+    /// again in `start_server`; handed to the webviews by
+    /// `get_server_credentials`. Never logged.
+    api_key: Mutex<Option<String>>,
 }
 
 fn backend_override_file(data_dir: &std::path::Path) -> std::path::PathBuf {
@@ -237,6 +247,31 @@ fn write_persisted_backend_override(data_dir: &std::path::Path, value: Option<&s
             let _ = std::fs::remove_file(&path);
         }
     }
+}
+
+/// Resolve the backend API key for this app instance from its data directory
+/// (the same directory the sidecar receives as `--data-dir`), creating the key
+/// file on first launch. Shared by `.setup`, the speak monitor and
+/// `get_server_credentials`; `start_server` calls `api_key::resolve_api_key`
+/// directly because it already has the data dir.
+pub(crate) fn resolve_app_api_key(app: &tauri::AppHandle) -> Result<String, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    api_key::resolve_api_key(&data_dir)
+}
+
+/// Error returned by `start_server` when a Voicebox server on our port rejects
+/// this app's API key. The wording deliberately avoids "port" and "already in
+/// use": App.tsx string-matches those into a health-polling loop that could
+/// never succeed against a server that rejects our key.
+fn auth_mismatch_error() -> String {
+    format!(
+        "AUTH_MISMATCH: a Voicebox server on 127.0.0.1:{} rejected this app's API key. \
+         Stop it or point the app at its key file.",
+        SERVER_PORT
+    )
 }
 
 /// Run `<exe> --version` with a 10-second timeout to avoid hanging Tauri startup.
@@ -283,8 +318,27 @@ async fn start_server(
         return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
     }
 
+    // Resolve the data directory and the API key before looking at the port:
+    // the reuse decision below needs the key, and the key file must exist
+    // before the sidecar is spawned (it reads `<data-dir>/api_key` itself; the
+    // key never travels on argv or in the environment).
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+
+    // Ensure data directory exists
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("Failed to create data dir: {}", e))?;
+
+    let api_key = api_key::resolve_api_key(&data_dir)?;
+    *state.api_key.lock().unwrap() = Some(api_key.clone());
+
     // Check if a voicebox server is already running on our port (from previous session with keep_running=true,
-    // or an externally started server e.g. via `python`, `uvicorn`, Docker, etc.)
+    // or an externally started server e.g. via `python`, `uvicorn`, Docker, etc.). Every reuse decision goes
+    // through the authenticated health check: a server that accepts our key is reused; one that rejects it
+    // (a different data dir, hence a different key file) is reported as AUTH_MISMATCH so the UI can ask the
+    // user for that server's key instead of polling forever; anything else is a foreign process on the port.
     #[cfg(unix)]
     {
         use std::process::Command;
@@ -298,33 +352,40 @@ async fn start_server(
                 if parts.len() >= 2 {
                     let command = parts[0];
                     let pid_str = parts[1];
-                    if command.contains("voicebox") {
-                        if let Ok(pid) = pid_str.parse::<u32>() {
-                            println!("Found existing voicebox-server on port {} (PID: {}), reusing it", SERVER_PORT, pid);
-                            // Store the PID so we can kill it on exit if needed
-                            *state.server_pid.lock().unwrap() = Some(pid);
+                    println!("Port {} in use by '{}' (PID: {}), checking if it's a Voicebox server...", SERVER_PORT, command, pid_str);
+                    match check_health(SERVER_PORT, &api_key) {
+                        Ok(true) => {
+                            if command.contains("voicebox") {
+                                // Our own sidecar from a previous session (keep_running=true):
+                                // remember the PID so we can kill it on exit. External servers
+                                // (python/uvicorn/Docker) are reused but never killed.
+                                if let Ok(pid) = pid_str.parse::<u32>() {
+                                    println!("Found existing voicebox-server on port {} (PID: {}), reusing it", SERVER_PORT, pid);
+                                    *state.server_pid.lock().unwrap() = Some(pid);
+                                }
+                            } else {
+                                println!("Health check passed — reusing external server on port {}", SERVER_PORT);
+                            }
                             return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
                         }
-                    } else {
-                        // Process name doesn't contain "voicebox" — could be an external
-                        // Python/uvicorn/Docker server. Verify via HTTP health check.
-                        println!("Port {} in use by '{}' (PID: {}), checking if it's a Voicebox server...", SERVER_PORT, command, pid_str);
-                        if check_health(SERVER_PORT) {
-                            println!("Health check passed — reusing external server on port {}", SERVER_PORT);
-                            return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+                        Ok(false) => {
+                            println!("Health check rejected this app's API key — not reusing the server on port {}", SERVER_PORT);
+                            return Err(auth_mismatch_error());
                         }
-                        println!("Health check failed — port is occupied by a non-Voicebox process");
-                        return Err(format!(
-                            "Port {} is already in use by another application ({}). \
-                             Close it or change the Voicebox server port.",
-                            SERVER_PORT, command
-                        ));
+                        Err(()) => {
+                            println!("Health check failed — port is occupied by a non-Voicebox process");
+                            return Err(format!(
+                                "Port {} is already in use by another application ({}). \
+                                 Close it or change the Voicebox server port.",
+                                SERVER_PORT, command
+                            ));
+                        }
                     }
                 }
             }
         }
     }
-    
+
     #[cfg(windows)]
     {
         use std::net::TcpStream;
@@ -332,24 +393,33 @@ async fn start_server(
             &format!("127.0.0.1:{}", SERVER_PORT).parse().unwrap(),
             std::time::Duration::from_secs(1),
         ).is_ok() {
-            // Port is in use — check if it's a voicebox process by name first
-            if let Some(pid) = find_voicebox_pid_on_port(SERVER_PORT) {
-                println!("Found existing voicebox-server on port {} (PID: {}), reusing it", SERVER_PORT, pid);
-                *state.server_pid.lock().unwrap() = Some(pid);
-                return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+            // Port is in use — note whether a voicebox process owns it (so its PID can
+            // be tracked), then let the authenticated health check decide about reuse.
+            let voicebox_pid = find_voicebox_pid_on_port(SERVER_PORT);
+            println!("Port {} in use, checking if it's a Voicebox server...", SERVER_PORT);
+            match check_health(SERVER_PORT, &api_key) {
+                Ok(true) => {
+                    if let Some(pid) = voicebox_pid {
+                        println!("Found existing voicebox-server on port {} (PID: {}), reusing it", SERVER_PORT, pid);
+                        *state.server_pid.lock().unwrap() = Some(pid);
+                    } else {
+                        println!("Health check passed — reusing external server on port {}", SERVER_PORT);
+                    }
+                    return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+                }
+                Ok(false) => {
+                    println!("Health check rejected this app's API key — not reusing the server on port {}", SERVER_PORT);
+                    return Err(auth_mismatch_error());
+                }
+                Err(()) => {
+                    println!("Health check failed — port is occupied by a non-Voicebox process");
+                    return Err(format!(
+                        "Port {} is already in use by another application. \
+                         Close the other application or change the Voicebox port.",
+                        SERVER_PORT
+                    ));
+                }
             }
-            // Process name doesn't match — could be an external Python/Docker server.
-            // Verify via HTTP health check before giving up.
-            println!("Port {} in use by unknown process, checking if it's a Voicebox server...", SERVER_PORT);
-            if check_health(SERVER_PORT) {
-                println!("Health check passed — reusing external server on port {}", SERVER_PORT);
-                return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
-            }
-            return Err(format!(
-                "Port {} is already in use by another application. \
-                 Close the other application or change the Voicebox port.",
-                SERVER_PORT
-            ));
         }
     }
 
@@ -405,16 +475,6 @@ async fn start_server(
     
     // Brief wait for port to be released
     std::thread::sleep(std::time::Duration::from_millis(200));
-
-    // Get app data directory
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
-
-    // Ensure data directory exists
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|e| format!("Failed to create data dir: {}", e))?;
 
     println!("=================================================================");
     println!("Starting voicebox-server sidecar");
@@ -859,17 +919,26 @@ async fn stop_server(state: State<'_, ServerState>) -> Result<(), String> {
         {
             // Send graceful shutdown via HTTP — the server's parent-pid watchdog
             // will also handle cleanup if this app process exits.
-            println!("Sending graceful shutdown via HTTP...");
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(2))
-                .build()
-                .unwrap();
+            let api_key = state.api_key.lock().unwrap().clone();
+            match api_key {
+                Some(api_key) => {
+                    println!("Sending graceful shutdown via HTTP...");
+                    let client = reqwest::blocking::Client::builder()
+                        .timeout(std::time::Duration::from_secs(2))
+                        .build()
+                        .unwrap();
 
-            let _ = client
-                .post(&format!("http://127.0.0.1:{}/shutdown", SERVER_PORT))
-                .send();
+                    let _ = client
+                        .post(&format!("http://127.0.0.1:{}/shutdown", SERVER_PORT))
+                        .bearer_auth(api_key)
+                        .send();
 
-            println!("Shutdown request sent (server watchdog will handle cleanup)");
+                    println!("Shutdown request sent (server watchdog will handle cleanup)");
+                }
+                None => println!(
+                    "stop_server: no API key resolved, skipping the HTTP shutdown request (server watchdog will handle cleanup)"
+                ),
+            }
         }
     }
     
@@ -922,6 +991,62 @@ fn set_backend_override(
         write_persisted_backend_override(&data_dir, backend.as_deref());
     }
     *state.backend_override.lock().unwrap() = backend;
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerCredentials {
+    url: String,
+    api_key: String,
+}
+
+/// Hand the backend URL and API key to a webview. The IPC ACL already limits
+/// this command to the `main` and `dictate` windows (capabilities/default.json)
+/// and the command re-checks the caller itself: only those two labels, and only
+/// while they show app content (`tauri://` on macOS/Linux, `tauri.localhost` on
+/// Windows, or the configured `devUrl` origin in debug builds). A window that
+/// navigated to any other origin gets nothing.
+#[command]
+fn get_server_credentials(
+    app: tauri::AppHandle,
+    webview: tauri::Webview,
+    state: State<'_, ServerState>,
+) -> Result<ServerCredentials, String> {
+    let label = webview.label();
+    if label != "main" && label != DICTATE_WINDOW_LABEL {
+        return Err("not allowed".to_string());
+    }
+    let url = webview.url().map_err(|_| "not allowed".to_string())?;
+    let is_app_origin = url.scheme() == "tauri" || url.host_str() == Some("tauri.localhost");
+    let is_dev_origin = cfg!(debug_assertions)
+        && app
+            .config()
+            .build
+            .dev_url
+            .as_ref()
+            .map(|dev_url| dev_url.origin() == url.origin())
+            .unwrap_or(false);
+    if !is_app_origin && !is_dev_origin {
+        return Err("not allowed".to_string());
+    }
+
+    // `.setup` normally fills this in; resolve here for the paths that skip it
+    // (Tauri dev never calls start_server, and the dictate window may ask
+    // before the main window does).
+    let cached = state.api_key.lock().unwrap().clone();
+    let api_key = match cached {
+        Some(key) => key,
+        None => {
+            let key = resolve_app_api_key(&app)?;
+            *state.api_key.lock().unwrap() = Some(key.clone());
+            key
+        }
+    };
+
+    Ok(ServerCredentials {
+        url: format!("http://127.0.0.1:{}", SERVER_PORT),
+        api_key,
+    })
 }
 
 #[command]
@@ -1391,6 +1516,7 @@ pub fn run() {
             keep_running_on_close: Mutex::new(false),
             models_dir: Mutex::new(None),
             backend_override: Mutex::new(None),
+            api_key: Mutex::new(None),
         })
         .manage(audio_capture::AudioCaptureState::new())
         .manage(audio_output::AudioOutputState::new())
@@ -1447,7 +1573,21 @@ pub fn run() {
                 });
 
                 ensure_dictate_window(app.handle());
-                speak_monitor::spawn_speak_monitor(app.handle().clone());
+
+                // Make sure the shared key file exists before anything talks to
+                // the backend, and keep the key in ServerState for the shell's
+                // own HTTP calls and for `get_server_credentials`. Failure is
+                // not fatal here: start_server resolves again and reports the
+                // error to the UI, and the speak monitor retries on its own.
+                let api_key = match resolve_app_api_key(app.handle()) {
+                    Ok(key) => Some(key),
+                    Err(e) => {
+                        eprintln!("Failed to resolve API key at startup: {}", e);
+                        None
+                    }
+                };
+                *app.state::<ServerState>().api_key.lock().unwrap() = api_key.clone();
+                speak_monitor::spawn_speak_monitor(app.handle().clone(), api_key);
             }
 
             // Hide title bar icon on Windows
@@ -1513,6 +1653,7 @@ pub fn run() {
             restart_server,
             set_keep_server_running,
             set_backend_override,
+            get_server_credentials,
             start_system_audio_capture,
             stop_system_audio_capture,
             is_system_audio_supported,
@@ -1609,16 +1750,25 @@ pub fn run() {
                             println!("Wrote keep-running sentinel to {:?}", sentinel);
                         }
 
-                        let client = reqwest::blocking::Client::builder()
-                            .timeout(std::time::Duration::from_secs(2))
-                            .build()
-                            .unwrap();
-                        match client
-                            .post(&format!("http://127.0.0.1:{}/watchdog/disable", SERVER_PORT))
-                            .send()
-                        {
-                            Ok(resp) => println!("Watchdog disable response: {}", resp.status()),
-                            Err(e) => eprintln!("Failed to disable watchdog: {}", e),
+                        let api_key = state.api_key.lock().unwrap().clone();
+                        match api_key {
+                            Some(api_key) => {
+                                let client = reqwest::blocking::Client::builder()
+                                    .timeout(std::time::Duration::from_secs(2))
+                                    .build()
+                                    .unwrap();
+                                match client
+                                    .post(&format!("http://127.0.0.1:{}/watchdog/disable", SERVER_PORT))
+                                    .bearer_auth(api_key)
+                                    .send()
+                                {
+                                    Ok(resp) => println!("Watchdog disable response: {}", resp.status()),
+                                    Err(e) => eprintln!("Failed to disable watchdog: {}", e),
+                                }
+                            }
+                            None => eprintln!(
+                                "No API key resolved; skipping the watchdog disable request (the sentinel file covers it)"
+                            ),
                         }
                     } else {
                         // Server will self-terminate via parent-pid watchdog when

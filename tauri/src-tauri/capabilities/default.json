@@ -4,9 +4,6 @@
   "description": "Default permissions for voicebox",
   "platforms": ["linux", "macOS", "windows"],
   "windows": ["main", "dictate"],
-  "remote": {
-    "urls": ["http://localhost:*"]
-  },
   "permissions": [
     "core:default",
     "core:window:default",
@@ -14,8 +11,6 @@
     "core:webview:default",
     "core:webview:allow-internal-toggle-devtools",
     "shell:allow-open",
-    "shell:allow-execute",
-    "shell:allow-spawn",
     "updater:default",
     "process:default",
     "dialog:default",
@@ -23,6 +18,30 @@
     "dialog:allow-open",
     "fs:default",
     "fs:read-all",
-    "fs:write-all"
+    "fs:write-all",
+    "allow-start-server",
+    "allow-stop-server",
+    "allow-restart-server",
+    "allow-set-keep-server-running",
+    "allow-set-backend-override",
+    "allow-get-server-credentials",
+    "allow-start-system-audio-capture",
+    "allow-stop-system-audio-capture",
+    "allow-is-system-audio-supported",
+    "allow-list-audio-output-devices",
+    "allow-play-audio-to-devices",
+    "allow-stop-audio-playback",
+    "allow-debug-clipboard-roundtrip",
+    "allow-debug-paste-text",
+    "allow-debug-capture-focus",
+    "allow-debug-focus-roundtrip",
+    "allow-check-accessibility-permission",
+    "allow-check-input-monitoring-permission",
+    "allow-open-accessibility-settings",
+    "allow-open-input-monitoring-settings",
+    "allow-paste-final-text",
+    "allow-enable-hotkey",
+    "allow-disable-hotkey",
+    "allow-update-chord-bindings"
   ]
 }
