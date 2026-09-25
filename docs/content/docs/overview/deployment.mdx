@@ -70,18 +70,25 @@ On `SIGTERM` the server stops accepting connections, finishes streams and SSE re
 
 Generated audio and captures stay forever by default. With `VOICEBOX_RETENTION_DAYS=N`, a daily sweep deletes generations older than N days that are not favourited and not placed in a story, captures older than N days, and audio files that no database row references. `POST /maintenance/prune` (admin key; optional body `{"days": N}`) runs the same sweep on demand and returns what it removed. `0` keeps nothing older than today.
 
-## 7. Backups
+## 7. Observability
+
+- **Request ids.** Every response carries `X-Request-Id` (echoed when the client sends a well-formed one). A `500` returns the same value as `error_id`, so an id reported by an application finds the traceback in the server log.
+- **JSON logs.** `VOICEBOX_LOG_FORMAT=json` switches the application and uvicorn loggers to one JSON object per line (`ts`, `level`, `logger`, `msg`, `request_id`, `key_id`, and for access lines `client`, `method`, `path`, `status`). Query strings still have media tokens and OAuth codes redacted.
+- **Metrics.** `GET /metrics` (admin key) serves Prometheus metrics: HTTP requests and latency by route, queue depth and wait, synthesis duration and characters per engine, time to the first streamed chunk, Whisper/LLM slot waits, model load times, rate-limit rejections, CUDA memory. `VOICEBOX_METRICS_PORT=9464` additionally serves them on a separate unauthenticated port for scrapers that cannot send a bearer; keep that port on a private network.
+- **Load test.** `scripts/load_test.py --url ... --key ... --voice ... --model kokoro --concurrency 4 --requests 20` streams through `/v1/audio/speech` and prints time to first byte, total time, realtime factor and the 429 count. Run it once per engine on the target hardware before choosing rate limits.
+
+## 8. Backups
 
 Everything lives in the data directory (`/app/data` in the container, the `voicebox-data` volume): `voicebox.db`, `profiles/`, `generations/`, `captures/`, `api_key` and `api_keys.json`. The database runs in WAL mode, so a file copy must include `voicebox.db-wal` and `voicebox.db-shm`, or use `sqlite3 /app/data/voicebox.db ".backup /backup/voicebox.db"` for a consistent snapshot. Keep the data directory on a local disk: SQLite's WAL is not safe on NFS.
 
 Models are cached separately (`huggingface-cache` volume or `VOICEBOX_MODELS_DIR`); they are redownloadable and need no backup.
 
-## 8. Transport and limits
+## 9. Transport and limits
 
 - Terminate TLS in front of the server: the Caddy overlay (`docker-compose.tls.yml`) does it with automatic certificates. Keys must never travel over plain HTTP outside loopback or a private network.
 - Behind your own proxy, set `FORWARDED_ALLOW_IPS` to the proxy's address so per-IP limits see the real client, and disable response buffering for `/generate/stream` and the SSE routes.
 - Per-key rate limits, upload caps and the queue depth are described in [API Keys](/overview/api-keys). Raise a key's limits in `api_keys.json` rather than turning limiting off.
 
-## 9. Upgrading
+## 10. Upgrading
 
 Pull the new image (or rebuild), then `docker compose up -d`. Schema migrations run at startup and are idempotent. Stop the old container gracefully first (see above) so in-flight generations finish, and take a backup before a major version.

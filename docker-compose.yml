@@ -39,6 +39,10 @@ services:
       - VOICEBOX_RETENTION_DAYS
       # Seconds a shutdown waits for queued generations (default 30).
       - VOICEBOX_DRAIN_TIMEOUT_S
+      # json for one JSON object per log line (request id, key id).
+      - VOICEBOX_LOG_FORMAT
+      # Prometheus exporter on an extra, unauthenticated port (keep it private).
+      - VOICEBOX_METRICS_PORT
       # Every endpoint needs an API key. Export VOICEBOX_API_KEY on the host
       # (e.g. `export VOICEBOX_API_KEY=$(openssl rand -base64 32)`) to set the
       # admin key; leave it unset and the server creates one in the data

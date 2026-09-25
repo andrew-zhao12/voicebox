@@ -116,6 +116,8 @@ ports:
 | `VOICEBOX_DRAIN_TIMEOUT_S` | `30` | How long a stop waits for queued generations before cancelling them. |
 | `VOICEBOX_DATA_DIR` | `/app/data` | Data directory (database, profiles, generated audio, keys). |
 | `LOG_LEVEL` / `VOICEBOX_LOG_LEVEL` | `info` | Log level of the application loggers (`debug`, `info`, `warning`, `error`). |
+| `VOICEBOX_LOG_FORMAT` | (plain) | `json` for one JSON object per log line with the request id and key id. |
+| `VOICEBOX_METRICS_PORT` | (unset) | Serve Prometheus metrics on this extra port without a key (the authenticated `GET /metrics` is always on). |
 
 `VOICEBOX_API_KEY`, `VOICEBOX_DISABLE_DOCS`, `VOICEBOX_CORS_ORIGINS`, `VOICEBOX_PRELOAD_MODELS`, `VOICEBOX_RETENTION_DAYS` and `VOICEBOX_DRAIN_TIMEOUT_S` are forwarded from the shell you run `docker compose` in. Set the others under `environment:` in a `docker-compose.override.yml`. The [Deployment Checklist](/overview/deployment) explains how they fit together.
 
