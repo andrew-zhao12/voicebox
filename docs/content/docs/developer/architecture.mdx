@@ -247,15 +247,18 @@ See [Building](/developer/building) for what PyInstaller does and how the CUDA b
 ### Current
 
 - Local-only by default (bound to `127.0.0.1:17493`)
-- No authentication (localhost trust)
-- File system sandboxing via Tauri
+- Bearer API keys on every endpoint, including `/mcp`, the docs routes and unknown paths. Two roles: `admin` (desktop app, operators) and `client` (your own apps). See [API Keys](/overview/api-keys).
+- Per-key rate limits (requests, inference calls, TTS characters, upload bytes, pending queued jobs), per-IP limits for anonymous and failed requests, a global queue depth, and per-route request-body caps
+- Short-lived media tokens for browser loads that cannot send headers (`EventSource`, `<audio>`, `<img>`)
+- Unexpected errors are masked (`{"detail": "Internal server error", "error_id": ...}`), access logs redact tokens, and every response carries `X-Content-Type-Options`, `X-Frame-Options` and `Referrer-Policy`
+- HTTPS via a reverse proxy (`docker-compose.tls.yml` ships Caddy with automatic certificates)
+- File system sandboxing via Tauri; the desktop shell declares an explicit command allowlist and a Content Security Policy
+
+The middleware stack, outermost first, is CORS → security headers → auth → rate limit → body limit → `ClientIdMiddleware` → router. It lives in `backend/auth/`; `backend/auth/policy.py` is the single place routes are classified as public, client or admin, and `tests/test_route_classification.py` fails when a new route is missing from it.
 
 ### Planned
 
-- API key authentication for remote mode
-- User accounts
-- Rate limiting
-- HTTPS support
+- User accounts and per-key ownership of profiles and generations
 
 ## Deployment Modes
 

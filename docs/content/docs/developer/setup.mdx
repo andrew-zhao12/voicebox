@@ -290,7 +290,8 @@ bun run tauri dev
   </Accordion>
 
   <Accordion title="OpenAPI client generation fails">
-    - Ensure backend is running: `curl http://localhost:17493/openapi.json`
+    - Ensure backend is running: `curl http://localhost:17493/health`
+    - The script sends the dev API key from `data/api_key` (`just api-key` creates it)
     - Check network connectivity
     - Verify the backend is accessible at localhost:17493
   </Accordion>

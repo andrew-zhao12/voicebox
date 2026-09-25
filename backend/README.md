@@ -91,26 +91,38 @@ Detection is handled by `utils/platform_detect.py`. Both backends implement the 
 | Models | `/models` | Load, unload, download, migrate, status |
 | Tasks | `/tasks`, `/cache` | Active task tracking, cache management |
 | CUDA | `/backend/cuda-*` | CUDA binary download and management |
+| Auth | `/auth` | `whoami`, media tokens, API key management (admin) |
+
+### Authentication
+
+Every endpoint requires `Authorization: Bearer <key>`. Keys come from `VOICEBOX_API_KEY`, else the `api_key` file the server creates in its data directory on first start (`just api-key` prints the dev one), plus the hashed `api_keys.json` store managed with `python -m backend.keys` or the admin `/auth/keys` routes. `admin` keys can do everything; `client` keys (for your own apps) can generate, stream, speak, transcribe and read profiles. Browser loads that cannot send headers use `POST /auth/media-token` and `?token=`. `GET /health` answers `{"status": "healthy", "service": "voicebox"}` without a key. Details: `docs/content/docs/overview/api-keys.mdx`.
 
 ### Quick examples
 
 ```bash
+export VOICEBOX_API_KEY="$(just api-key)"
+
 # Generate speech
 curl -X POST http://localhost:17493/generate \
+  -H "Authorization: Bearer $VOICEBOX_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello world", "profile_id": "...", "language": "en"}'
 
 # List profiles
-curl http://localhost:17493/profiles
+curl -H "Authorization: Bearer $VOICEBOX_API_KEY" http://localhost:17493/profiles
 
 # Stream generation status (SSE)
-curl http://localhost:17493/generate/{id}/status
+curl -H "Authorization: Bearer $VOICEBOX_API_KEY" http://localhost:17493/generate/{id}/status
 
 # Stream audio while it is synthesized (WAV with unknown length, or "format": "pcm")
 curl -N -X POST http://localhost:17493/generate/stream \
+  -H "Authorization: Bearer $VOICEBOX_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"text": "First sentence. Second sentence.", "profile_id": "..."}' \
   | ffplay -nodisp -autoexit -
+
+# Create a client key for one of your apps (printed once)
+backend/venv/bin/python -m backend.keys create --id myapp --role client
 ```
 
 ## Data directory

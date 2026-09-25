@@ -5,7 +5,7 @@ description: "Connect to a GPU server for faster generation"
 
 ## Overview
 
-Remote Mode allows you to run the Voicebox backend on a separate machine (like a GPU server) while using the desktop app on your local machine.
+Remote Mode allows you to run the Voicebox backend on a separate machine (like a GPU server) while using the desktop app or the web UI on your local machine.
 
 ## Use Cases
 
@@ -17,6 +17,8 @@ Remote Mode allows you to run the Voicebox backend on a separate machine (like a
 ## Architecture
 
 In Remote Mode, the Voicebox desktop app (running on your local machine) communicates with the backend server (running on a remote machine) via HTTP. The local app provides only the user interface, while the remote server handles all the heavy processing including the TTS models, API endpoints, and audio generation.
+
+Every request carries an [API key](/overview/api-keys). The server answers only callers that present one, so the key is what you hand to each client, whether that is the desktop app, the web UI, an agent, or your own code.
 
 ## Setting Up Remote Mode
 
@@ -43,14 +45,27 @@ In Remote Mode, the Voicebox desktop app (running on your local machine) communi
     Or just run `just setup` from the repo root, which handles all of this.
   </Step>
 
+  <Step title="Choose an API Key">
+    ```bash
+    # Back to the repo root
+    cd ..
+
+    # A random admin key; you will enter it on every client
+    export VOICEBOX_API_KEY="$(openssl rand -base64 32)"
+    echo "$VOICEBOX_API_KEY"
+    ```
+
+    If you skip this, the server writes a key to `data/api_key` on first start and `python -m backend.keys local` prints it. Either way, keep the key somewhere safe.
+  </Step>
+
   <Step title="Start the Server">
     ```bash
-    # Allow external connections
-    uvicorn main:app --host 0.0.0.0 --port 17493
+    # Run from the repo root; --host 0.0.0.0 allows external connections
+    uvicorn backend.main:app --host 0.0.0.0 --port 17493
     ```
 
     <Callout type="warn">
-      This exposes the server to your network. Use a firewall or VPN for security.
+      This exposes the server to your network. Callers need the API key, but plain HTTP shows that key to anyone on the path between client and server. Stay on a trusted LAN or VPN, or put HTTPS in front (see [Security Considerations](#security-considerations)).
     </Callout>
   </Step>
 
@@ -66,27 +81,37 @@ In Remote Mode, the Voicebox desktop app (running on your local machine) communi
 
 ### On the Client
 
+Every client asks for the same two things: the server URL and the API key.
+
+**Web UI** (a [Docker](/overview/docker) install, or `just dev-web`) opens on a **Connect** screen:
+
 <Steps>
-  <Step title="Open Settings">
-    In Voicebox, go to **Settings → Server**
-  </Step>
-
-  <Step title="Enable Remote Mode">
-    Toggle **Use Remote Server**
-  </Step>
-
-  <Step title="Enter Server URL">
+  <Step title="Enter the Server URL">
     ```
     http://<server-ip>:17493
     ```
 
-    Replace `<server-ip>` with your server's IP address
+    Replace `<server-ip>` with your server's IP address, or use `https://<your-domain>` once TLS is in front of the server.
   </Step>
 
-  <Step title="Test Connection">
-    Click **Test Connection** to verify
+  <Step title="Paste the API Key">
+    The field is masked like a password. The browser keeps the URL and key in its local storage until you disconnect from **Settings → General**.
+  </Step>
+
+  <Step title="Test, then Connect">
+    **Test** shows the key's id and role as the server sees them. The UI needs an `admin` key; a `client` key is refused here. **Connect** loads the app.
   </Step>
 </Steps>
+
+**Desktop app**: go to **Settings → General**, set the server URL, paste the key into the API-key row next to it and click **Test**.
+
+<Callout type="info">
+  The desktop app reconnects to its bundled local server every time it launches, so a remote URL and key apply to the current session. Enter them again after a restart.
+</Callout>
+
+### Using the Desktop App as the Server
+
+The desktop app can be the server for other devices. In **Settings → General**, turn on **Allow network access** and restart the app; the bundled server then listens on all interfaces instead of only `127.0.0.1`. Other devices connect with the app's own key, which you can copy from **Settings → MCP → Copy API key**. That key is an admin key travelling over plain HTTP, so keep this to a trusted network.
 
 ## Cloud Deployment
 
@@ -95,7 +120,7 @@ In Remote Mode, the Voicebox desktop app (running on your local machine) communi
 ```bash
 # Launch a GPU instance (e.g., g4dn.xlarge)
 # Install dependencies
-# Start server with --host 0.0.0.0
+# Export VOICEBOX_API_KEY, then start the server with --host 0.0.0.0
 ```
 
 ### Vast.ai
@@ -103,7 +128,7 @@ In Remote Mode, the Voicebox desktop app (running on your local machine) communi
 ```bash
 # Rent a GPU instance
 # SSH in and clone repo
-# Start server
+# Export VOICEBOX_API_KEY, then start the server
 ```
 
 ### RunPod
@@ -111,20 +136,36 @@ In Remote Mode, the Voicebox desktop app (running on your local machine) communi
 ```bash
 # Deploy a pod with CUDA support
 # Install Voicebox backend
-# Expose port 17493
+# Export VOICEBOX_API_KEY, expose port 17493
 ```
 
 ## Security Considerations
 
+Every endpoint requires an API key, so nobody without one can use a server on the network. The key is the only secret, though, and plain HTTP reveals it to anyone on the path between client and server.
+
 <Callout type="warn">
-  The API currently has no authentication. Only use on trusted networks or with a VPN.
+  Keys must only travel over loopback or HTTPS. Plain HTTP is fine on a trusted LAN or through a VPN; anything reachable from the internet needs TLS in front of the server.
 </Callout>
 
 **Best Practices:**
-- Use a VPN (WireGuard, Tailscale) instead of exposing to the internet
-- Run behind a reverse proxy with authentication (nginx + basic auth)
-- Use HTTPS with SSL certificates
+- Use a VPN (WireGuard, Tailscale) instead of exposing the port to the internet
+- Terminate TLS in a reverse proxy. With Docker, the bundled Caddy overlay does it for you: `VOICEBOX_DOMAIN=voice.example.com docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d` (see [Docker Deployment](/overview/docker#tls-with-caddy)). Basic auth is not needed; the API key already authenticates every request.
+- Give each app or agent its own `client` key and keep the admin key for the UI (see [API Keys](/overview/api-keys)); revoke a key the moment it leaks
+- Set `VOICEBOX_DISABLE_DOCS=1` on servers that don't need the interactive API docs
+- Behind your own proxy, set `FORWARDED_ALLOW_IPS` to the proxy's address so per-IP rate limits see the real client, and never `*` on a published port
 - Firewall rules to limit access to specific IPs
+
+On a bare host, this Caddyfile is enough for automatic HTTPS in front of the server:
+
+```
+voice.example.com {
+    reverse_proxy 127.0.0.1:17493 {
+        flush_interval -1
+    }
+}
+```
+
+`flush_interval -1` keeps progress streams and streamed audio unbuffered. With any other proxy, disable response buffering for `/generate/stream` and the SSE routes the same way.
 
 ## Performance
 

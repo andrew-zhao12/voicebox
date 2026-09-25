@@ -31,8 +31,15 @@ coming out of your machine.
 claude mcp add voicebox \
   --transport http \
   --url http://127.0.0.1:17493/mcp \
+  --header "Authorization: Bearer $VOICEBOX_API_KEY" \
   --header "X-Voicebox-Client-Id: claude-code"
 ```
+
+Every request needs an API key. On the machine that runs the desktop app,
+**Settings → MCP → Copy API key** gives you the app's admin key; for a
+headless server, create a client key with `python -m backend.keys create --id claude-code --role client`
+(see [API Keys](/overview/api-keys)). A checked-in `.mcp.json` can reference the
+key as `${VOICEBOX_API_KEY}` so the secret stays in your environment.
 
 ### Cursor / Windsurf / VS Code MCP / any HTTP MCP client
 
@@ -43,15 +50,19 @@ Drop this into the client's MCP config (usually `.mcp.json` or a Settings UI):
   "mcpServers": {
     "voicebox": {
       "url": "http://127.0.0.1:17493/mcp",
-      "headers": { "X-Voicebox-Client-Id": "cursor" }
+      "headers": {
+        "Authorization": "Bearer vbx_...",
+        "X-Voicebox-Client-Id": "cursor"
+      }
     }
   }
 }
 ```
 
-Change `cursor` to whatever name you want the binding to show up as in
-Voicebox → Settings → MCP. The value is just an identifier for the
-per-client voice binding — not a secret, not a credential.
+`Authorization` carries the API key and is the credential. Change `cursor`
+to whatever name you want the binding to show up as in Voicebox → Settings →
+MCP; that value is just an identifier for the per-client voice binding, not
+a secret.
 
 ### Clients that only speak stdio
 
@@ -65,7 +76,7 @@ the client at that binary's absolute path:
     "mcpServers": {
       "voicebox": {
         "command": "/Applications/Voicebox.app/Contents/MacOS/voicebox-mcp",
-        "env": { "VOICEBOX_CLIENT_ID": "claude-desktop" }
+        "env": { "VOICEBOX_CLIENT_ID": "claude-desktop", "VOICEBOX_API_KEY": "vbx_..." }
       }
     }
   }
@@ -77,7 +88,7 @@ the client at that binary's absolute path:
     "mcpServers": {
       "voicebox": {
         "command": "C:\\Program Files\\Voicebox\\voicebox-mcp.exe",
-        "env": { "VOICEBOX_CLIENT_ID": "claude-desktop" }
+        "env": { "VOICEBOX_CLIENT_ID": "claude-desktop", "VOICEBOX_API_KEY": "vbx_..." }
       }
     }
   }
@@ -89,7 +100,7 @@ the client at that binary's absolute path:
     "mcpServers": {
       "voicebox": {
         "command": "/opt/voicebox/voicebox-mcp",
-        "env": { "VOICEBOX_CLIENT_ID": "claude-desktop" }
+        "env": { "VOICEBOX_CLIENT_ID": "claude-desktop", "VOICEBOX_API_KEY": "vbx_..." }
       }
     }
   }
@@ -99,7 +110,9 @@ the client at that binary's absolute path:
 
 The shim waits up to 30 seconds for the Voicebox backend to come up, then
 proxies JSON-RPC from stdio over Streamable HTTP. Voicebox must be running
-for the shim to connect.
+for the shim to connect. `VOICEBOX_API_KEY` is optional on the machine that
+runs the desktop app: the shim finds the app's own key file automatically
+(set `VOICEBOX_API_KEY_FILE` to point it elsewhere).
 
 ## Tools
 
@@ -221,6 +234,7 @@ don't speak MCP — shell scripts, ACP, A2A, GitHub Actions, whatever.
 
 ```bash
 curl -X POST http://127.0.0.1:17493/speak \
+  -H "Authorization: Bearer $VOICEBOX_API_KEY" \
   -H 'Content-Type: application/json' \
   -H 'X-Voicebox-Client-Id: ci' \
   -d '{"text":"Build complete.","profile":"Morgan"}'
@@ -252,15 +266,18 @@ generation land in the Captures tab.
 
 ## Security
 
-- **Localhost only.** The server binds to `127.0.0.1`. If you ever point
-  Voicebox at a non-loopback interface (e.g. remote-mode over a trusted
-  network), add a bearer token — it's on the roadmap but not in 0.5.0.
-- **No auth today.** Any process that can connect to your loopback can
-  call MCP. That's the same trust boundary as the rest of Voicebox's REST
-  API and is appropriate for a single-user local tool.
-- **`audio_path` reads are unrestricted** against the same trust
-  boundary. If you're scripting against a shared host, prefer
-  `audio_base64` so you don't have to think about path sandboxing.
+- **Every call needs an API key.** `/mcp` is covered by the same bearer
+  authentication as the REST API; an agent without a key gets `401`. Give
+  agents on other machines a `client` key rather than the admin key, and
+  send it only over loopback or HTTPS. See [API Keys](/overview/api-keys).
+- **Client keys get the speaking tools only.** `voicebox.speak`,
+  `voicebox.transcribe` (base64 audio) and `voicebox.list_profiles` work
+  with a client key; `voicebox.list_captures` returns your dictation
+  transcripts and needs an admin key. Tool calls count against the key's
+  inference rate limit.
+- **`audio_path` reads need an admin key on loopback.** Remote callers and
+  client keys must send `audio_base64`, so a server on a shared network can
+  never be used to read local files.
 - **Voice cloning consent applies.** See [Voice Cloning](/overview/voice-cloning#limitations)
   — an agent being able to call `voicebox.speak` in someone's voice
   doesn't change the ethics of whose voices you clone.

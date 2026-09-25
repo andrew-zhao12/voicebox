@@ -283,31 +283,39 @@ Use cases: agent dev loops (dictate a question, hear the answer in a cloned voic
 
 Voicebox exposes a REST API for integrating voice I/O into your own apps and agents.
 
+Every endpoint requires an API key sent as a bearer token. The desktop app creates its own (copy it from **Settings → MCP**), `just api-key` prints the development key, and `python -m backend.keys create --id myapp --role client` mints a key for one of your apps with its own rate limits. See the [API keys guide](https://docs.voicebox.sh/overview/api-keys).
+
 ```bash
+export VOICEBOX_API_KEY="vbx_..."
+
 # Generate speech
 curl -X POST http://127.0.0.1:17493/generate \
+  -H "Authorization: Bearer $VOICEBOX_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello world", "profile_id": "abc123", "language": "en"}'
 
 # Stream speech sentence by sentence while it is still being synthesized
 curl -N -X POST http://127.0.0.1:17493/generate/stream \
+  -H "Authorization: Bearer $VOICEBOX_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello world. Here comes the rest.", "profile_id": "abc123"}' \
   | ffplay -nodisp -autoexit -
 
 # Agent voice output — any app or script can speak in a cloned voice
 curl -X POST http://127.0.0.1:17493/speak \
+  -H "Authorization: Bearer $VOICEBOX_API_KEY" \
   -H "Content-Type: application/json" \
   -H "X-Voicebox-Client-Id: my-script" \
   -d '{"text": "Deploy complete.", "profile": "Morgan"}'
 
 # Transcribe an audio file
 curl -X POST http://127.0.0.1:17493/transcribe \
+  -H "Authorization: Bearer $VOICEBOX_API_KEY" \
   -F "audio=@recording.wav" \
   -F "model=whisper-turbo"
 
 # List voice profiles
-curl http://127.0.0.1:17493/profiles
+curl -H "Authorization: Bearer $VOICEBOX_API_KEY" http://127.0.0.1:17493/profiles
 ```
 
 `POST /speak` accepts `profile` as a name (case-insensitive) or id, and resolves via the same precedence as the MCP tool: explicit arg → per-client binding → `capture_settings.default_playback_voice_id`.

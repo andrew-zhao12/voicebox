@@ -12,10 +12,17 @@ Voicebox can run as a Docker container with a full web UI -- no desktop app requ
 ```bash
 git clone https://github.com/jamiepine/voicebox.git
 cd voicebox
-docker compose up
+
+# The admin API key the server will accept. Optional: leave it unset and the
+# container generates one (see "Reading the API key" below).
+export VOICEBOX_API_KEY="$(openssl rand -base64 32)"
+
+docker compose up --build
 ```
 
-Open [http://localhost:17493](http://localhost:17493) in your browser. The full Voicebox UI is served directly from the backend.
+Open [http://localhost:17600](http://localhost:17600) in your browser. The full Voicebox UI is served directly from the backend. The host port is 17600 so that an installed desktop app can keep 17493; inside the container the server still listens on 17493.
+
+The UI opens on a **Connect** screen. Enter the server URL (`http://localhost:17600`) and the API key, click **Test** to confirm the server recognises the key, then **Connect**. The browser remembers both in its local storage; use **Settings → General** to disconnect or switch servers.
 
 <Callout type="info">
   The first build takes a few minutes (compiling the frontend, installing Python dependencies). Subsequent starts are fast thanks to Docker layer caching.
@@ -29,13 +36,13 @@ The Docker image uses a 3-stage build:
 2. **Backend** -- installs Python dependencies and TTS model packages
 3. **Runtime** -- combines both into a minimal image running the FastAPI server
 
-The backend serves the web UI automatically when the built frontend is present. All API routes work exactly as they do in the desktop app.
+The backend serves the web UI automatically when the built frontend is present. All API routes work exactly as they do in the desktop app, and every one of them requires an [API key](/overview/api-keys); only the UI's static files and a minimal `/health` answer without one, so that the Connect screen can load.
 
 ## Configuration
 
 ### docker-compose.yml
 
-The default `docker-compose.yml` binds to localhost only, mounts persistent volumes for data and model cache, and sets sensible resource limits:
+The default `docker-compose.yml` binds to localhost only, passes the security-related variables through from your shell, mounts persistent volumes for data and model cache, and sets sensible resource limits:
 
 ```yaml
 services:
@@ -44,13 +51,18 @@ services:
     container_name: voicebox
     restart: unless-stopped
     ports:
-      - "127.0.0.1:17493:17493"
+      - "127.0.0.1:17600:17493"
     volumes:
       - ./output:/app/data/generations
       - voicebox-data:/app/data
       - huggingface-cache:/home/voicebox/.cache/huggingface
     environment:
-      - LOG_LEVEL=info
+      - VOICEBOX_API_KEY        # forwarded from your shell when set
+      - VOICEBOX_DISABLE_DOCS
+      - VOICEBOX_CORS_ORIGINS
+      - NUMBA_CACHE_DIR=/tmp/numba_cache
+    security_opt:
+      - no-new-privileges:true
     deploy:
       resources:
         limits:
@@ -58,26 +70,49 @@ services:
           memory: 8G
 ```
 
+### Reading the API key
+
+If `VOICEBOX_API_KEY` was unset when the container first started, the server generated an admin key in the `voicebox-data` volume:
+
+```bash
+docker compose exec voicebox cat /app/data/api_key
+```
+
+That key survives restarts and rebuilds as long as the volume exists. To switch to a fixed key later, export `VOICEBOX_API_KEY` and run `docker compose up -d` again.
+
+For your own apps, create separate `client` keys instead of sharing the admin key:
+
+```bash
+docker compose exec -u voicebox voicebox python -m backend.keys create --id myapp --role client
+```
+
+See [API Keys](/overview/api-keys) for what client keys can do and how to manage them over the REST API.
+
 ### Exposing to Your Network
 
 By default the container only listens on `127.0.0.1`. To allow other machines on your network to connect, change the port binding:
 
 ```yaml
 ports:
-  - "0.0.0.0:17493:17493"
+  - "0.0.0.0:17600:17493"
 ```
 
 <Callout type="warn">
-  The API has no built-in authentication. Only expose to trusted networks, or put a reverse proxy with auth in front of it.
+  Every request still needs the API key, but plain HTTP shows that key to anyone on the network path. Only expose the port on a trusted LAN or VPN. For anything further, use the [TLS overlay](#tls-with-caddy) instead of publishing the port.
 </Callout>
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LOG_LEVEL` | `info` | Logging verbosity (`debug`, `info`, `warning`, `error`) |
+| `VOICEBOX_API_KEY` | (unset) | Admin API key. When unset, the container generates one at `/app/data/api_key`. |
+| `VOICEBOX_DISABLE_DOCS` | (unset) | Set to `1` to remove `/docs`, `/redoc` and `/openapi.json`. Recommended for headless servers. |
+| `VOICEBOX_CORS_ORIGINS` | (local origins) | Additional browser origins allowed to call the API, comma-separated. Needed when your own web app calls the API directly from the browser. |
+| `VOICEBOX_RATE_LIMITING` | `1` | Set to `0` to disable the per-key rate limits. The queue depth and upload caps stay. |
+| `FORWARDED_ALLOW_IPS` | loopback | Proxies whose `X-Forwarded-For` header the server trusts for per-IP limits. The TLS overlay sets it; never use `*` on a published port. |
 | `VOICEBOX_MODELS_DIR` | (HuggingFace cache) | Custom path for model storage |
-| `VOICEBOX_CORS_ORIGINS` | (local origins) | Additional CORS origins, comma-separated |
+
+`VOICEBOX_API_KEY`, `VOICEBOX_DISABLE_DOCS` and `VOICEBOX_CORS_ORIGINS` are forwarded from the shell you run `docker compose` in. Set the others under `environment:` in a `docker-compose.override.yml`.
 
 ### Resource Limits
 
@@ -100,7 +135,7 @@ deploy:
 | Volume | Container Path | Purpose |
 |--------|---------------|---------|
 | `./output` | `/app/data/generations` | Generated audio files (bind-mount, easy access from host) |
-| `voicebox-data` | `/app/data` | Profiles, database, cache |
+| `voicebox-data` | `/app/data` | Profiles, database, cache, API keys |
 | `huggingface-cache` | `/home/voicebox/.cache/huggingface` | Downloaded models (persists across rebuilds) |
 
 The `huggingface-cache` volume is important -- without it, models would be re-downloaded every time the container is rebuilt.
@@ -149,35 +184,44 @@ The default configuration runs on CPU. This works fine but generation will be sl
 
 The Docker image follows security best practices:
 
+- **API keys on every endpoint** -- nothing but the UI's static files and a minimal `/health` answers without a key. Per-key rate limits and upload caps apply. See [API Keys](/overview/api-keys).
 - **Non-root user** -- the server runs as `voicebox`, not `root`
+- **No privilege escalation** -- the container runs with `no-new-privileges`
 - **Localhost binding** -- only accessible from the host machine by default
-- **Health checks** -- automatic restart if the server hangs (`/health` endpoint polled every 30s)
+- **Health checks** -- automatic restart if the server hangs (the public, minimal `/health` is polled every 30s)
 - **CORS restricted** -- only local origins allowed by default
+- **Hardened responses** -- security headers on every response; unexpected errors return an `error_id` instead of details, which you can look up in `docker compose logs voicebox`
 
-### Running Behind a Reverse Proxy
+### TLS with Caddy
 
-For production deployments, put Voicebox behind nginx or Caddy with TLS and authentication:
+For anything beyond a trusted LAN, run the TLS overlay. It adds a Caddy reverse proxy with automatic HTTPS, stops publishing the backend port, and makes Caddy the only way in:
 
-```nginx
-server {
-    listen 443 ssl;
-    server_name voicebox.example.com;
-
-    ssl_certificate /etc/ssl/certs/voicebox.pem;
-    ssl_certificate_key /etc/ssl/private/voicebox.key;
-
-    auth_basic "Voicebox";
-    auth_basic_user_file /etc/nginx/.htpasswd;
-
-    location / {
-        proxy_pass http://127.0.0.1:17493;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-}
+```bash
+export VOICEBOX_DOMAIN=voice.example.com
+export VOICEBOX_API_KEY="$(openssl rand -base64 32)"
+docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
 ```
 
+Requirements:
+
+- `VOICEBOX_DOMAIN` must resolve to this host, and ports 80 and 443 must be reachable from the internet so Caddy can obtain and renew its certificate.
+- If a web app on another origin calls the API directly from the browser, set `VOICEBOX_CORS_ORIGINS` to that origin (for example `https://app.example.com`).
+
+The overlay mounts `deploy/Caddyfile`, which proxies to the backend with responses unbuffered (`flush_interval -1`, so progress events and streamed audio arrive as they are produced) and adds HSTS. It also sets `FORWARDED_ALLOW_IPS` so per-IP rate limits see the real client address, which is safe only because the backend port is no longer published. Certificates persist in the `caddy-data` volume.
+
+Clients then use `https://voice.example.com` as the server URL, with the same API key.
+
+If you already run your own reverse proxy (nginx, Traefik, Caddy on the host), point it at `127.0.0.1:17600`, keep the port bound to localhost, disable response buffering for `/generate/stream` and the SSE routes, and set `FORWARDED_ALLOW_IPS` to the proxy's address. Basic auth is not needed; the API key already authenticates every request.
+
 ## Troubleshooting
+
+### The Connect screen rejects the key
+
+**Test** fails with **Unauthorized**: the key doesn't match what the server has. Compare it with `docker compose exec voicebox cat /app/data/api_key`, or with the `VOICEBOX_API_KEY` you exported (the variable must be set in the shell that ran `docker compose up`). **Forbidden** means the key is a `client` key; the UI needs an `admin` key.
+
+### Opening an API path in the browser shows the UI
+
+Navigating to `http://localhost:17600/captures` (or any other API path) in the address bar shows the web UI instead of JSON. That is expected: browser navigations don't carry the API key, so the server serves the app. Use `curl` or `fetch` with the `Authorization` header to call the API.
 
 ### Container starts but UI shows JSON
 
@@ -212,10 +256,10 @@ deploy:
 ### Port already in use
 
 ```bash
-# Check what's using port 17493
-lsof -i :17493
+# Check what's using port 17600
+lsof -i :17600
 
-# Or use a different port
+# Or use a different host port
 ports:
   - "127.0.0.1:8080:17493"
 ```
@@ -226,7 +270,7 @@ We plan to publish prebuilt Docker images to GitHub Container Registry so you wo
 
 ```bash
 # Not available yet — coming in a future release
-docker run -p 17493:17493 ghcr.io/jamiepine/voicebox:latest
+docker run -p 17493:17493 -e VOICEBOX_API_KEY ghcr.io/jamiepine/voicebox:latest
 ```
 
 The CPU image will be ~3-4 GB (Python + PyTorch + TTS packages). A separate CUDA tag (~6-8 GB) will be available for NVIDIA GPU users. This is normal for ML containers.
@@ -235,6 +279,6 @@ For now, use `docker compose up` to build from source as described above.
 
 ## Connecting the Desktop App
 
-You can also use the desktop app as a frontend for a Docker-hosted backend. In the desktop app, go to **Settings -> Server**, enable **Remote Mode**, and enter `http://<server-ip>:17493`.
+You can also use the desktop app as a frontend for a Docker-hosted backend. In the desktop app, go to **Settings → General**, enter `http://<server-ip>:17600` as the server URL and the container's API key next to it, and click **Test**. The desktop app reconnects to its own bundled server on each launch, so enter the remote details again after a restart.
 
 See the [Remote Mode guide](/overview/remote-mode) for details.

@@ -189,18 +189,27 @@ Differences from `/generate`:
 - Headers wait for the first chunk, which includes queue wait and model load. Give clients a read timeout that covers both.
 
 ```bash
+# Every request needs an API key (`just api-key` prints the dev one)
+export VOICEBOX_API_KEY="$(just api-key)"
+
 # Play as it arrives (WAV with unknown length)
 curl -N -X POST http://127.0.0.1:17493/generate/stream \
+  -H "Authorization: Bearer $VOICEBOX_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"profile_id": "<id>", "engine": "kokoro", "text": "First sentence. Second sentence."}' \
   | ffplay -nodisp -autoexit -
 
 # Raw PCM for programmatic clients; the rate is in X-Voicebox-Sample-Rate
 curl -N -X POST http://127.0.0.1:17493/generate/stream \
+  -H "Authorization: Bearer $VOICEBOX_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"profile_id": "<id>", "text": "Hello there.", "format": "pcm"}' \
   | ffplay -f s16le -ar 24000 -ac 1 -nodisp -autoexit -
 ```
+
+A `client` key may call `/generate` and `/generate/stream` only for models that
+are already downloaded; it gets `400` otherwise. Text counts against the key's
+per-minute character budget and a full queue answers `429` with `Retry-After`.
 
 ## Instruct Mode
 

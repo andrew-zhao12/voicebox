@@ -74,7 +74,7 @@ export function ApiSection() {
 					<p className="text-muted-foreground max-w-2xl mx-auto">
 						Every engine you download becomes a REST endpoint on your machine.
 						Build apps, games, and voice tools with full programmatic control —
-						no API keys, no rate limits, no per-character fees.
+						your own API keys, no cloud account, no rate limits, no per-character fees.
 					</p>
 				</div>
 
