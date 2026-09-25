@@ -245,6 +245,10 @@ class PyTorchTTSBackend:
         return audio, sample_rate
 
 
+# Whisper processes 30 s of 16 kHz audio per window.
+WHISPER_WINDOW_SAMPLES = 30 * 16000
+
+
 class PyTorchSTTBackend:
     """PyTorch-based STT backend using Whisper."""
 
@@ -340,13 +344,27 @@ class PyTorchSTTBackend:
 
             # Inference runs with the process's default HF_HUB_OFFLINE
             # state — forcing offline here (issue #462) broke online users
-            # whose `get_decoder_prompt_ids` / tokenizer calls issue
-            # legitimate metadata lookups.
-            # Process audio
+            # whose tokenizer calls issue legitimate metadata lookups.
+            #
+            # Whisper's feature extractor pads or truncates to one 30 s window
+            # by default, which silently dropped everything after 30 s.  For
+            # longer audio keep the full spectrogram and pass the attention
+            # mask so ``generate`` decodes it window by window (transformers
+            # >= 4.37).  Short clips keep the padded single window the encoder
+            # expects.
+            long_form = len(audio) > WHISPER_WINDOW_SAMPLES
+            processor_kwargs = {}
+            if long_form:
+                processor_kwargs = {
+                    "truncation": False,
+                    "padding": "longest",
+                    "return_attention_mask": True,
+                }
             inputs = self.processor(
                 audio,
                 sampling_rate=16000,
                 return_tensors="pt",
+                **processor_kwargs,
             )
             inputs = inputs.to(self.device)
 
@@ -354,11 +372,11 @@ class PyTorchSTTBackend:
             # If language is provided, force it; otherwise let Whisper auto-detect
             generate_kwargs = {}
             if language:
-                forced_decoder_ids = self.processor.get_decoder_prompt_ids(
-                    language=language,
-                    task="transcribe",
-                )
-                generate_kwargs["forced_decoder_ids"] = forced_decoder_ids
+                generate_kwargs["language"] = language
+                generate_kwargs["task"] = "transcribe"
+            if long_form:
+                generate_kwargs["attention_mask"] = inputs["attention_mask"]
+                generate_kwargs["return_timestamps"] = True
 
             with torch.no_grad():
                 predicted_ids = self.model.generate(

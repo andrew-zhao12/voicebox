@@ -63,7 +63,14 @@ class ModelConfig:
 
 @runtime_checkable
 class TTSBackend(Protocol):
-    """Protocol for TTS backend implementations."""
+    """Protocol for TTS backend implementations.
+
+    Backends may additionally implement an optional async generator
+    ``generate_stream(text, voice_prompt, language, seed, instruct)`` that
+    yields ``(audio, sample_rate)`` pieces while synthesis is still running.
+    ``utils.chunked_tts.generate_chunked_stream`` uses it when present (see
+    ``MLXTTSBackend``); everything else keeps working through ``generate``.
+    """
 
     # Each backend class should define MODEL_CONFIGS as a class variable:
     # MODEL_CONFIGS: list[ModelConfig]

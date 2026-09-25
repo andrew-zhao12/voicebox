@@ -40,8 +40,41 @@ def normalize_audio(
     
     # Peak limiting
     audio = np.clip(audio, -peak_limit, peak_limit)
-    
+
     return audio
+
+
+class StreamingNormalizer:
+    """Chunk-wise stand-in for :func:`normalize_audio`.
+
+    Whole-clip RMS is unknown while streaming, so the gain is locked from the
+    first chunk that carries signal and reused for every later chunk.  A fixed
+    gain keeps the loudness relationship between sentences intact, whereas a
+    per-chunk RMS would pump the level at every seam.  Peaks are clipped per
+    chunk exactly like ``normalize_audio``.
+    """
+
+    # Cap the locked gain so a quiet first chunk cannot blow up the rest.
+    MAX_GAIN_DB = 20.0
+    # Chunks quieter than this are passed through and do not lock the gain.
+    MIN_SIGNAL_RMS = 10 ** (-60 / 20)
+
+    def __init__(self, target_db: float = -20.0, peak_limit: float = 0.85) -> None:
+        self.target_db = target_db
+        self.peak_limit = peak_limit
+        self.gain: float | None = None
+
+    def process(self, chunk: np.ndarray) -> np.ndarray:
+        """Return *chunk* with the locked gain applied and peaks clipped."""
+        chunk = np.asarray(chunk, dtype=np.float32)
+        if self.gain is None and len(chunk):
+            rms = float(np.sqrt(np.mean(chunk**2)))
+            if rms >= self.MIN_SIGNAL_RMS:
+                target_rms = 10 ** (self.target_db / 20)
+                self.gain = min(target_rms / rms, 10 ** (self.MAX_GAIN_DB / 20))
+        if self.gain is not None:
+            chunk = chunk * np.float32(self.gain)
+        return np.clip(chunk, -self.peak_limit, self.peak_limit)
 
 
 def load_audio(
@@ -110,22 +143,27 @@ def save_audio(
         raise OSError(f"Failed to save audio to {path}: {e}") from e
 
 
-def has_tts_runaway(
+def find_tts_runaway_cut(
     audio: np.ndarray,
     sample_rate: int = 24000,
     frame_ms: int = 20,
     silence_threshold_db: float = -40.0,
     max_internal_silence_ms: int = 2000,
-) -> bool:
-    """Detect speech followed by a long silence and then more output.
+) -> int | None:
+    """Locate speech followed by a long silence and then more output.
 
     This shape is a reliable signal that a TTS model missed EOS and resumed
     with hallucinated speech or codec noise. Leading and trailing silence do
     not count because they are not bounded by non-silent audio.
+
+    Returns:
+        The sample index where the offending silence starts, so that
+        ``audio[:index]`` keeps only the good speech, or ``None`` when the
+        audio looks stable.
     """
     frame_len = int(sample_rate * frame_ms / 1000)
     if frame_len == 0 or len(audio) < frame_len:
-        return False
+        return None
 
     n_frames = len(audio) // frame_len
     threshold_linear = 10 ** (silence_threshold_db / 20)
@@ -138,13 +176,37 @@ def has_tts_runaway(
         is_speech = np.sqrt(np.mean(frame**2)) >= threshold_linear
         if is_speech:
             if seen_speech and consecutive_silence >= max_silence_frames:
-                return True
+                return (i - consecutive_silence) * frame_len
             seen_speech = True
             consecutive_silence = 0
         elif seen_speech:
             consecutive_silence += 1
 
-    return False
+    return None
+
+
+def has_tts_runaway(
+    audio: np.ndarray,
+    sample_rate: int = 24000,
+    frame_ms: int = 20,
+    silence_threshold_db: float = -40.0,
+    max_internal_silence_ms: int = 2000,
+) -> bool:
+    """Detect speech followed by a long silence and then more output.
+
+    Boolean form of :func:`find_tts_runaway_cut`, used by the non-streaming
+    path to decide whether to regenerate a chunk in smaller pieces.
+    """
+    return (
+        find_tts_runaway_cut(
+            audio,
+            sample_rate,
+            frame_ms,
+            silence_threshold_db,
+            max_internal_silence_ms,
+        )
+        is not None
+    )
 
 
 def trim_tts_output(

@@ -289,6 +289,12 @@ curl -X POST http://127.0.0.1:17493/generate \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello world", "profile_id": "abc123", "language": "en"}'
 
+# Stream speech sentence by sentence while it is still being synthesized
+curl -N -X POST http://127.0.0.1:17493/generate/stream \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello world. Here comes the rest.", "profile_id": "abc123"}' \
+  | ffplay -nodisp -autoexit -
+
 # Agent voice output — any app or script can speak in a cloned voice
 curl -X POST http://127.0.0.1:17493/speak \
   -H "Content-Type: application/json" \

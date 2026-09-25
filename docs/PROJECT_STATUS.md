@@ -180,7 +180,7 @@ Shipped 2026-04-25 (PR #544). Voicebox went from a voice-cloning studio to a ful
 - Model management UI with inline download progress + folder migration (PR #268)
 - Download cancel/clear UI with error panel (PR #238)
 - Generation history with caching and cancellation (PR #444)
-- Streaming generation endpoint (MLX only)
+- Streaming generation endpoint — `/generate/stream` sends sentence-level chunks for every engine through the serial queue; Qwen3-TTS on MLX additionally streams sub-sentence pieces
 - Audio player freeze fix + UX improvements (PR #293)
 - CORS restriction to known local origins (PR #88)
 
@@ -272,7 +272,7 @@ Shipped 2026-04-25 (PR #544). Voicebox went from a voice-cloning studio to a ful
 - **Chatterbox Turbo upstream token bug**: `from_pretrained()` passes `token=os.getenv("HF_TOKEN") or True` which fails without a stored HF token. Our backend works around this by calling `snapshot_download(token=None)` + `from_local()`.
 - **chatterbox-tts must install with `--no-deps`**: It pins `numpy<1.26`, `torch==2.6.0`, `transformers==4.46.3` — all incompatible with our stack (Python 3.12, torch 2.10, transformers 4.57.3). Sub-deps listed explicitly in `requirements.txt`.
 - **Instruct parameter partially shipped** (#224, #303): Qwen CustomVoice (PR #328) now provides real instruct support via predefined speakers. Other backends still silently drop the instruct field — the UI exposes the field broadly but most engines ignore it. The floating generate box was patched to restore instruct for CustomVoice (commit `106aec4`).
-- **Streaming generation** only works for Qwen on MLX. Other engines use the non-streaming `/generate` endpoint.
+- **Streaming generation** is sentence-level for every engine; only Qwen3-TTS on MLX streams sub-sentence pieces, because `qwen-tts` (PyTorch), Chatterbox, LuxTTS and TADA expose no streaming API upstream.
 - **dicta-onnx** (Hebrew diacritization) not included — upstream Chatterbox bug requires `model_path` arg but calls `Dicta()` with none. Hebrew works fine without it.
 - **Blackwell (RTX 50-series) CUDA**: cu128 + sm_120 kernel support shipped (PR #401, #316), but users still report `cudaErrorNoKernelImageForDevice` (#417, #400, #396, #395, #390, #362) — likely a stale CUDA binary on upgraded installs. Needs a follow-up diagnostic / forced re-download path.
 - **Long text 50k character limit** (#464, #365, #354): Still hit on GPU despite chunking (PR #266). Chunking reliability needs another pass.
@@ -720,7 +720,7 @@ The two-month gap means the highest-leverage work isn't new code — it's review
 | 5 | **#225** — Custom HuggingFace models | User-supplied models. Needs rework. | High |
 | 6 | OpenAI-compatible API (plan doc exists) — see also #448 (API for non-Qwen) | Low effort once API is stable | Low |
 | 7 | LoRA fine-tuning (PR #195) | Complex, needs rework for multi-engine | Very High |
-| 8 | Streaming for non-MLX engines | Currently MLX-only | Medium |
+| 8 | ~~Streaming for non-MLX engines~~ | Shipped: sentence-level streaming for all engines via `/generate/stream`; sub-sentence streaming needs upstream engine APIs | Done |
 | 9 | Voice-to-voice / RVC (#407, #347) | New modality — different arch shape | High |
 
 ### Tier 3 — Future Engines (cross-platform preferred)
@@ -799,7 +799,7 @@ Feeds the planned streaming-transcription roadmap; Whisper alternatives.
 | `/profiles/{id}/export` | GET | Export profile as ZIP |
 | `/profiles/import` | POST | Import profile from ZIP |
 | `/generate` | POST | Generate speech (engine param selects TTS backend) |
-| `/generate/stream` | POST | Stream speech (MLX only) |
+| `/generate/stream` | POST | Stream speech as it is synthesized (all engines; WAV or raw PCM) |
 | `/history` | GET | List generation history |
 | `/history/{id}` | GET, DELETE | Get/delete generation |
 | `/history/{id}/export` | GET | Export generation ZIP |

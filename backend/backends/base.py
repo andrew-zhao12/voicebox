@@ -5,8 +5,12 @@ Eliminates duplication of cache checking, device detection,
 voice prompt combination, and model loading progress tracking.
 """
 
+import asyncio
+import contextlib
 import logging
 import platform
+import threading
+from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
@@ -19,6 +23,63 @@ from ..utils.hf_progress import HFProgressTracker, create_hf_progress_callback
 from ..utils.tasks import get_task_manager
 
 logger = logging.getLogger(__name__)
+
+
+async def iterate_in_thread[T](
+    make_iter: Callable[[], Iterator[T]],
+    *,
+    stop: threading.Event | None = None,
+) -> AsyncIterator[T]:
+    """Run a synchronous iterator in one worker thread and yield its items asynchronously.
+
+    Items cross into the event loop through ``loop.call_soon_threadsafe``.  An
+    exception raised by the iterator is re-raised at the consumer.  When the
+    consumer stops early, *stop* is set so the worker breaks out of its loop
+    and closes the iterator, and the thread is awaited rather than abandoned,
+    so whatever the iterator holds (typically the GPU) is released before
+    control returns.  Keeping the whole iterator on one thread also suits MLX,
+    which does not like hopping threads mid-generation.
+    """
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    stop_event = stop or threading.Event()
+    done = object()
+
+    def put(item) -> None:
+        # A closed event loop raises RuntimeError: nobody is listening any more.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(queue.put_nowait, item)
+
+    def worker() -> None:
+        try:
+            iterator = make_iter()
+            try:
+                for item in iterator:
+                    if stop_event.is_set():
+                        break
+                    put(item)
+            finally:
+                close = getattr(iterator, "close", None)
+                if close is not None:
+                    close()
+        except Exception as e:
+            put(e)
+        else:
+            put(done)
+
+    task = asyncio.ensure_future(asyncio.to_thread(worker))
+    try:
+        while True:
+            item = await queue.get()
+            if item is done:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        stop_event.set()
+        if not task.done():
+            await asyncio.wait({task})
 
 
 def is_model_cached(

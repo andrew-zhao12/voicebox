@@ -371,3 +371,28 @@ def apply_effects(
     if audio.ndim == 1:
         return processed[0]
     return processed
+
+
+class StreamingEffects:
+    """Apply an effects chain to consecutive chunks of one audio stream.
+
+    Uses a single :class:`Pedalboard` and processes every chunk with
+    ``reset=False`` so stateful effects (reverb tails, delay lines,
+    compressor envelopes) carry across chunk boundaries instead of
+    restarting at every seam.
+    """
+
+    def __init__(self, effects_chain: list[dict[str, Any]]) -> None:
+        self._board = build_pedalboard(effects_chain)
+
+    def process(self, chunk: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Process one chunk and return it with the same dimensionality."""
+        if len(self._board) == 0 or len(chunk) == 0:
+            return chunk
+
+        audio_2d = chunk[np.newaxis, :] if chunk.ndim == 1 else chunk
+        processed = self._board.process(audio_2d.astype(np.float32), sample_rate, reset=False)
+
+        if chunk.ndim == 1:
+            return processed[0]
+        return processed

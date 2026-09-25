@@ -105,6 +105,12 @@ curl http://localhost:17493/profiles
 
 # Stream generation status (SSE)
 curl http://localhost:17493/generate/{id}/status
+
+# Stream audio while it is synthesized (WAV with unknown length, or "format": "pcm")
+curl -N -X POST http://localhost:17493/generate/stream \
+  -H "Content-Type: application/json" \
+  -d '{"text": "First sentence. Second sentence.", "profile_id": "..."}' \
+  | ffplay -nodisp -autoexit -
 ```
 
 ## Data directory

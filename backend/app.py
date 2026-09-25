@@ -194,6 +194,14 @@ def _configure_cors(application: FastAPI) -> None:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # Let browser clients read the streaming metadata set by /generate/stream.
+        expose_headers=[
+            "X-Voicebox-Sample-Rate",
+            "X-Voicebox-Channels",
+            "X-Voicebox-Sample-Format",
+            "X-Voicebox-Stream-Mode",
+            "X-Voicebox-Job-Id",
+        ],
     )
 
 

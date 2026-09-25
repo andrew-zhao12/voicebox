@@ -57,9 +57,12 @@ For long-form content, split into smaller chunks for better control and faster p
 
 Voicebox caches voice prompts for faster re-generation with the same profile.
 
+### Streaming
+
+`POST /generate/stream` sends audio sentence by sentence while the rest is still being synthesized, for apps that need a fast first response. See [Streaming](/developer/tts-generation#streaming) in the developer docs.
+
 ## Coming Soon
 
-- Real-time streaming
 - Word-level timing control
 - Emotion and style controls
 - SSML support

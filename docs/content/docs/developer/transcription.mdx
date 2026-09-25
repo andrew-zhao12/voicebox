@@ -83,7 +83,7 @@ Whisper expects mono 16 kHz audio. The audio utility in `backend/utils/audio.py`
 - **Formats:** WAV, MP3, FLAC, OGG, M4A (via soundfile / librosa)
 - **Target:** mono, 16 kHz, float32
 
-Files longer than Whisper's 30-second window are handled by the underlying library's chunking logic — no explicit splitting in Voicebox code.
+Files longer than Whisper's 30-second window are transcribed window by window. On Apple Silicon mlx-audio does this internally; on the PyTorch path `backend/backends/pytorch_backend.py` switches to transformers' long-form generation (`truncation=False`, `return_timestamps=True`) for audio over 30 seconds, while shorter clips use the padded single window.
 
 ## API Endpoints
 
@@ -101,7 +101,7 @@ Content-Type: multipart/form-data
 
 file: <audio_file>
 language: en         # optional
-model_size: base     # optional (default: "base")
+model: base          # optional: base, small, medium, large, turbo (default: the loaded size, initially "base")
 ```
 
 ### Response

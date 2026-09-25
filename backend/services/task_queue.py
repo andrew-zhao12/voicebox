@@ -11,6 +11,10 @@ from typing import Coroutine, Literal
 # Keep references to fire-and-forget background tasks to prevent GC
 _background_tasks: set = set()
 
+# Job ids of streaming generations (``POST /generate/stream``). They share the
+# queue with regular generations but have no ``generations`` row.
+STREAM_JOB_PREFIX = "stream-"
+
 
 @dataclass
 class GenerationJob:
@@ -70,6 +74,9 @@ async def _force_fail_if_active(generation_id: str, error: str) -> None:
     """Best-effort recovery — flip an active row to failed if the worker
     bailed before writing a terminal status. Catches the case where the gen
     coroutine's own status-write raised (e.g. SQLite lock contention)."""
+    if generation_id.startswith(STREAM_JOB_PREFIX):
+        # Streaming jobs have no DB row; they report failures to their consumer.
+        return
     try:
         from ..database import Generation as DBGeneration, get_db
         from . import history

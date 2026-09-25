@@ -162,6 +162,46 @@ The request path from frontend to audio file:
 
 Text longer than `max_chunk_chars` (default 800, range 100–5000) is split at sentence boundaries, generated in sequence, and crossfaded together. The chunking behavior is engine-agnostic — it lives in the service layer, not in individual backends.
 
+## Streaming
+
+`POST /generate/stream` returns audio while it is still being synthesized, so the first sentence plays while the rest is generated. It accepts every `POST /generate` field plus:
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `format` | `"wav"` | `wav`: a 44-byte RIFF header whose length fields are `0xFFFFFFFF` (unknown length), then PCM16 frames. `pcm`: raw signed 16-bit little-endian mono samples. |
+| `first_chunk_chars` | `120` | Cap for the first chunk so the first audio arrives after roughly one sentence. `null` keeps the normal `max_chunk_chars` splitting. |
+
+How it works:
+
+1. The text is split exactly like the async path, except that the first chunk is cut at the first sentence end inside `first_chunk_chars`.
+2. The job is enqueued in the same serial queue as `/generate`, so it waits for any running generation and never overlaps other GPU work.
+3. Each chunk is synthesized, crossfaded into the previous one on the fly (`CrossfadeJoiner` in `backend/utils/chunked_tts.py`, sample-identical to the buffered join) and sent as PCM16 the moment it exists. Engines that implement `generate_stream` (Qwen3-TTS on MLX) additionally stream sub-sentence pieces.
+4. The HTTP headers go out together with the first chunk, so a failure before any audio still gets a real 4xx/5xx and the sample rate is known when the WAV header is written.
+
+Response headers: `X-Voicebox-Sample-Rate`, `X-Voicebox-Channels` (always `1`), `X-Voicebox-Sample-Format` (`s16le`), `X-Voicebox-Stream-Mode` (`chunked`), `X-Voicebox-Job-Id`, plus `X-Accel-Buffering: no` for reverse proxies.
+
+Differences from `/generate`:
+
+- Nothing is written to history and the desktop UI does not show the job.
+- `normalize` locks a gain from the first chunk that carries signal instead of using whole-clip RMS.
+- Effects run through one pedalboard instance with state carried across chunks.
+- With `first_chunk_chars` set, chunk boundaries (and therefore per-chunk seeds) differ from the async path, so the audio is not sample-identical to `/generate` unless you pass `"first_chunk_chars": null`.
+- Headers wait for the first chunk, which includes queue wait and model load. Give clients a read timeout that covers both.
+
+```bash
+# Play as it arrives (WAV with unknown length)
+curl -N -X POST http://127.0.0.1:17493/generate/stream \
+  -H "Content-Type: application/json" \
+  -d '{"profile_id": "<id>", "engine": "kokoro", "text": "First sentence. Second sentence."}' \
+  | ffplay -nodisp -autoexit -
+
+# Raw PCM for programmatic clients; the rate is in X-Voicebox-Sample-Rate
+curl -N -X POST http://127.0.0.1:17493/generate/stream \
+  -H "Content-Type: application/json" \
+  -d '{"profile_id": "<id>", "text": "Hello there.", "format": "pcm"}' \
+  | ffplay -f s16le -ar 24000 -ac 1 -nodisp -autoexit -
+```
+
 ## Instruct Mode
 
 Two engines support natural-language delivery control via the `instruct` kwarg:
@@ -198,6 +238,7 @@ The model management API (`/models/load`, `/models/unload`) lets users free VRAM
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/generate` | Generate speech from text |
+| POST | `/generate/stream` | Stream speech as it is synthesized (see [Streaming](#streaming)) |
 | GET | `/audio/{generation_id}` | Serve generated audio file |
 
 ### Response schema
