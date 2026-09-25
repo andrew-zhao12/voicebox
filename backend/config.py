@@ -18,8 +18,9 @@ if _custom_models_dir:
     os.environ["HF_HUB_CACHE"] = _custom_models_dir
     logger.info("Model download path set to: %s", _custom_models_dir)
 
-# Default data directory (used in development)
-_data_dir = Path("data").resolve()
+# Data directory: ``--data-dir`` (``set_data_dir``) wins, else ``VOICEBOX_DATA_DIR``,
+# else ``data/`` relative to the working directory (development).
+_data_dir = Path(os.environ.get("VOICEBOX_DATA_DIR") or "data").resolve()
 
 
 def _path_relative_to_any_data_dir(path: Path) -> Path | None:
@@ -98,9 +99,7 @@ def resolve_storage_path(path: str | Path | None) -> Path | None:
     # baked in (e.g. "data/profiles/..."). Joining those directly with
     # _data_dir produces a spurious "<data_dir>/data/profiles/..." nest.
     if stored_path.parts and stored_path.parts[0] == "data":
-        stored_path = (
-            Path(*stored_path.parts[1:]) if len(stored_path.parts) > 1 else Path()
-        )
+        stored_path = Path(*stored_path.parts[1:]) if len(stored_path.parts) > 1 else Path()
 
     return (_data_dir / stored_path).resolve()
 

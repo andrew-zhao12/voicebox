@@ -3,7 +3,7 @@
 import logging
 import uuid
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from .. import config
@@ -27,6 +27,22 @@ SessionLocal = None
 _db_path = None
 
 
+def _apply_sqlite_pragmas(dbapi_connection, _record) -> None:
+    """Per-connection SQLite settings.
+
+    WAL lets readers overlap the queue worker's writes; ``busy_timeout``
+    waits for a lock instead of raising "database is locked" at once.
+    ``journal_mode=WAL`` sticks to the file; the other two are per connection.
+    """
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+    finally:
+        cursor.close()
+
+
 def init_db() -> None:
     """Initialize the database engine, run migrations, create tables, and seed data."""
     global engine, SessionLocal, _db_path
@@ -38,6 +54,7 @@ def init_db() -> None:
         f"sqlite:///{_db_path}",
         connect_args={"check_same_thread": False},
     )
+    event.listen(engine, "connect", _apply_sqlite_pragmas)
 
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
