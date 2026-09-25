@@ -1,0 +1,125 @@
+---
+title: API Reference
+description: "Call Voicebox from your applications: the OpenAI-compatible /v1 endpoints and the native API"
+---
+
+Voicebox speaks two APIs on the same port and with the same [API keys](/overview/api-keys):
+
+- **`/v1`, OpenAI-compatible.** Speech and transcription in the shape the OpenAI SDKs expect, so any OpenAI client works with `base_url` pointed at your server. This is the surface to build applications on.
+- **The native API.** Everything the desktop UI uses: profiles, samples, history, stories, captures, models, settings. Its interactive reference is at `/docs` on a running server (unless `VOICEBOX_DISABLE_DOCS=1`), and the schema is in the repo at `docs/openapi.json`.
+
+Every request carries `Authorization: Bearer <key>`. Give each application its own **client** key; it can synthesize, transcribe, and read profiles and models, and nothing else.
+
+## Speech: `POST /v1/audio/speech`
+
+```json
+{
+  "model": "tts-1",
+  "input": "Hello from Voicebox.",
+  "voice": "Narrator",
+  "response_format": "mp3"
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `voice` | A voice profile **name or id** (see `GET /v1/voices`). OpenAI's stock names (`alloy`, `nova`, ...) select the configured default voice: the per-client binding, else the default playback voice from Settings → MCP. |
+| `model` | `tts-1`, `tts-1-hd` or `gpt-4o-mini-tts` use the profile's default engine. Otherwise a model or engine name from `GET /v1/models`: `kokoro`, `qwen-tts-1.7B`, `qwen-tts-0.6B`, `chatterbox-turbo`, `luxtts`, `tada-1b`, ... |
+| `response_format` | `mp3` (default), `opus`, `aac`, `flac`, `wav`, `pcm` (signed 16-bit little-endian mono). |
+| `instructions` | Style hint, passed as the engine's `instruct` where the engine supports it (Qwen CustomVoice). |
+| `language` | Voicebox extension: language code of the input. Defaults to the profile's language. |
+| `speed` | Only `1.0` is accepted. |
+
+The response is always chunked. `wav` and `pcm` leave the server sentence by sentence as synthesis proceeds; the compressed formats stream too when ffmpeg is installed (it is in the Docker image) and are otherwise sent once the clip is complete. `X-Voicebox-Sample-Rate` carries the engine's sample rate (24 kHz for most engines, 48 kHz for LuxTTS) and `X-Voicebox-Engine` the engine used. Nothing is written to the generation history.
+
+**Python (OpenAI SDK)**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="https://voice.example.com/v1", api_key="vbx_...")
+
+with client.audio.speech.with_streaming_response.create(
+    model="kokoro",
+    voice="Narrator",
+    input="Hello from Voicebox.",
+    response_format="mp3",
+) as response:
+    response.stream_to_file("hello.mp3")
+```
+
+**Node (OpenAI SDK)**
+
+```ts
+import OpenAI from 'openai';
+
+const client = new OpenAI({ baseURL: 'https://voice.example.com/v1', apiKey: 'vbx_...' });
+const response = await client.audio.speech.create({
+  model: 'tts-1',
+  voice: 'Narrator',
+  input: 'Hello from Voicebox.',
+  response_format: 'wav',
+});
+// response.body is a stream; the first bytes arrive after the first sentence.
+```
+
+**curl**
+
+```bash
+curl -N https://voice.example.com/v1/audio/speech \
+  -H "Authorization: Bearer $VOICEBOX_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"tts-1","voice":"Narrator","input":"Hello from Voicebox.","response_format":"wav"}' \
+  --output hello.wav
+```
+
+## Transcription: `POST /v1/audio/transcriptions`
+
+Multipart form with `file` (wav, mp3, m4a, ogg, flac, aac, webm, opus; 200 MB cap), `model` and optional `language` and `response_format`.
+
+- `model`: `whisper-1` uses the server's current Whisper size; `whisper-turbo`, `whisper-large`, `whisper-medium`, `whisper-small` or `whisper-base` pick one explicitly.
+- `response_format`: `json` (default, `{"text": "..."}`) or `text`. `srt`, `vtt` and `verbose_json` are not available (no word timestamps).
+- The model must already be downloaded; client keys get a `409` otherwise (preload it with `VOICEBOX_PRELOAD_MODELS=whisper-turbo`).
+
+```python
+with open("meeting.m4a", "rb") as audio:
+    result = client.audio.transcriptions.create(model="whisper-turbo", file=audio, language="en")
+print(result.text)
+```
+
+## Discovery: `GET /v1/models` and `GET /v1/voices`
+
+`/v1/models` lists every TTS and STT model with `engine`, `kind` (`tts`/`stt`), `languages`, `supports_instruct`, `downloaded` and `loaded`, plus a top-level `formats` array with the `response_format` values this server can produce. `/v1/voices` lists the voice profiles with their `id`, `name`, `language`, `voice_type` and `engine`.
+
+## Errors
+
+Under `/v1`, errors use OpenAI's envelope, so SDK exceptions carry the message:
+
+```json
+{ "error": { "message": "No voice profile named 'Narrator'; GET /v1/voices lists the voice profiles.", "type": "invalid_request_error", "param": "voice", "code": "voice_not_found" } }
+```
+
+| Status | `type` | When |
+|--------|--------|------|
+| 400 | `invalid_request_error` | Bad body (`invalid_value`), unsupported `speed` or `response_format`, engine and profile mismatch |
+| 401 | `authentication_error` | Missing or invalid key |
+| 403 | `permission_error` | A client key on an admin route |
+| 404 | `invalid_request_error` | `voice_not_found`, `model_not_found` |
+| 409 | `invalid_request_error` | The model is not downloaded (client keys) |
+| 429 | `rate_limit_error` | Per-key limits or a full queue; honour `Retry-After` |
+| 503 | `server_error` | The server is draining before a restart; retry after `Retry-After` |
+
+Responses also carry `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset` (see [API Keys → Rate limits](/overview/api-keys#rate-limits)).
+
+## Native endpoints worth knowing
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /generate/stream` | The same streaming synthesis with Voicebox's own body (`profile_id`, `engine`, `effects_chain`, `seed`, chunking controls). |
+| `POST /generate` then `GET /generate/{id}/status` | Queue a generation that is saved to history; progress over SSE, audio at `GET /audio/{id}`. |
+| `POST /speak` | Speak through the profile bound to an `X-Voicebox-Client-Id` (agents). |
+| `POST /transcribe` | Transcription with `{"text", "duration"}`. |
+| `GET /profiles`, `GET /profiles/{id}` | Voice profiles (client keys read only). |
+| `GET /health/ready` | Readiness probe, no key needed. |
+
+Creating and editing profiles, uploading samples and managing models are admin operations: do them in the UI, or with the admin key against the routes in `/docs`.

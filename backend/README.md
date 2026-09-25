@@ -93,6 +93,10 @@ Detection is handled by `utils/platform_detect.py`. Both backends implement the 
 | CUDA | `/backend/cuda-*` | CUDA binary download and management |
 | Auth | `/auth` | `whoami`, media tokens, API key management (admin) |
 
+### OpenAI-compatible surface
+
+`POST /v1/audio/speech`, `POST /v1/audio/transcriptions`, `GET /v1/models` and `GET /v1/voices` (`routes/openai_compat.py`) speak the OpenAI Audio API, so the OpenAI SDKs work with `base_url=".../v1"` and a client key. Voices are profile names or ids, models are registry names (`kokoro`, `qwen-tts-1.7B`, ...) or the `tts-1` aliases, and `response_format` covers mp3/opus/aac/flac/wav/pcm (`utils/encode.py`: ffmpeg pipe when available, libsndfile otherwise). Errors under `/v1` use the OpenAI `{"error": {...}}` envelope (`api_errors.py`), including the ones the auth middleware produces.
+
 ### Authentication
 
 Every endpoint requires `Authorization: Bearer <key>`. Keys come from `VOICEBOX_API_KEY`, else the `api_key` file the server creates in its data directory on first start (`just api-key` prints the dev one), plus the hashed `api_keys.json` store managed with `python -m backend.keys` or the admin `/auth/keys` routes. `admin` keys can do everything; `client` keys (for your own apps) can generate, stream, speak, transcribe and read profiles. Browser loads that cannot send headers use `POST /auth/media-token` and `?token=`. `GET /health` answers `{"status": "healthy", "service": "voicebox"}` without a key. Details: `docs/content/docs/overview/api-keys.mdx`.
