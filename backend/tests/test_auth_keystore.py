@@ -104,17 +104,19 @@ def test_reserved_and_invalid_ids_are_refused(tmp_path):
         store.revoke("local")
 
 
-def test_json_changes_are_picked_up_after_the_stat_interval(tmp_path):
+def test_new_keys_are_found_at_once_and_revocations_within_the_stat_interval(tmp_path):
     now = [1000.0]
     store = make_store(tmp_path, env_key="vbx_env", clock=lambda: now[0])
     store.ensure_loaded()
 
     other = make_store(tmp_path, env_key="vbx_env")
     _, key = other.create("late", "client")
+    assert store.lookup(key) is not None  # a miss re-checks the file immediately
 
-    assert store.lookup(key) is None  # stat throttled: just loaded
+    other.revoke("late")
+    assert store.lookup(key) is not None  # hits are throttled to one stat per second
     now[0] += 2.0
-    assert store.lookup(key) is not None
+    assert store.lookup(key) is None
 
 
 def test_corrupt_json_keeps_the_last_good_set(tmp_path):

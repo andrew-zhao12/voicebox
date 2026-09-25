@@ -202,11 +202,19 @@ class KeyStore:
             self.ensure_loaded()
             self._maybe_reload()
             digest = hash_key(presented)
-            match = None
-            for record in self._records():
-                if hmac.compare_digest(record.sha256, digest):
-                    match = record
+            match = self._match(digest)
+            if match is None and self._load_json():
+                # A miss costs one stat: a key created a moment ago (CLI or
+                # admin route) is honoured without waiting for the throttle.
+                match = self._match(digest)
             return match
+
+    def _match(self, digest: str) -> KeyRecord | None:
+        match = None
+        for record in self._records():
+            if hmac.compare_digest(record.sha256, digest):
+                match = record
+        return match
 
     def get(self, key_id: str) -> KeyRecord | None:
         with self._lock:
@@ -288,22 +296,24 @@ class KeyStore:
         self._last_stat = now
         self._load_json()
 
-    def _load_json(self, force: bool = False) -> None:
+    def _load_json(self, force: bool = False) -> bool:
+        """Re-read ``api_keys.json`` when it changed; returns whether the record set was replaced."""
         signature = self._stat_json()
         if not force and signature == self._json_sig:
-            return
+            return False
         if signature is None:
             self._file = {}
             self._json_sig = None
-            return
+            return True
         path = self._keys_json()
         try:
             parsed = self._parse(json.loads(path.read_text(encoding="utf-8")))
         except (OSError, ValueError, TypeError, AttributeError) as e:
             logger.warning("Ignoring unreadable API key store %s: %s", path, e)
-            return
+            return False
         self._file = parsed
         self._json_sig = signature
+        return True
 
     @staticmethod
     def _parse(data: object) -> dict[str, KeyRecord]:

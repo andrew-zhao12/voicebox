@@ -99,10 +99,13 @@ def cmd_local(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m backend.keys", description="Manage Voicebox API keys")
-    parser.add_argument("--data-dir", help="Data directory of the server (default: ./data)")
+    # Accepted before or after the subcommand: ``keys --data-dir X list`` and ``keys list --data-dir X``.
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument("--data-dir", default=None, help="Data directory of the server (default: ./data)")
+    parser.add_argument("--data-dir", default=None, help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    create = commands.add_parser("create", help="create a key and print it once")
+    create = commands.add_parser("create", help="create a key and print it once", parents=[shared])
     create.add_argument("--id", required=True, help="key id: lowercase letters, digits, '-' or '_'")
     create.add_argument("--role", choices=("admin", "client"), default="client")
     create.add_argument(
@@ -114,19 +117,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     create.set_defaults(func=cmd_create)
 
-    commands.add_parser("list", help="list keys (never prints secrets)").set_defaults(func=cmd_list)
+    commands.add_parser("list", help="list keys (never prints secrets)", parents=[shared]).set_defaults(func=cmd_list)
 
-    revoke = commands.add_parser("revoke", help="remove a key from the store")
+    revoke = commands.add_parser("revoke", help="remove a key from the store", parents=[shared])
     revoke.add_argument("--id", required=True)
     revoke.set_defaults(func=cmd_revoke)
 
-    commands.add_parser("path", help="print where the key files live").set_defaults(func=cmd_path)
-    commands.add_parser("local", help="print the local admin key").set_defaults(func=cmd_local)
+    commands.add_parser("path", help="print where the key files live", parents=[shared]).set_defaults(func=cmd_path)
+    commands.add_parser("local", help="print the local admin key", parents=[shared]).set_defaults(func=cmd_local)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    # argparse resets a parent-level option when the subparser also defines it,
+    # so remember a value given before the subcommand and apply it if the
+    # subcommand did not set one.
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    leading_data_dir = None
+    if argv_list and argv_list[0] == "--data-dir" and len(argv_list) > 1:
+        leading_data_dir = argv_list[1]
+        argv_list = argv_list[2:]
+    elif argv_list and argv_list[0].startswith("--data-dir="):
+        leading_data_dir = argv_list[0].split("=", 1)[1]
+        argv_list = argv_list[1:]
+    args = parser.parse_args(argv_list)
+    if args.data_dir is None:
+        args.data_dir = leading_data_dir
     return args.func(args)
 
 
