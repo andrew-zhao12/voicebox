@@ -4,6 +4,7 @@
       "type": "http",
       "url": "http://127.0.0.1:17493/mcp",
       "headers": {
+        "Authorization": "Bearer ${VOICEBOX_API_KEY}",
         "X-Voicebox-Client-Id": "claude-code"
       }
     }

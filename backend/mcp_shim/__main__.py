@@ -5,9 +5,14 @@ JSON-RPC message to ``http://127.0.0.1:<port>/mcp/``, and stream the
 server's response back. The Voicebox server does all the real work.
 
 Environment variables:
-  VOICEBOX_PORT       Voicebox server port (default 17493).
-  VOICEBOX_HOST       Host (default 127.0.0.1).
-  VOICEBOX_CLIENT_ID  Forwarded as X-Voicebox-Client-Id on every request.
+  VOICEBOX_PORT          Voicebox server port (default 17493).
+  VOICEBOX_HOST          Host (default 127.0.0.1).
+  VOICEBOX_CLIENT_ID     Forwarded as X-Voicebox-Client-Id on every request.
+  VOICEBOX_API_KEY       Bearer key for the server (every endpoint requires one).
+  VOICEBOX_API_KEY_FILE  File holding the key instead. When neither is set and
+                         the host is loopback, the desktop app's own key file
+                         (``<app data dir>/api_key``) and ``./data/api_key``
+                         are tried.
 
 Stdout is JSON-RPC only. Diagnostics go to stderr.
 Exit 0 on clean EOF, 1 on transport error, 2 if backend never answers.
@@ -19,10 +24,10 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 import httpx
-
 
 CLIENT_ID_HEADER = "X-Voicebox-Client-Id"
 SESSION_HEADER = "mcp-session-id"
@@ -38,6 +43,48 @@ def _base_url() -> tuple[str, str]:
     host = os.environ.get("VOICEBOX_HOST", "127.0.0.1")
     port = int(os.environ.get("VOICEBOX_PORT", str(DEFAULT_PORT)))
     return f"http://{host}:{port}/mcp/", f"http://{host}:{port}/health"
+
+
+def _desktop_key_files() -> list[Path]:
+    """Where the desktop app keeps its ``api_key`` on each platform, then ``./data``."""
+    home = Path.home()
+    if sys.platform == "darwin":
+        candidates = [home / "Library" / "Application Support" / "sh.voicebox.app" / "api_key"]
+    elif sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        candidates = [Path(appdata) / "sh.voicebox.app" / "api_key"] if appdata else []
+    else:
+        xdg = os.environ.get("XDG_DATA_HOME")
+        base = Path(xdg) if xdg else home / ".local" / "share"
+        candidates = [base / "sh.voicebox.app" / "api_key"]
+    candidates.append(Path("data") / "api_key")
+    return candidates
+
+
+def _read_key_file(path: Path) -> str | None:
+    try:
+        key = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return key or None
+
+
+def _resolve_api_key() -> str | None:
+    """``VOICEBOX_API_KEY``, then ``VOICEBOX_API_KEY_FILE``, then (loopback only) the desktop key file."""
+    key = os.environ.get("VOICEBOX_API_KEY", "").strip()
+    if key:
+        return key
+    key_file = os.environ.get("VOICEBOX_API_KEY_FILE", "").strip()
+    if key_file:
+        return _read_key_file(Path(key_file).expanduser())
+    host = os.environ.get("VOICEBOX_HOST", "127.0.0.1")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return None
+    for candidate in _desktop_key_files():
+        key = _read_key_file(candidate)
+        if key:
+            return key
+    return None
 
 
 async def _wait_for_backend(client: httpx.AsyncClient, health_url: str) -> bool:
@@ -96,9 +143,7 @@ async def _handle_request(
     # 202 Accepted and we stay quiet.
     is_notification = isinstance(message, dict) and "id" not in message
 
-    async with client.stream(
-        "POST", url, headers=req_headers, content=raw.encode("utf-8")
-    ) as response:
+    async with client.stream("POST", url, headers=req_headers, content=raw.encode("utf-8")) as response:
         # Capture session id on initialize.
         if session_id[0] is None:
             sid = response.headers.get(SESSION_HEADER)
@@ -109,10 +154,7 @@ async def _handle_request(
             return  # notification acknowledged
         if response.status_code >= 400:
             body = await response.aread()
-            _err(
-                f"server {response.status_code}: "
-                f"{body.decode('utf-8', errors='replace')[:400]}"
-            )
+            _err(f"server {response.status_code}: {body.decode('utf-8', errors='replace')[:400]}")
             if is_notification:
                 return
             _write_stdout(
@@ -121,9 +163,7 @@ async def _handle_request(
                     "id": message.get("id"),
                     "error": {
                         "code": -32000,
-                        "message": (
-                            f"Voicebox MCP proxy got HTTP {response.status_code}"
-                        ),
+                        "message": (f"Voicebox MCP proxy got HTTP {response.status_code}"),
                     },
                 }
             )
@@ -146,10 +186,7 @@ async def _handle_request(
             try:
                 _write_stdout(json.loads(body))
             except json.JSONDecodeError:
-                _err(
-                    f"non-JSON response ({ctype}): "
-                    f"{body.decode('utf-8', errors='replace')[:200]}"
-                )
+                _err(f"non-JSON response ({ctype}): {body.decode('utf-8', errors='replace')[:200]}")
 
 
 async def _run() -> int:
@@ -158,14 +195,20 @@ async def _run() -> int:
     client_id = os.environ.get("VOICEBOX_CLIENT_ID")
     if client_id:
         forward_headers[CLIENT_ID_HEADER] = client_id
+    api_key = _resolve_api_key()
+    if api_key:
+        forward_headers["Authorization"] = f"Bearer {api_key}"
+    else:
+        _err(
+            "no API key found; set VOICEBOX_API_KEY (or VOICEBOX_API_KEY_FILE) "
+            "or requests will be rejected with HTTP 401"
+        )
 
     session_id: list[str | None] = [None]
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
         if not await _wait_for_backend(client, health_url):
-            _err(
-                f"timed out waiting for Voicebox at {health_url} — is the app open?"
-            )
+            _err(f"timed out waiting for Voicebox at {health_url} — is the app open?")
             return 2
 
         try:
@@ -176,9 +219,7 @@ async def _run() -> int:
                 line = line.strip()
                 if not line:
                     continue
-                await _handle_request(
-                    client, url, line, forward_headers, session_id
-                )
+                await _handle_request(client, url, line, forward_headers, session_id)
         except (KeyboardInterrupt, SystemExit):
             return 0
         except Exception as exc:
