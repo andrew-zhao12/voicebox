@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import WaveSurfer from 'wavesurfer.js';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils/cn';
+import { apiClient } from '@/lib/api/client';
 import { debug } from '@/lib/utils/debug';
 
 function formatDuration(ms?: number | null): string {
@@ -104,7 +105,7 @@ export function CaptureInlinePlayer({
     } catch (err) {
       debug.error('Failed to reset inline waveform before load', err);
     }
-    ws.load(audioUrl).catch((err) => {
+    ws.load(apiClient.withMediaToken(audioUrl)).catch((err) => {
       debug.error('Inline waveform load failed', err);
       setError(err instanceof Error ? err.message : String(err));
       setIsLoading(false);

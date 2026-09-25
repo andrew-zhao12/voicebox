@@ -35,6 +35,24 @@ function MiniSamplePlayer({ audioUrl }: MiniSamplePlayerProps) {
   useEffect(() => {
     const audio = new Audio(audioUrl);
     audioRef.current = audio;
+    let retried = false;
+
+    // A stale media token (server restart) makes the load fail: refresh the
+    // token once and point the element at the re-stamped URL.
+    const handleError = () => {
+      if (retried) {
+        setIsLoading(false);
+        return;
+      }
+      retried = true;
+      void apiClient.ensureMediaToken(true).then((token) => {
+        if (token && audioRef.current === audio) {
+          audio.src = apiClient.withMediaToken(audioUrl, token);
+        } else {
+          setIsLoading(false);
+        }
+      });
+    };
 
     const handleLoadedMetadata = () => {
       setDuration(audio.duration);
@@ -58,9 +76,11 @@ function MiniSamplePlayer({ audioUrl }: MiniSamplePlayerProps) {
     audio.addEventListener('ended', handleEnded);
     audio.addEventListener('play', handlePlay);
     audio.addEventListener('pause', handlePause);
+    audio.addEventListener('error', handleError);
 
     return () => {
       audio.pause();
+      audio.removeEventListener('error', handleError);
       audio.removeEventListener('loadedmetadata', handleLoadedMetadata);
       audio.removeEventListener('timeupdate', handleTimeUpdate);
       audio.removeEventListener('ended', handleEnded);

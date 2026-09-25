@@ -11,7 +11,9 @@ import { Progress } from '@/components/ui/progress';
 import { Toggle } from '@/components/ui/toggle';
 import { useToast } from '@/components/ui/use-toast';
 import { useAutoUpdater } from '@/hooks/useAutoUpdater';
-import { useServerHealth } from '@/lib/hooks/useServer';
+import { ApiError } from '@/lib/api/client';
+import { verifyConnection } from '@/lib/connection';
+import { useServerIdentity } from '@/lib/hooks/useServer';
 import { usePlatform } from '@/platform/PlatformContext';
 import { useServerStore } from '@/stores/serverStore';
 import { CloudSection } from './CloudSection';
@@ -22,22 +24,25 @@ import { ThemeSelect } from './ThemeSelect';
 function makeConnectionSchema(invalidUrl: string) {
   return z.object({
     serverUrl: z.string().url(invalidUrl),
+    apiKey: z.string(),
   });
 }
 
-type ConnectionFormValues = { serverUrl: string };
+type ConnectionFormValues = { serverUrl: string; apiKey: string };
 
 export function GeneralPage() {
   const { t } = useTranslation();
   const platform = usePlatform();
   const serverUrl = useServerStore((state) => state.serverUrl);
   const setServerUrl = useServerStore((state) => state.setServerUrl);
+  const apiKey = useServerStore((state) => state.apiKey);
+  const setApiKey = useServerStore((state) => state.setApiKey);
   const keepServerRunningOnClose = useServerStore((state) => state.keepServerRunningOnClose);
   const setKeepServerRunningOnClose = useServerStore((state) => state.setKeepServerRunningOnClose);
   const mode = useServerStore((state) => state.mode);
   const setMode = useServerStore((state) => state.setMode);
   const { toast } = useToast();
-  const { data: health, isLoading, error: healthError } = useServerHealth();
+  const { data: identity, isLoading, error: identityError } = useServerIdentity();
 
   const resolver = useMemo(
     () => zodResolver(makeConnectionSchema(t('settings.general.serverUrl.invalidUrl'))),
@@ -45,12 +50,12 @@ export function GeneralPage() {
   );
   const form = useForm<ConnectionFormValues>({
     resolver,
-    defaultValues: { serverUrl },
+    defaultValues: { serverUrl, apiKey: apiKey ?? '' },
   });
 
   useEffect(() => {
-    form.reset({ serverUrl });
-  }, [serverUrl, form]);
+    form.reset({ serverUrl, apiKey: apiKey ?? '' });
+  }, [serverUrl, apiKey, form]);
 
   // Re-run validation when the locale changes so existing error messages retranslate.
   useEffect(() => {
@@ -62,11 +67,16 @@ export function GeneralPage() {
   const { isDirty } = form.formState;
 
   function onSubmit(data: ConnectionFormValues) {
-    setServerUrl(data.serverUrl);
-    form.reset(data);
+    const nextUrl = data.serverUrl.replace(/\/+$/, '');
+    setServerUrl(nextUrl);
+    setApiKey(data.apiKey.trim() || null);
+    form.reset({ serverUrl: nextUrl, apiKey: data.apiKey.trim() });
+    // A changed URL already sends the app back through the Connect gate;
+    // a changed key alone is re-verified here.
+    void verifyConnection();
     toast({
       title: t('settings.general.serverUrl.updatedTitle'),
-      description: t('settings.general.serverUrl.updatedDescription', { url: data.serverUrl }),
+      description: t('settings.general.serverUrl.updatedDescription', { url: nextUrl }),
     });
   }
 
@@ -115,16 +125,20 @@ export function GeneralPage() {
           title={t('settings.general.serverUrl.title')}
           description={t('settings.general.serverUrl.description')}
           action={
-            <ConnectionStatus health={health} isLoading={isLoading} healthError={healthError} />
+            <ConnectionStatus
+              identity={identity}
+              isLoading={isLoading}
+              identityError={identityError}
+            />
           }
         >
           <Form {...form}>
-            <form onSubmit={form.handleSubmit(onSubmit)} className="flex gap-2">
+            <form onSubmit={form.handleSubmit(onSubmit)} className="flex flex-col gap-2">
               <FormField
                 control={form.control}
                 name="serverUrl"
                 render={({ field }) => (
-                  <FormItem className="flex-1">
+                  <FormItem>
                     <FormControl>
                       <Input placeholder="http://127.0.0.1:17493" {...field} />
                     </FormControl>
@@ -132,10 +146,33 @@ export function GeneralPage() {
                   </FormItem>
                 )}
               />
+              <FormField
+                control={form.control}
+                name="apiKey"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormControl>
+                      <Input
+                        type="password"
+                        autoComplete="off"
+                        placeholder={t('settings.general.apiKey.placeholder')}
+                        aria-label={t('settings.general.apiKey.title')}
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('settings.general.apiKey.description')}
+              </p>
               {isDirty && (
-                <Button type="submit" size="sm">
-                  {t('common.save')}
-                </Button>
+                <div className="flex justify-end">
+                  <Button type="submit" size="sm">
+                    {t('common.save')}
+                  </Button>
+                </div>
               )}
             </form>
           </Form>
@@ -218,13 +255,13 @@ export function GeneralPage() {
 }
 
 function ConnectionStatus({
-  health,
+  identity,
   isLoading,
-  healthError,
+  identityError,
 }: {
-  health: ReturnType<typeof useServerHealth>['data'];
+  identity: ReturnType<typeof useServerIdentity>['data'];
   isLoading: boolean;
-  healthError: ReturnType<typeof useServerHealth>['error'];
+  identityError: ReturnType<typeof useServerIdentity>['error'];
 }) {
   const { t } = useTranslation();
   if (isLoading) {
@@ -237,18 +274,25 @@ function ConnectionStatus({
       </div>
     );
   }
-  if (healthError) {
+  if (identityError) {
+    const status = identityError instanceof ApiError ? identityError.status : null;
+    const label =
+      status === 401
+        ? t('settings.general.connection.unauthorized')
+        : status === 403
+          ? t('settings.general.connection.forbidden')
+          : t('settings.general.connection.offline');
     return (
       <div className="flex items-center gap-2 rounded-full border border-destructive/30 px-3 py-1">
         <span className="relative flex h-2 w-2">
           <span className="absolute inline-flex h-full w-full rounded-full bg-destructive/40" />
           <span className="relative inline-flex h-2 w-2 rounded-full bg-destructive" />
         </span>
-        <span className="text-xs text-destructive">{t('settings.general.connection.offline')}</span>
+        <span className="text-xs text-destructive">{label}</span>
       </div>
     );
   }
-  if (health) {
+  if (identity) {
     return (
       <div className="flex items-center gap-2 rounded-full border border-accent/30 px-3 py-1">
         <span className="relative flex h-2 w-2">

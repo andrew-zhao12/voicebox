@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
-import type { PlatformLifecycle, ServerLogEntry } from '@/platform/types';
+import type { PlatformLifecycle, ServerCredentials, ServerLogEntry } from '@/platform/types';
 
 class TauriLifecycle implements PlatformLifecycle {
   onServerReady?: () => void;
@@ -94,6 +94,13 @@ class TauriLifecycle implements PlatformLifecycle {
     } catch (error) {
       console.error('Failed to setup window close handler:', error);
     }
+  }
+
+  async getCredentials(): Promise<ServerCredentials> {
+    // Rust hands the sidecar URL and the api_key file contents to trusted
+    // windows only; the key never touches argv, env or webview localStorage.
+    const creds = await invoke<{ url: string; apiKey: string }>('get_server_credentials');
+    return { url: creds.url, apiKey: creds.apiKey || null };
   }
 
   subscribeToServerLogs(callback: (entry: ServerLogEntry) => void): () => void {

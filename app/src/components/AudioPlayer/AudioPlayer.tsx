@@ -4,7 +4,7 @@ import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import WaveSurfer from 'wavesurfer.js';
 import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
-import { apiClient } from '@/lib/api/client';
+import { apiClient, authHeaders } from '@/lib/api/client';
 import { formatAudioDuration } from '@/lib/utils/audio';
 import { debug } from '@/lib/utils/debug';
 import { usePlatform } from '@/platform/PlatformContext';
@@ -282,7 +282,7 @@ export function AudioPlayer() {
     // Stop current playback and reset position before loading new audio.
     // With the WebAudio backend, pause() accumulates playedDuration internally.
     // seekTo(0) resets it so the new track starts from the beginning.
-    debug.log('Loading new audio URL:', audioUrl);
+    debug.log('Loading new audio into WaveSurfer');
     try {
       if (wavesurfer.isPlaying()) {
         wavesurfer.pause();
@@ -298,8 +298,10 @@ export function AudioPlayer() {
     setCurrentTime(0);
     setDuration(0);
 
+    // Re-stamp the media token at load time: playerStore keeps URLs across
+    // token refreshes, and WaveSurfer's WebAudio backend fetches without headers.
     wavesurfer
-      .load(audioUrl)
+      .load(apiClient.withMediaToken(audioUrl))
       .then(() => {
         debug.log('Audio loaded into WaveSurfer');
         loadingRef.current = false;
@@ -441,7 +443,9 @@ export function AudioPlayer() {
 
         if (deviceIds.length > 0) {
           // Fetch audio data
-          const response = await fetch(audioUrl);
+          const response = await fetch(apiClient.withMediaToken(audioUrl), {
+            headers: authHeaders(),
+          });
           const audioData = new Uint8Array(await response.arrayBuffer());
 
           // Play via native audio

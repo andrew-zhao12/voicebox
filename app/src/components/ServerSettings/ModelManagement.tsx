@@ -1015,28 +1015,38 @@ export function ModelManagement() {
                     return;
                   }
 
-                  // Connect to SSE for progress
+                  // Connect to SSE for progress (the URL carries a media token;
+                  // a refused stream gets one token refresh and reconnect)
                   await new Promise<void>((resolve, reject) => {
-                    const es = new EventSource(apiClient.getMigrationProgressUrl());
-                    es.onmessage = (event) => {
-                      try {
-                        const data = JSON.parse(event.data);
-                        setMigrationProgress(data);
-                        if (data.status === 'complete') {
-                          es.close();
-                          resolve();
-                        } else if (data.status === 'error') {
-                          es.close();
-                          reject(new Error(data.error || t('models.toast.migrationFailed')));
+                    const connect = (retried: boolean) => {
+                      const es = new EventSource(apiClient.getMigrationProgressUrl());
+                      es.onmessage = (event) => {
+                        try {
+                          const data = JSON.parse(event.data);
+                          setMigrationProgress(data);
+                          if (data.status === 'complete') {
+                            es.close();
+                            resolve();
+                          } else if (data.status === 'error') {
+                            es.close();
+                            reject(new Error(data.error || t('models.toast.migrationFailed')));
+                          }
+                        } catch {
+                          /* ignore parse errors */
                         }
-                      } catch {
-                        /* ignore parse errors */
-                      }
+                      };
+                      es.onerror = () => {
+                        const refused = es.readyState === EventSource.CLOSED;
+                        es.close();
+                        if (refused && !retried) {
+                          useServerStore.getState().setMediaToken(null);
+                          void apiClient.ensureMediaToken().then(() => connect(true));
+                          return;
+                        }
+                        reject(new Error(t('models.toast.migrationConnectionLost')));
+                      };
                     };
-                    es.onerror = () => {
-                      es.close();
-                      reject(new Error(t('models.toast.migrationConnectionLost')));
-                    };
+                    connect(false);
                   });
 
                   setCustomModelsDir(newDir);

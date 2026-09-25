@@ -158,6 +158,7 @@ export function ProfileForm() {
   const { isPlaying, playPause, cleanup: cleanupAudio } = useAudioPlayer();
   const isCreating = !editingProfileId;
   const serverUrl = useServerStore((state) => state.serverUrl);
+  const mediaToken = useServerStore((state) => state.mediaToken?.token ?? null);
   const [profileEffectsChain, setProfileEffectsChain] = useState<EffectConfig[]>([]);
   const [effectsDirty, setEffectsDirty] = useState(false);
   const [defaultEngine, setDefaultEngine] = useState<string>('');
@@ -321,11 +322,11 @@ export function ProfileForm() {
       setAvatarPreview(url);
       return () => URL.revokeObjectURL(url);
     } else if (editingProfile?.avatar_path) {
-      setAvatarPreview(`${serverUrl}/profiles/${editingProfile.id}/avatar`);
+      setAvatarPreview(apiClient.getAvatarUrl(editingProfile.id, mediaToken));
     } else {
       setAvatarPreview(null);
     }
-  }, [selectedAvatarFile, editingProfile, serverUrl]);
+  }, [selectedAvatarFile, editingProfile, mediaToken]);
 
   // Restore form state from draft or editing profile
   useEffect(() => {

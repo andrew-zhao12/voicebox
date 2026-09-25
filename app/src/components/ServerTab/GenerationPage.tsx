@@ -6,6 +6,7 @@ import { Slider } from '@/components/ui/slider';
 import { Toggle } from '@/components/ui/toggle';
 import { useGenerationSettings } from '@/lib/hooks/useSettings';
 import { usePlatform } from '@/platform/PlatformContext';
+import { authHeaders } from '@/lib/api/client';
 import { useServerStore } from '@/stores/serverStore';
 import { SettingRow, SettingSection } from './SettingRow';
 
@@ -29,7 +30,7 @@ export function GenerationPage() {
   const [generationsPath, setGenerationsPath] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch(`${serverUrl}/health/filesystem`)
+    fetch(`${serverUrl}/health/filesystem`, { headers: authHeaders() })
       .then((res) => res.json())
       .then((data) => {
         const genDir = data.directories?.find((d: { path: string }) =>

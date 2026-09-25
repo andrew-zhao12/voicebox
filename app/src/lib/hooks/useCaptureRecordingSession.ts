@@ -3,6 +3,7 @@ import { emit as tauriEmit } from '@tauri-apps/api/event';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { PillState } from '@/components/CapturePill/CapturePill';
 import { apiClient } from '@/lib/api/client';
+import { credentialsReady } from '@/lib/credentials';
 import type {
   CaptureListResponse,
   CaptureResponse,
@@ -203,8 +204,12 @@ export function useCaptureRecordingSession(
   });
 
   const uploadMutation = useMutation({
-    mutationFn: async ({ file, source }: { file: File; source: CaptureSource }) =>
-      apiClient.createCapture(file, { source }),
+    mutationFn: async ({ file, source }: { file: File; source: CaptureSource }) => {
+      // The dictate window fetches its credentials from Rust on mount; a
+      // recording that ends before that resolves must not upload keyless.
+      await credentialsReady();
+      return apiClient.createCapture(file, { source });
+    },
     onSuccess: (capture) => {
       queryClient.setQueryData<CaptureListResponse>(['captures'], (prev) => {
         if (!prev) return prev;

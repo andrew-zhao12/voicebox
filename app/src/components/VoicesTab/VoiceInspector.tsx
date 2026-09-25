@@ -66,6 +66,7 @@ export function VoiceInspector({ profileId }: VoiceInspectorProps) {
   const uploadAvatar = useUploadAvatar();
   const deleteAvatar = useDeleteAvatar();
   const serverUrl = useServerStore((state) => state.serverUrl);
+  const mediaToken = useServerStore((state) => state.mediaToken?.token ?? null);
   const { toast } = useToast();
 
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
@@ -100,12 +101,12 @@ export function VoiceInspector({ profileId }: VoiceInspectorProps) {
   // Avatar preview
   useEffect(() => {
     if (profile?.avatar_path) {
-      setAvatarPreview(`${serverUrl}/profiles/${profile.id}/avatar`);
+      setAvatarPreview(apiClient.getAvatarUrl(profile.id, mediaToken));
     } else {
       setAvatarPreview(null);
     }
     setAvatarError(false);
-  }, [profile, serverUrl]);
+  }, [profile, mediaToken]);
 
   function handleAvatarFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];

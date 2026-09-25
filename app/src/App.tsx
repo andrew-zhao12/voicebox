@@ -1,14 +1,14 @@
 import { RouterProvider } from '@tanstack/react-router';
 import { useEffect, useRef, useState } from 'react';
 import voiceboxLogo from '@/assets/voicebox-logo.png';
+import { ConnectScreen } from '@/components/Connect/ConnectScreen';
 import { DictateWindow } from '@/components/DictateWindow/DictateWindow';
 import ShinyText from '@/components/ShinyText';
 import { TitleBarDragRegion } from '@/components/TitleBarDragRegion';
 import { useAutoUpdater } from '@/hooks/useAutoUpdater';
 import { useThemeSync } from '@/hooks/useThemeSync';
 import { apiClient } from '@/lib/api/client';
-import type { HealthResponse } from '@/lib/api/types';
-import { useChordSync } from '@/lib/hooks/useChordSync';
+import { connectWithPlatformCredentials } from '@/lib/connection';
 import { TOP_SAFE_AREA_PADDING } from '@/lib/constants/ui';
 import { cn } from '@/lib/utils/cn';
 import { usePlatform } from '@/platform/PlatformContext';
@@ -23,18 +23,6 @@ import {
 function isDictateView(): boolean {
   if (typeof window === 'undefined') return false;
   return new URLSearchParams(window.location.search).get('view') === 'dictate';
-}
-
-/**
- * Validate that a health response has the expected Voicebox-specific shape.
- * Prevents misidentifying an unrelated service on the same port.
- */
-function isVoiceboxHealthResponse(health: HealthResponse): boolean {
-  return (
-    health?.status === 'healthy' &&
-    typeof health.model_loaded === 'boolean' &&
-    typeof health.gpu_available === 'boolean'
-  );
 }
 
 /**
@@ -94,13 +82,36 @@ function MainApp() {
   const [startupError, setStartupError] = useState<string | null>(null);
   const [loadingMessageIndex, setLoadingMessageIndex] = useState(0);
   const serverStartingRef = useRef(false);
+  const authStatus = useServerStore((state) => state.authStatus);
 
   // Automatically check for app updates on startup and show toast notifications
   useAutoUpdater({ checkOnMount: true, showToast: true });
 
-  // Replay the saved chord into the Rust hotkey listener every time
-  // capture_settings resolves or the user edits the chord.
-  useChordSync();
+  // Keep a media token on hand while the key is accepted: <img>, <audio> and
+  // EventSource loads carry it as `?token=`. Refresh at two thirds of its
+  // lifetime and whenever the window comes back into view.
+  useEffect(() => {
+    if (authStatus !== 'ok') return;
+    let cancelled = false;
+    let timer: number | null = null;
+    const schedule = async (force: boolean) => {
+      await apiClient.ensureMediaToken(force);
+      if (cancelled) return;
+      const token = useServerStore.getState().mediaToken;
+      const remaining = token ? Math.max(30_000, token.expiresAt - Date.now()) : 60_000;
+      timer = window.setTimeout(() => void schedule(true), Math.floor((remaining * 2) / 3));
+    };
+    void schedule(false);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') void apiClient.ensureMediaToken();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [authStatus]);
 
   // Sync stored setting to Rust on startup
   useEffect(() => {
@@ -139,7 +150,9 @@ function MainApp() {
       if (currentServerUrl !== serverUrl && isLoopbackVoiceboxServerUrl(currentServerUrl)) {
         useServerStore.getState().setServerUrl(serverUrl);
       }
-      setServerReady(true); // Web assumes server is running
+      // Web assumes the server is running; the Connect screen takes over
+      // when the stored key (or the dev key) is missing or rejected.
+      void connectWithPlatformCredentials(platform).finally(() => setServerReady(true));
       return;
     }
 
@@ -153,9 +166,10 @@ function MainApp() {
     // In dev mode, user runs server separately
     if (!import.meta.env?.PROD) {
       console.log('Dev mode: Skipping auto-start of server (run it separately)');
-      setServerReady(true); // Mark as ready so UI doesn't show loading screen
       // Mark that server was not started by app (so we don't try to stop it on close)
       window.__voiceboxServerStartedByApp = false;
+      // Rust hands over the key from VOICEBOX_API_KEY_FILE (set by `just dev`).
+      void connectWithPlatformCredentials(platform).finally(() => setServerReady(true));
       return;
     }
 
@@ -171,18 +185,30 @@ function MainApp() {
 
     platform.lifecycle
       .startServer(isRemote, customModelsDir)
-      .then((serverUrl) => {
+      .then(async (serverUrl) => {
         console.log('Server is ready at:', serverUrl);
         // Update the server URL in the store with the dynamically assigned port
         useServerStore.getState().setServerUrl(serverUrl);
-        setServerReady(true);
         // Mark that we started the server (so we know to stop it on close)
         window.__voiceboxServerStartedByApp = true;
+        // Pick up the sidecar's key from Rust and verify it before showing the UI.
+        await connectWithPlatformCredentials(platform);
+        setServerReady(true);
       })
       .catch((error) => {
         console.error('Failed to auto-start server:', error);
         serverStartingRef.current = false;
         window.__voiceboxServerStartedByApp = false;
+
+        // A Voicebox server on our port rejected this app's key (it belongs
+        // to another data directory). Ask the user for that server's key
+        // instead of polling a health check that can never succeed.
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.startsWith('AUTH_MISMATCH:')) {
+          useServerStore.getState().setAuthStatus('unauthorized');
+          setServerReady(true);
+          return;
+        }
 
         // Only fall back to health-check polling when the error indicates the
         // port is occupied (likely an external server). For real failures
@@ -195,23 +221,17 @@ function MainApp() {
         }
 
         // Fall back to polling: the server may already be running externally
-        // (e.g. started via python/uvicorn/Docker). Poll the health endpoint
-        // until it responds with a valid Voicebox payload, then transition to
-        // the main UI.
-        console.log('Falling back to health-check polling...');
+        // (e.g. started via python/uvicorn/Docker). Verify the key against it
+        // until it answers; a rejected key lands on the Connect screen.
+        console.log('Falling back to connection polling...');
         const pollInterval = setInterval(async () => {
-          try {
-            const health = await apiClient.getHealth();
-            if (!isVoiceboxHealthResponse(health)) {
-              console.log('Health response is not from a Voicebox server, keep polling...');
-              return;
-            }
-            console.log('External Voicebox server detected via health check');
-            clearInterval(pollInterval);
-            setServerReady(true);
-          } catch {
-            // Server not ready yet, keep polling
+          await connectWithPlatformCredentials(platform);
+          if (useServerStore.getState().authStatus === 'offline') {
+            return; // Server not ready yet, keep polling
           }
+          console.log('External Voicebox server detected');
+          clearInterval(pollInterval);
+          setServerReady(true);
         }, 2000);
 
         // Stop polling after 2 minutes and surface the failure
@@ -300,6 +320,11 @@ function MainApp() {
         </div>
       </div>
     );
+  }
+
+  // Nothing talks to the API until the stored key is accepted as admin.
+  if (authStatus !== 'ok') {
+    return <ConnectScreen />;
   }
 
   return <RouterProvider router={router} />;

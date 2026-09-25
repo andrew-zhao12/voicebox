@@ -23,6 +23,7 @@ import { Sidebar } from '@/components/Sidebar';
 import { StoriesTab } from '@/components/StoriesTab/StoriesTab';
 import { Toaster } from '@/components/ui/toaster';
 import { VoicesTab } from '@/components/VoicesTab/VoicesTab';
+import { useChordSync } from '@/lib/hooks/useChordSync';
 import { useGenerationProgress } from '@/lib/hooks/useGenerationProgress';
 import { useModelDownloadToast } from '@/lib/hooks/useModelDownloadToast';
 import { MODEL_DISPLAY_NAMES, useRestoreActiveTasks } from '@/lib/hooks/useRestoreActiveTasks';
@@ -37,6 +38,11 @@ function RootLayout() {
 
   // Subscribe to SSE for pending generations — handles completion, auto-play, and history refresh
   useGenerationProgress();
+
+  // Replay the saved chord into the Rust hotkey listener every time
+  // capture_settings resolves or the user edits the chord. Lives here rather
+  // than in App so it only queries the API once the key is accepted.
+  useChordSync();
 
   return (
     <AppFrame>

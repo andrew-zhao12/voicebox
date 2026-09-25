@@ -21,7 +21,7 @@ import { BOTTOM_SAFE_AREA_PADDING } from '@/lib/constants/ui';
 import { useProfiles } from '@/lib/hooks/useProfiles';
 import { cn } from '@/lib/utils/cn';
 import { usePlayerStore } from '@/stores/playerStore';
-import { useServerStore } from '@/stores/serverStore';
+import { useAvatarUrl } from '@/lib/hooks/useAvatarUrl';
 import { useUIStore } from '@/stores/uiStore';
 import { VoiceInspector } from './VoiceInspector';
 
@@ -197,9 +197,10 @@ function VoiceRow({
   onChannelChange,
 }: VoiceRowProps) {
   const { t } = useTranslation();
-  const serverUrl = useServerStore((state) => state.serverUrl);
   const [avatarError, setAvatarError] = useState(false);
-  const avatarUrl = profile.avatar_path ? `${serverUrl}/profiles/${profile.id}/avatar` : null;
+  const tokenedAvatarUrl = useAvatarUrl(profile.id);
+  const avatarUrl = profile.avatar_path ? tokenedAvatarUrl : null;
+  useEffect(() => setAvatarError(false), [avatarUrl]);
 
   const enabledEffects = profile.effects_chain?.filter((e) => e.enabled) ?? [];
   const effectsSummary = enabledEffects.map((e) => e.type).join(' → ');

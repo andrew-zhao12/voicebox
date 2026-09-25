@@ -28,6 +28,7 @@ import { useDictationReadiness } from '@/lib/hooks/useDictationReadiness';
 import { useCaptureSettings } from '@/lib/hooks/useSettings';
 import { useProfiles } from '@/lib/hooks/useProfiles';
 import { usePlatform } from '@/platform/PlatformContext';
+import { authHeaders } from '@/lib/api/client';
 import { useServerStore } from '@/stores/serverStore';
 import { cn } from '@/lib/utils/cn';
 import { defaultChordKeys, displayLabelForKey, modifierSideHint } from '@/lib/utils/keyCodes';
@@ -146,7 +147,7 @@ export function CapturesPage() {
   const [capturesPath, setCapturesPath] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch(`${serverUrl}/health/filesystem`)
+    fetch(`${serverUrl}/health/filesystem`, { headers: authHeaders() })
       .then((res) => res.json())
       .then((data) => {
         const dir = data.directories?.find((d: { path: string }) =>

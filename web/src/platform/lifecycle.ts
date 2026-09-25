@@ -1,4 +1,4 @@
-import type { PlatformLifecycle, ServerLogEntry } from '@/platform/types';
+import type { PlatformLifecycle, ServerCredentials, ServerLogEntry } from '@/platform/types';
 import { getDefaultServerUrl } from '@/stores/serverStore';
 
 class WebLifecycle implements PlatformLifecycle {
@@ -35,6 +35,16 @@ class WebLifecycle implements PlatformLifecycle {
   subscribeToServerLogs(_callback: (_entry: ServerLogEntry) => void): () => void {
     // No-op for web - server logs are not available
     return () => {};
+  }
+
+  async getCredentials(): Promise<ServerCredentials> {
+    // The DEV guard is deliberate: a production bundle must never embed a
+    // key, so `web/dist` always starts on the Connect screen.
+    const devKey = import.meta.env.DEV ? import.meta.env.VITE_VOICEBOX_API_KEY : undefined;
+    return {
+      url: import.meta.env.VITE_SERVER_URL || getDefaultServerUrl(),
+      apiKey: devKey || null,
+    };
   }
 }
 

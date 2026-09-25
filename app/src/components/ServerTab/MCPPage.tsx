@@ -51,6 +51,7 @@ export function MCPPage() {
   const [newLabel, setNewLabel] = useState('');
   const [newProfileId, setNewProfileId] = useState('');
   const [adding, setAdding] = useState(false);
+  const [copiedKey, setCopiedKey] = useState(false);
 
   const handleAdd = async () => {
     if (!newClientId.trim()) return;
@@ -84,7 +85,10 @@ export function MCPPage() {
                 mcpServers: {
                   voicebox: {
                     url: mcpUrl,
-                    headers: { 'X-Voicebox-Client-Id': 'claude-code' },
+                    headers: {
+                      Authorization: 'Bearer <VOICEBOX_API_KEY>',
+                      'X-Voicebox-Client-Id': 'claude-code',
+                    },
                   },
                 },
               },
@@ -95,7 +99,7 @@ export function MCPPage() {
           <SnippetRow
             title={t('settings.mcp.install.claudeCode.title')}
             description={t('settings.mcp.install.claudeCode.description')}
-            snippet={`claude mcp add voicebox --transport http --url ${mcpUrl} --header "X-Voicebox-Client-Id: claude-code"`}
+            snippet={`claude mcp add voicebox --transport http --url ${mcpUrl} --header "Authorization: Bearer <VOICEBOX_API_KEY>" --header "X-Voicebox-Client-Id: claude-code"`}
           />
           <SnippetRow
             title={t('settings.mcp.install.stdio.title')}
@@ -105,13 +109,35 @@ export function MCPPage() {
                 mcpServers: {
                   voicebox: {
                     command: stdioShimCommand,
-                    env: { VOICEBOX_CLIENT_ID: 'claude-code' },
+                    env: {
+                      VOICEBOX_API_KEY: '<VOICEBOX_API_KEY>',
+                      VOICEBOX_CLIENT_ID: 'claude-code',
+                    },
                   },
                 },
               },
               null,
               2,
             )}
+          />
+          <SettingRow
+            title={t('settings.mcp.apiKey.title')}
+            description={t('settings.mcp.apiKey.description')}
+            action={
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={async () => {
+                  const key = useServerStore.getState().apiKey;
+                  if (!key) return;
+                  await navigator.clipboard.writeText(key);
+                  setCopiedKey(true);
+                  window.setTimeout(() => setCopiedKey(false), 2000);
+                }}
+              >
+                {copiedKey ? t('settings.mcp.apiKey.copied') : t('settings.mcp.apiKey.copy')}
+              </Button>
+            }
           />
         </SettingSection>
 

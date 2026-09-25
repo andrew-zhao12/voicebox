@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef } from 'react';
-import { apiClient } from '@/lib/api/client';
+import { apiClient, authHeaders } from '@/lib/api/client';
 import type { StoryItemDetail } from '@/lib/api/types';
 import { useStoryStore } from '@/stores/storyStore';
 
@@ -125,7 +125,7 @@ export function useStoryPlayback(items: StoryItemDetail[] | undefined) {
         const audioUrl = getAudioUrlForItem(item);
         console.log('[StoryPlayback] Preloading audio buffer:', key);
 
-        const preloadPromise = fetch(audioUrl)
+        const preloadPromise = fetch(apiClient.withMediaToken(audioUrl), { headers: authHeaders() })
           .then((response) => response.arrayBuffer())
           .then((arrayBuffer) => audioContext.decodeAudioData(arrayBuffer))
           .then((audioBuffer) => {

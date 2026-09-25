@@ -4,7 +4,10 @@ import { useEffect, useRef, useState } from 'react';
 import { CapturePill } from '@/components/CapturePill/CapturePill';
 import { apiClient } from '@/lib/api/client';
 import type { FocusSnapshot } from '@/lib/api/types';
+import { markCredentialsReady } from '@/lib/credentials';
 import { useCaptureRecordingSession } from '@/lib/hooks/useCaptureRecordingSession';
+import { usePlatform } from '@/platform/PlatformContext';
+import { useServerStore } from '@/stores/serverStore';
 
 /**
  * Floating dictate surface shown in a separate transparent Tauri window.
@@ -34,6 +37,24 @@ export function DictateWindow() {
       document.body.style.background = prevBody;
     };
   }, []);
+
+  // This webview has its own JS context (zustand persist does not sync
+  // across windows, and in Tauri the key is memory-only), so fetch the
+  // server URL and key from Rust before anything here talks to the API.
+  const platform = usePlatform();
+  useEffect(() => {
+    platform.lifecycle
+      .getCredentials()
+      .then((creds) => {
+        const store = useServerStore.getState();
+        if (creds.url) store.setServerUrl(creds.url);
+        if (creds.apiKey) store.setApiKey(creds.apiKey);
+      })
+      .catch((err) => {
+        console.warn('[dictate] server credentials unavailable:', err);
+      })
+      .finally(() => markCredentialsReady());
+  }, [platform.lifecycle]);
 
   // Snapshot of the focused UI element at chord-start, shipped over from
   // Rust on the ``dictate:start`` payload. Held in a ref so it survives
@@ -130,7 +151,11 @@ export function DictateWindow() {
     setSpeaking(null);
   };
 
-  const startSpeakPlayback = (generationId: string) => {
+  const startSpeakPlayback = async (generationId: string) => {
+    // The audio element cannot send headers; the URL carries a media token
+    // and this hidden window has no refresh timer, so fetch one on demand.
+    await apiClient.ensureMediaToken();
+    if (speakingRef.current?.generationId !== generationId) return;
     const audio = new Audio(apiClient.getAudioUrl(generationId));
     audio.onended = () => dismissSpeak(generationId);
     audio.onerror = () => dismissSpeak(generationId);
@@ -152,6 +177,44 @@ export function DictateWindow() {
       console.warn('[dictate] audio.play failed:', err);
       dismissSpeak(generationId);
     });
+  };
+
+  // Monotonic id per speak cycle so async work from a superseded cycle
+  // (token refresh, stream re-open) cannot touch the current one.
+  const speakCycleRef = useRef(0);
+
+  const openStatusSource = (id: string, cycle: number, retried: boolean) => {
+    const source = new EventSource(apiClient.getGenerationStatusUrl(id));
+    statusSourceRef.current = source;
+    source.onmessage = (msg) => {
+      try {
+        const data = JSON.parse(msg.data) as { status?: string };
+        if (data.status === 'completed') {
+          clearStatusTimeout();
+          source.close();
+          if (statusSourceRef.current === source) statusSourceRef.current = null;
+          void startSpeakPlayback(id);
+        } else if (data.status === 'failed' || data.status === 'not_found') {
+          clearStatusTimeout();
+          source.close();
+          dismissSpeak(id);
+        }
+      } catch {
+        // heartbeats / junk — ignore.
+      }
+    };
+    source.onerror = () => {
+      // Transient drops reconnect on their own and the 60 s timeout is the
+      // backstop. CLOSED means the server refused the stream (a stale media
+      // token after a restart): refresh the token once and reopen.
+      if (source.readyState !== EventSource.CLOSED) return;
+      if (retried || speakCycleRef.current !== cycle) return;
+      if (statusSourceRef.current === source) statusSourceRef.current = null;
+      useServerStore.getState().setMediaToken(null);
+      void apiClient.ensureMediaToken().then(() => {
+        if (speakCycleRef.current === cycle) openStatusSource(id, cycle, true);
+      });
+    };
   };
 
   useEffect(() => {
@@ -177,10 +240,6 @@ export function DictateWindow() {
         setSpeaking({ generationId: id, startedAt: null });
         setSpeakElapsed(0);
 
-        // Subscribe to this one generation's status. When it completes, the
-        // `/audio/{id}` endpoint will serve the WAV we need to play.
-        const source = new EventSource(apiClient.getGenerationStatusUrl(id));
-        statusSourceRef.current = source;
         // Hard cap on how long the pill can sit in the 'speaking' state
         // without ever hearing back from the backend. Covers the case where
         // the gen row is deleted mid-flight (SSE 404s and EventSource silently
@@ -193,27 +252,13 @@ export function DictateWindow() {
             dismissSpeak(id);
           }
         }, 60_000);
-        source.onmessage = (msg) => {
-          try {
-            const data = JSON.parse(msg.data) as { status?: string };
-            if (data.status === 'completed') {
-              clearStatusTimeout();
-              source.close();
-              if (statusSourceRef.current === source) statusSourceRef.current = null;
-              startSpeakPlayback(id);
-            } else if (data.status === 'failed' || data.status === 'not_found') {
-              clearStatusTimeout();
-              source.close();
-              dismissSpeak(id);
-            }
-          } catch {
-            // heartbeats / junk — ignore.
-          }
-        };
-        source.onerror = () => {
-          // EventSource auto-reconnects on transient drops; the timeout above
-          // is the backstop for the case where it never recovers.
-        };
+        // Subscribe to this one generation's status. When it completes, the
+        // `/audio/{id}` endpoint will serve the WAV we need to play. The
+        // stream URL carries a media token, so make sure one exists first.
+        const cycle = ++speakCycleRef.current;
+        void apiClient.ensureMediaToken().then(() => {
+          if (speakCycleRef.current === cycle) openStatusSource(id, cycle, false);
+        });
       }),
     );
 

@@ -53,6 +53,8 @@ import type {
   MCPClientBindingUpsert,
   CloudLoginStartResponse,
   CloudStatus,
+  MediaTokenResponse,
+  WhoAmIResponse,
 } from './types';
 
 function formatErrorDetail(detail: unknown, fallback: string): string {
@@ -70,10 +72,64 @@ function formatErrorDetail(detail: unknown, fallback: string): string {
   return fallback;
 }
 
+/**
+ * Non-2xx response from the backend. `status` lets callers tell auth failures
+ * (401/403) and rate limits (429) apart from everything else; `detail` is the
+ * parsed `{"detail": ...}` body (or the status text when there was none).
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly detail: unknown;
+
+  constructor(status: number, message: string, detail: unknown) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+/** Bearer header for the current API key; empty when no key is set. */
+export function authHeaders(): Record<string, string> {
+  const apiKey = useServerStore.getState().apiKey;
+  return apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
+}
+
+/** Refresh a media token once it is this close to expiring. */
+const MEDIA_TOKEN_REFRESH_MARGIN_MS = 30_000;
+
 class ApiClient {
+  /** Single-flight guard so concurrent callers share one `/auth/media-token` request. */
+  private mediaTokenInflight: Promise<string | null> | null = null;
+
   private getBaseUrl(): string {
     const serverUrl = useServerStore.getState().serverUrl;
     return serverUrl;
+  }
+
+  /**
+   * Turn a failed response into an `ApiError`. A 401/403 also flips the
+   * store's `authStatus`, which sends the app back to the Connect screen;
+   * pass `updateAuthStatus = false` when probing a key the user is only testing.
+   */
+  private async fail(response: Response, updateAuthStatus = true): Promise<never> {
+    const body: unknown = await response.json().catch(() => null);
+    const detail =
+      body && typeof body === 'object' && 'detail' in body
+        ? (body as { detail: unknown }).detail
+        : response.statusText;
+    if (updateAuthStatus) {
+      if (response.status === 401) {
+        useServerStore.getState().setAuthStatus('unauthorized');
+      } else if (response.status === 403) {
+        useServerStore.getState().setAuthStatus('forbidden');
+      }
+    }
+    throw new ApiError(
+      response.status,
+      formatErrorDetail(detail, `HTTP error! status: ${response.status}`),
+      detail,
+    );
   }
 
   private async request<T>(endpoint: string, options?: RequestInit): Promise<T> {
@@ -82,23 +138,90 @@ class ApiClient {
       ...options,
       headers: {
         'Content-Type': 'application/json',
+        ...authHeaders(),
         ...options?.headers,
       },
     });
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({
-        detail: response.statusText,
-      }));
-      throw new Error(formatErrorDetail(error.detail, `HTTP error! status: ${response.status}`));
-    }
+    if (!response.ok) return this.fail(response);
 
     return response.json();
   }
 
-  // Health
+  // Health. Without a key the backend answers only {status, service}; the full
+  // body needs a bearer, so callers that read gpu/model fields must be authed.
   async getHealth(): Promise<HealthResponse> {
     return this.request<HealthResponse>('/health');
+  }
+
+  // Auth
+  async whoami(override?: { baseUrl: string; apiKey: string }): Promise<WhoAmIResponse> {
+    if (!override) {
+      return this.request<WhoAmIResponse>('/auth/whoami');
+    }
+    // Probe credentials the user is still editing without touching the store.
+    const base = override.baseUrl.replace(/\/+$/, '');
+    const response = await fetch(`${base}/auth/whoami`, {
+      headers: { Authorization: `Bearer ${override.apiKey}` },
+    });
+    if (!response.ok) return this.fail(response, false);
+    return response.json();
+  }
+
+  async getMediaToken(): Promise<MediaTokenResponse> {
+    return this.request<MediaTokenResponse>('/auth/media-token', { method: 'POST' });
+  }
+
+  /**
+   * Return a media token that is good for at least another 30 s, fetching a
+   * new one when needed (`force` always fetches, for the scheduled refresh).
+   * Concurrent callers share one request. Resolves null when there is no API
+   * key or the fetch failed (a 401 there has already flipped `authStatus`).
+   */
+  async ensureMediaToken(force = false): Promise<string | null> {
+    const state = useServerStore.getState();
+    if (!state.apiKey) return null;
+    const current = state.mediaToken;
+    if (!force && current && current.expiresAt - Date.now() > MEDIA_TOKEN_REFRESH_MARGIN_MS) {
+      return current.token;
+    }
+    if (!this.mediaTokenInflight) {
+      this.mediaTokenInflight = this.getMediaToken()
+        .then((res) => {
+          useServerStore.getState().setMediaToken({
+            token: res.token,
+            expiresAt: Date.now() + res.expires_in * 1000,
+          });
+          return res.token;
+        })
+        .catch((err: unknown) => {
+          console.warn('[api] media token refresh failed:', err);
+          return null;
+        })
+        .finally(() => {
+          this.mediaTokenInflight = null;
+        });
+    }
+    return this.mediaTokenInflight;
+  }
+
+  /**
+   * Stamp (or re-stamp) the current media token onto a media/SSE URL. Callers
+   * that keep URLs around (playerStore, EventSource re-opens) call this again
+   * at use time so a refreshed token replaces the old `token` param.
+   */
+  withMediaToken(
+    url: string,
+    token: string | null = useServerStore.getState().mediaToken?.token ?? null,
+  ): string {
+    if (!token) return url;
+    try {
+      const parsed = new URL(url);
+      parsed.searchParams.set('token', token);
+      return parsed.toString();
+    } catch {
+      return url;
+    }
   }
 
   // Profiles
@@ -157,15 +280,11 @@ class ApiClient {
 
     const response = await fetch(url, {
       method: 'POST',
+      headers: authHeaders(),
       body: formData,
     });
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({
-        detail: response.statusText,
-      }));
-      throw new Error(formatErrorDetail(error.detail, `HTTP error! status: ${response.status}`));
-    }
+    if (!response.ok) return this.fail(response);
 
     return response.json();
   }
@@ -192,14 +311,9 @@ class ApiClient {
 
   async exportProfile(profileId: string): Promise<Blob> {
     const url = `${this.getBaseUrl()}/profiles/${profileId}/export`;
-    const response = await fetch(url);
+    const response = await fetch(url, { headers: authHeaders() });
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({
-        detail: response.statusText,
-      }));
-      throw new Error(formatErrorDetail(error.detail, `HTTP error! status: ${response.status}`));
-    }
+    if (!response.ok) return this.fail(response);
 
     return response.blob();
   }
@@ -211,15 +325,11 @@ class ApiClient {
 
     const response = await fetch(url, {
       method: 'POST',
+      headers: authHeaders(),
       body: formData,
     });
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({
-        detail: response.statusText,
-      }));
-      throw new Error(formatErrorDetail(error.detail, `HTTP error! status: ${response.status}`));
-    }
+    if (!response.ok) return this.fail(response);
 
     return response.json();
   }
@@ -231,15 +341,11 @@ class ApiClient {
 
     const response = await fetch(url, {
       method: 'POST',
+      headers: authHeaders(),
       body: formData,
     });
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({
-        detail: response.statusText,
-      }));
-      throw new Error(formatErrorDetail(error.detail, `HTTP error! status: ${response.status}`));
-    }
+    if (!response.ok) return this.fail(response);
 
     return response.json();
   }
@@ -281,12 +387,10 @@ class ApiClient {
     form.append('file', file);
     const res = await fetch(`${this.getBaseUrl()}/generate/import`, {
       method: 'POST',
+      headers: authHeaders(),
       body: form,
     });
-    if (!res.ok) {
-      const detail = await res.text().catch(() => res.statusText);
-      throw new Error(detail || `HTTP ${res.status}`);
-    }
+    if (!res.ok) return this.fail(res);
     return res.json();
   }
 
@@ -328,28 +432,18 @@ class ApiClient {
 
   async exportGeneration(generationId: string): Promise<Blob> {
     const url = `${this.getBaseUrl()}/history/${generationId}/export`;
-    const response = await fetch(url);
+    const response = await fetch(url, { headers: authHeaders() });
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({
-        detail: response.statusText,
-      }));
-      throw new Error(formatErrorDetail(error.detail, `HTTP error! status: ${response.status}`));
-    }
+    if (!response.ok) return this.fail(response);
 
     return response.blob();
   }
 
   async exportGenerationAudio(generationId: string): Promise<Blob> {
     const url = `${this.getBaseUrl()}/history/${generationId}/export-audio`;
-    const response = await fetch(url);
+    const response = await fetch(url, { headers: authHeaders() });
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({
-        detail: response.statusText,
-      }));
-      throw new Error(formatErrorDetail(error.detail, `HTTP error! status: ${response.status}`));
-    }
+    if (!response.ok) return this.fail(response);
 
     return response.blob();
   }
@@ -367,31 +461,52 @@ class ApiClient {
 
     const response = await fetch(url, {
       method: 'POST',
+      headers: authHeaders(),
       body: formData,
     });
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({
-        detail: response.statusText,
-      }));
-      throw new Error(formatErrorDetail(error.detail, `HTTP error! status: ${response.status}`));
-    }
+    if (!response.ok) return this.fail(response);
 
     return response.json();
   }
 
+  // Media and SSE URLs. Browsers cannot attach headers to <img>, <audio> or
+  // EventSource loads, so these carry the short-lived media token instead.
+  // They are stamped with the token current at call time; keep them fresh
+  // with `withMediaToken` when a URL is stored and used later.
+
   // Generation status SSE
   getGenerationStatusUrl(generationId: string): string {
-    return `${this.getBaseUrl()}/generate/${generationId}/status`;
+    return this.withMediaToken(`${this.getBaseUrl()}/generate/${generationId}/status`);
   }
 
   // Audio
   getAudioUrl(audioId: string): string {
-    return `${this.getBaseUrl()}/audio/${audioId}`;
+    return this.withMediaToken(`${this.getBaseUrl()}/audio/${audioId}`);
   }
 
   getSampleUrl(sampleId: string): string {
-    return `${this.getBaseUrl()}/samples/${sampleId}`;
+    return this.withMediaToken(`${this.getBaseUrl()}/samples/${sampleId}`);
+  }
+
+  getAvatarUrl(profileId: string, token?: string | null): string {
+    return this.withMediaToken(`${this.getBaseUrl()}/profiles/${profileId}/avatar`, token);
+  }
+
+  getModelProgressUrl(modelName: string): string {
+    return this.withMediaToken(`${this.getBaseUrl()}/models/progress/${modelName}`);
+  }
+
+  getCudaProgressUrl(): string {
+    return this.withMediaToken(`${this.getBaseUrl()}/backend/cuda-progress`);
+  }
+
+  getRocmProgressUrl(): string {
+    return this.withMediaToken(`${this.getBaseUrl()}/backend/rocm-progress`);
+  }
+
+  getSpeakEventsUrl(): string {
+    return this.withMediaToken(`${this.getBaseUrl()}/events/speak`);
   }
 
   // Transcription
@@ -412,15 +527,11 @@ class ApiClient {
     const url = `${this.getBaseUrl()}/transcribe`;
     const response = await fetch(url, {
       method: 'POST',
+      headers: authHeaders(),
       body: formData,
     });
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({
-        detail: response.statusText,
-      }));
-      throw new Error(formatErrorDetail(error.detail, `HTTP error! status: ${response.status}`));
-    }
+    if (!response.ok) return this.fail(response);
 
     return response.json();
   }
@@ -451,13 +562,8 @@ class ApiClient {
     if (options?.sttModel) formData.append('stt_model', options.sttModel);
 
     const url = `${this.getBaseUrl()}/captures`;
-    const response = await fetch(url, { method: 'POST', body: formData });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({
-        detail: response.statusText,
-      }));
-      throw new Error(formatErrorDetail(error.detail, `HTTP error! status: ${response.status}`));
-    }
+    const response = await fetch(url, { method: 'POST', headers: authHeaders(), body: formData });
+    if (!response.ok) return this.fail(response);
     return response.json();
   }
 
@@ -488,7 +594,7 @@ class ApiClient {
   }
 
   getCaptureAudioUrl(captureId: string): string {
-    return `${this.getBaseUrl()}/captures/${captureId}/audio`;
+    return this.withMediaToken(`${this.getBaseUrl()}/captures/${captureId}/audio`);
   }
 
   // Settings
@@ -560,7 +666,7 @@ class ApiClient {
   }
 
   getMigrationProgressUrl(): string {
-    return `${this.getBaseUrl()}/models/migrate/progress`;
+    return this.withMediaToken(`${this.getBaseUrl()}/models/migrate/progress`);
   }
 
   async triggerModelDownload(modelName: string): Promise<{ message: string }> {
@@ -832,14 +938,9 @@ class ApiClient {
 
   async exportStoryAudio(storyId: string): Promise<Blob> {
     const url = `${this.getBaseUrl()}/stories/${storyId}/export-audio`;
-    const response = await fetch(url);
+    const response = await fetch(url, { headers: authHeaders() });
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({
-        detail: response.statusText,
-      }));
-      throw new Error(formatErrorDetail(error.detail, `HTTP error! status: ${response.status}`));
-    }
+    if (!response.ok) return this.fail(response);
 
     return response.blob();
   }
@@ -910,7 +1011,7 @@ class ApiClient {
   }
 
   getVersionAudioUrl(versionId: string): string {
-    return `${this.getBaseUrl()}/audio/version/${versionId}`;
+    return this.withMediaToken(`${this.getBaseUrl()}/audio/version/${versionId}`);
   }
 
   async updateProfileEffects(
@@ -927,16 +1028,11 @@ class ApiClient {
     const url = `${this.getBaseUrl()}/effects/preview/${generationId}`;
     const response = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ effects_chain: effectsChain }),
     });
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({
-        detail: response.statusText,
-      }));
-      throw new Error(formatErrorDetail(error.detail, `HTTP error! status: ${response.status}`));
-    }
+    if (!response.ok) return this.fail(response);
 
     return response.blob();
   }

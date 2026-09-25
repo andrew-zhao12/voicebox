@@ -55,6 +55,16 @@ export interface ServerLogEntry {
   line: string;
 }
 
+/**
+ * Where the backend lives and the bearer key this shell may use for it.
+ * `apiKey` is null when the platform has no key to offer (a production web
+ * build never embeds one; the user types it into the Connect screen).
+ */
+export interface ServerCredentials {
+  url: string;
+  apiKey: string | null;
+}
+
 export interface PlatformLifecycle {
   startServer(remote?: boolean, modelsDir?: string | null): Promise<string>;
   stopServer(): Promise<void>;
@@ -63,6 +73,7 @@ export interface PlatformLifecycle {
   setBackendOverride(backend?: string | null): Promise<void>;
   setupWindowCloseHandler(): Promise<void>;
   subscribeToServerLogs(callback: (entry: ServerLogEntry) => void): () => void;
+  getCredentials(): Promise<ServerCredentials>;
   onServerReady?: () => void;
 }
 

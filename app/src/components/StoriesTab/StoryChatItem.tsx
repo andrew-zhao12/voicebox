@@ -1,7 +1,7 @@
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { GripVertical, Mic, MoreHorizontal, Music, Play, RotateCcw, Trash2 } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import {
@@ -14,7 +14,7 @@ import { Textarea } from '@/components/ui/textarea';
 import type { StoryItemDetail } from '@/lib/api/types';
 import { cn } from '@/lib/utils/cn';
 import { useStoryStore } from '@/stores/storyStore';
-import { useServerStore } from '@/stores/serverStore';
+import { useAvatarUrl } from '@/lib/hooks/useAvatarUrl';
 
 interface StoryChatItemProps {
   item: StoryItemDetail;
@@ -39,10 +39,12 @@ export function StoryChatItem({
 }: StoryChatItemProps) {
   const { t } = useTranslation();
   const seek = useStoryStore((state) => state.seek);
-  const serverUrl = useServerStore((state) => state.serverUrl);
   const [avatarError, setAvatarError] = useState(false);
 
-  const avatarUrl = `${serverUrl}/profiles/${item.profile_id}/avatar`;
+  // Tokened URL that changes when the media token refreshes, so a latched
+  // error state is cleared and the <img> reloads.
+  const avatarUrl = useAvatarUrl(item.profile_id) ?? '';
+  useEffect(() => setAvatarError(false), [avatarUrl]);
 
   // Check if this item is currently playing based on timecode
   const itemStartMs = item.start_time_ms;

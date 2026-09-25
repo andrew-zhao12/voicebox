@@ -177,74 +177,102 @@ export function GpuPage() {
   useEffect(() => {
     if ((!cudaDownloading && !cudaStreaming) || !serverUrl) return;
 
-    const eventSource = new EventSource(`${serverUrl}/backend/cuda-progress`);
+    let eventSource: EventSource | null = null;
+    const connect = (retried: boolean) => {
+      const es = new EventSource(apiClient.getCudaProgressUrl());
+      eventSource = es;
 
-    eventSource.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data) as CudaDownloadProgress;
-        setDownloadProgress(data);
+      es.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data) as CudaDownloadProgress;
+          setDownloadProgress(data);
 
-        if (data.status === 'complete') {
-          eventSource.close();
-          setDownloadProgress(null);
-          setCudaStreaming(false);
-          refetchCudaStatus();
-        } else if (data.status === 'error') {
-          eventSource.close();
-          setError(data.error || tRef.current('settings.gpu.errors.downloadFailed'));
-          setDownloadProgress(null);
-          setCudaStreaming(false);
-          refetchCudaStatus();
+          if (data.status === 'complete') {
+            es.close();
+            setDownloadProgress(null);
+            setCudaStreaming(false);
+            refetchCudaStatus();
+          } else if (data.status === 'error') {
+            es.close();
+            setError(data.error || tRef.current('settings.gpu.errors.downloadFailed'));
+            setDownloadProgress(null);
+            setCudaStreaming(false);
+            refetchCudaStatus();
+          }
+        } catch (e) {
+          console.error('Error parsing CUDA progress event:', e);
         }
-      } catch (e) {
-        console.error('Error parsing CUDA progress event:', e);
-      }
-    };
+      };
 
-    eventSource.onerror = () => {
-      eventSource.close();
-      setCudaStreaming(false);
+      es.onerror = () => {
+        // A refused stream (stale media token) gets one refresh and reconnect.
+        const refused = es.readyState === EventSource.CLOSED;
+        es.close();
+        if (refused && !retried) {
+          useServerStore.getState().setMediaToken(null);
+          void apiClient.ensureMediaToken().then(() => {
+            if (eventSource === es) connect(true);
+          });
+          return;
+        }
+        setCudaStreaming(false);
+      };
     };
+    connect(false);
 
     return () => {
-      eventSource.close();
+      eventSource?.close();
     };
   }, [cudaDownloading, cudaStreaming, serverUrl, refetchCudaStatus]);
 
   useEffect(() => {
     if ((!rocmDownloading && !rocmStreaming) || !serverUrl) return;
 
-    const eventSource = new EventSource(`${serverUrl}/backend/rocm-progress`);
+    let eventSource: EventSource | null = null;
+    const connect = (retried: boolean) => {
+      const es = new EventSource(apiClient.getRocmProgressUrl());
+      eventSource = es;
 
-    eventSource.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data) as RocmDownloadProgress;
-        setRocmDownloadProgress(data);
+      es.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data) as RocmDownloadProgress;
+          setRocmDownloadProgress(data);
 
-        if (data.status === 'complete') {
-          eventSource.close();
-          setRocmDownloadProgress(null);
-          setRocmStreaming(false);
-          refetchRocmStatus();
-        } else if (data.status === 'error') {
-          eventSource.close();
-          setError(data.error || tRef.current('settings.gpu.errors.downloadFailed'));
-          setRocmDownloadProgress(null);
-          setRocmStreaming(false);
-          refetchRocmStatus();
+          if (data.status === 'complete') {
+            es.close();
+            setRocmDownloadProgress(null);
+            setRocmStreaming(false);
+            refetchRocmStatus();
+          } else if (data.status === 'error') {
+            es.close();
+            setError(data.error || tRef.current('settings.gpu.errors.downloadFailed'));
+            setRocmDownloadProgress(null);
+            setRocmStreaming(false);
+            refetchRocmStatus();
+          }
+        } catch (e) {
+          console.error('Error parsing ROCm progress event:', e);
         }
-      } catch (e) {
-        console.error('Error parsing ROCm progress event:', e);
-      }
-    };
+      };
 
-    eventSource.onerror = () => {
-      eventSource.close();
-      setRocmStreaming(false);
+      es.onerror = () => {
+        // A refused stream (stale media token) gets one refresh and reconnect.
+        const refused = es.readyState === EventSource.CLOSED;
+        es.close();
+        if (refused && !retried) {
+          useServerStore.getState().setMediaToken(null);
+          void apiClient.ensureMediaToken().then(() => {
+            if (eventSource === es) connect(true);
+          });
+          return;
+        }
+        setRocmStreaming(false);
+      };
     };
+    connect(false);
 
     return () => {
-      eventSource.close();
+      eventSource?.close();
     };
   }, [rocmDownloading, rocmStreaming, serverUrl, refetchRocmStatus]);
 

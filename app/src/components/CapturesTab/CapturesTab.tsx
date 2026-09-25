@@ -57,7 +57,7 @@ import {
   ListPaneTitleRow,
 } from '@/components/ListPane';
 import { useToast } from '@/components/ui/use-toast';
-import { apiClient } from '@/lib/api/client';
+import { apiClient, authHeaders } from '@/lib/api/client';
 import type {
   CaptureListResponse,
   CaptureResponse,
@@ -341,7 +341,9 @@ export function CapturesTab() {
         filters: [{ name: 'Audio', extensions: ['wav'] }],
       });
       if (!dest) return;
-      const res = await fetch(apiClient.getCaptureAudioUrl(selected.id));
+      const res = await fetch(apiClient.getCaptureAudioUrl(selected.id), {
+        headers: authHeaders(),
+      });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const buf = new Uint8Array(await res.arrayBuffer());
       await writeFile(dest, buf);

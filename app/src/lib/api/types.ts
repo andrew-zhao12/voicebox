@@ -262,6 +262,8 @@ export interface TranscriptionResponse {
 
 export interface HealthResponse {
   status: string;
+  /** "voicebox" — the only extra field on the unauthenticated `/health` body. */
+  service?: string;
   model_loaded: boolean;
   model_downloaded?: boolean;
   model_size?: string;
@@ -559,4 +561,20 @@ export interface CloudStatus {
   key_prefix: string | null;
   connected_at: string | null;
   dashboard_url: string;
+}
+
+/* ─── Auth ────────────────────────────────────────────────────────────── */
+
+export interface WhoAmIResponse {
+  key_id: string;
+  role: 'admin' | 'client';
+  via: 'header' | 'token';
+  /** Per-minute limits by dimension; null means unlimited. */
+  limits: Record<string, number | null>;
+}
+
+export interface MediaTokenResponse {
+  token: string;
+  /** Seconds until the token expires (1800 by default). */
+  expires_in: number;
 }
