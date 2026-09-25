@@ -17,6 +17,7 @@ from starlette.middleware.body_limit import RequestBodyLimitMiddleware
 from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from ..api_errors import error_body
 from . import policy
 from .principal import ANONYMOUS, Principal, principal_from_scope, principal_var
 
@@ -38,8 +39,9 @@ def client_ip(scope: Scope) -> str:
     return client[0] if client and client[0] else "unknown"
 
 
-def _json(status: int, detail: str, headers: dict[str, str] | None = None) -> JSONResponse:
-    return JSONResponse({"detail": detail}, status_code=status, headers=headers)
+def _json(scope: Scope, status: int, detail: str, headers: dict[str, str] | None = None) -> JSONResponse:
+    """An error body: ``{"detail": ...}``, or the OpenAI envelope under ``/v1/``."""
+    return JSONResponse(error_body(str(scope.get("path", "/")), status, detail), status_code=status, headers=headers)
 
 
 def _prefers_html(accept: str | None) -> bool:
@@ -115,7 +117,7 @@ class AuthMiddleware:
         docs_enabled = not self.runtime.settings.disable_docs
         if not policy.allows(principal.role, method, path, docs_enabled=docs_enabled):
             self.runtime.limiter.note_auth_failure(client_ip(scope))
-            await _json(403, "Admin key required")(scope, receive, send)
+            await _json(scope, 403, "Admin key required")(scope, receive, send)
             return
 
         await self._run_as(principal, scope, receive, send)
@@ -170,7 +172,7 @@ class AuthMiddleware:
                 return
             decision = limiter.charge_public(ip)
             if not decision.allowed:
-                await _json(429, "Too many requests", limiter.headers_for(decision))(scope, receive, send)
+                await _json(scope, 429, "Too many requests", limiter.headers_for(decision))(scope, receive, send)
                 return
             await self._run_as(ANONYMOUS, scope, receive, send)
             return
@@ -188,7 +190,7 @@ class AuthMiddleware:
         if failure in ("missing", "invalid") and not token_path:
             decision = limiter.note_auth_failure(ip)
             if not decision.allowed:
-                await _json(429, "Too many failed authentication attempts", limiter.headers_for(decision))(
+                await _json(scope, 429, "Too many failed authentication attempts", limiter.headers_for(decision))(
                     scope, receive, send
                 )
                 return
@@ -199,7 +201,7 @@ class AuthMiddleware:
             detail, challenge = "Invalid or expired media token", WWW_AUTHENTICATE_INVALID
         else:
             detail, challenge = "Authentication required", WWW_AUTHENTICATE
-        await _json(401, detail, {"WWW-Authenticate": challenge})(scope, receive, send)
+        await _json(scope, 401, detail, {"WWW-Authenticate": challenge})(scope, receive, send)
 
     @staticmethod
     def _spa_response(path: str, headers: Headers, frontend_dir: Path) -> Response | str | None:
@@ -285,7 +287,7 @@ class RateLimitMiddleware:
 
     async def _reject(self, scope: Scope, receive: Receive, send: Send, dimension: str, decision) -> None:
         detail = f"Rate limit exceeded for {dimension}; retry in {max(1, decision.retry_after_s)} s"
-        await _json(429, detail, self.runtime.limiter.headers_for(decision))(scope, receive, send)
+        await _json(scope, 429, detail, self.runtime.limiter.headers_for(decision))(scope, receive, send)
 
 
 def _content_length(headers: Headers) -> int:

@@ -6,6 +6,7 @@ backend/tests/test_auth_routes.py
 backend/tests/test_auth_tokens.py
 backend/tests/test_chunked_tts_stream.py
 backend/tests/test_cors.py
+backend/tests/test_encode.py
 backend/tests/test_inference_slots.py
 backend/tests/test_keys_cli.py
 backend/tests/test_lifecycle.py

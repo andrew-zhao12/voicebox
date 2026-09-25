@@ -859,3 +859,19 @@ class PruneReportResponse(BaseModel):
     orphan_files: int
     freed_bytes: int
     errors: int
+
+
+class OpenAISpeechRequest(BaseModel):
+    """Body of ``POST /v1/audio/speech`` (OpenAI's shape plus a ``language`` extension)."""
+
+    model: str = Field(default="tts-1", max_length=100)
+    input: str = Field(..., min_length=1, max_length=50000)
+    voice: str = Field(..., min_length=1, max_length=200)
+    response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = "mp3"
+    speed: float = Field(default=1.0, ge=0.25, le=4.0)
+    instructions: Optional[str] = Field(None, max_length=500)
+    language: Optional[str] = Field(
+        None,
+        pattern="^(zh|en|ja|ko|de|fr|ru|pt|es|it|he|ar|da|el|fi|hi|ms|nl|no|pl|sv|sw|tr)$",
+        description="Voicebox extension: language of the input; defaults to the voice profile's language",
+    )

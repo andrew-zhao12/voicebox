@@ -1,20 +1,20 @@
 # Paths CI holds to `ruff check` and `ruff format --check` (the rest of the
 # backend predates ruff and is still being brought in line).  Add every new
 # module and test here; remove a path only after cleaning it.
+backend/api_errors.py
 backend/auth
+backend/config.py
 backend/keys.py
 backend/lifecycle.py
-backend/preload.py
-backend/config.py
 backend/mcp_shim
+backend/preload.py
 backend/routes/maintenance.py
+backend/routes/openai_compat.py
 backend/routes/transcription.py
 backend/services/inference_slots.py
 backend/services/preload.py
 backend/services/retention.py
 backend/services/task_queue.py
-backend/utils/chunked_tts.py
-backend/utils/wav_stream.py
 backend/tests/security_testapp.py
 backend/tests/test_auth_keystore.py
 backend/tests/test_auth_middleware.py
@@ -22,9 +22,11 @@ backend/tests/test_auth_policy.py
 backend/tests/test_auth_tokens.py
 backend/tests/test_chunked_tts_stream.py
 backend/tests/test_cors.py
+backend/tests/test_encode.py
 backend/tests/test_inference_slots.py
 backend/tests/test_keys_cli.py
 backend/tests/test_lifecycle.py
+backend/tests/test_openai_compat.py
 backend/tests/test_preload.py
 backend/tests/test_ratelimit.py
 backend/tests/test_retention.py
@@ -33,3 +35,7 @@ backend/tests/test_stream_route.py
 backend/tests/test_task_queue_cancellation.py
 backend/tests/test_task_queue_caps.py
 backend/tests/test_wav_stream.py
+backend/utils/chunked_tts.py
+backend/utils/encode.py
+backend/utils/http.py
+backend/utils/wav_stream.py

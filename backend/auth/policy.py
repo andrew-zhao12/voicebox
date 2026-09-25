@@ -97,6 +97,11 @@ CLIENT_RULES: tuple[Rule, ...] = (
     rule("POST", "/auth/media-token"),
     rule("*", "/mcp"),
     rule("*", "/mcp/"),
+    # OpenAI-compatible surface (routes/openai_compat.py)
+    rule("POST", "/v1/audio/speech"),
+    rule("POST", "/v1/audio/transcriptions"),
+    rule("GET", "/v1/models"),
+    rule("GET", "/v1/voices"),
 )
 
 ADMIN_RULES: tuple[Rule, ...] = (
@@ -224,11 +229,14 @@ INFERENCE_RULES: tuple[Rule, ...] = (
     rule("POST", "/profiles/{profile_id}/compose"),
     rule("POST", "/models/load"),
     rule("POST", "/models/download"),
+    rule("POST", "/v1/audio/speech"),
+    rule("POST", "/v1/audio/transcriptions"),
 )
 
 # Request bodies charged to ``uploads_bytes`` and capped individually.
 BODY_LIMIT_RULES: tuple[tuple[Rule, int], ...] = (
     (rule("POST", "/transcribe"), 200 * MIB),
+    (rule("POST", "/v1/audio/transcriptions"), 200 * MIB),
     (rule("POST", "/captures"), 200 * MIB),
     (rule("POST", "/generate/import"), 200 * MIB),
     (rule("POST", "/profiles/import"), 100 * MIB),
