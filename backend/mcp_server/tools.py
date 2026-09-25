@@ -14,12 +14,19 @@ import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
+from fastapi import HTTPException
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.dependencies import get_http_request
 
 from .. import models
+from ..auth import get_runtime, principal_scope
+from ..auth.principal import ANONYMOUS, Principal, principal_from_scope
+from ..auth.ratelimit import RateLimited
 from ..database import get_db
 from ..services import captures as captures_service
 from ..services import profiles as profiles_service
+from ..services.inference_slots import InferenceBusyError, whisper_slot
 from . import events as mcp_events
 from .context import current_client_id, request_is_loopback
 from .resolve import resolve_profile
@@ -30,6 +37,35 @@ logger = logging.getLogger(__name__)
 # Absolute-path transcribes are bounded to keep a bad client from
 # asking us to ingest a 20 GB file.
 MAX_TRANSCRIBE_BYTES = 200 * 1024 * 1024  # 200 MB
+
+
+def _current_principal() -> Principal:
+    """The caller of the JSON-RPC request being handled.
+
+    Read from the request scope, not a ContextVar: a stateful MCP session
+    handles every call inside the task spawned for ``initialize``, so
+    middleware ContextVars are stale here.
+    """
+    try:
+        request = get_http_request()
+    except RuntimeError:
+        return ANONYMOUS
+    return principal_from_scope(request.scope)
+
+
+def _charge_inference(principal: Principal) -> None:
+    runtime = get_runtime()
+    if runtime is None:
+        return
+    try:
+        runtime.limiter.charge_or_raise(principal, "inference")
+    except RateLimited as e:
+        raise ToolError(str(e.detail)) from e
+
+
+def _require_admin(principal: Principal, what: str) -> None:
+    if not principal.is_admin:
+        raise ToolError(f"{what} requires an admin API key.")
 
 
 def register_tools(mcp: FastMCP) -> None:
@@ -71,12 +107,14 @@ def register_tools(mcp: FastMCP) -> None:
         """
         from ..database.models import MCPClientBinding
 
+        principal = _current_principal()
+        _charge_inference(principal)
         db = next(get_db())
         try:
             client_id = current_client_id.get()
             vp = resolve_profile(profile, client_id, db)
             if vp is None:
-                raise ValueError(
+                raise ToolError(
                     "No voice profile resolved. Pass `profile=` with a "
                     "voice profile name or id, or set a default voice in "
                     "Voicebox → Settings → MCP."
@@ -99,16 +137,17 @@ def register_tools(mcp: FastMCP) -> None:
                 resolved_engine = binding.default_engine
 
             use_persona = bool(resolved_personality) and bool(vp.personality)
-            return await _speak(
-                profile_id=vp.id,
-                profile_name=vp.name,
-                text=text,
-                engine=resolved_engine,
-                language=language,
-                personality=use_persona,
-                model_size=model_size,
-                db=db,
-            )
+            with principal_scope(principal):
+                return await _speak(
+                    profile_id=vp.id,
+                    profile_name=vp.name,
+                    text=text,
+                    engine=resolved_engine,
+                    language=language,
+                    personality=use_persona,
+                    model_size=model_size,
+                    db=db,
+                )
         finally:
             db.close()
 
@@ -127,39 +166,44 @@ def register_tools(mcp: FastMCP) -> None:
         model: str | None = None,
     ) -> dict[str, Any]:
         if bool(audio_base64) == bool(audio_path):
-            raise ValueError(
+            raise ToolError(
                 "Pass exactly one of `audio_base64` or `audio_path`."
             )
 
+        principal = _current_principal()
+
         # Absolute-path mode: validate and transcribe in place. Restricted
-        # to loopback callers so a Voicebox bound on 0.0.0.0 doesn't double
-        # as an unauthenticated arbitrary-local-file read primitive.
+        # to admin keys on loopback so a Voicebox bound on 0.0.0.0 doesn't
+        # double as an arbitrary-local-file read primitive.
         if audio_path is not None:
+            _require_admin(principal, "`audio_path`")
             if not request_is_loopback():
-                raise ValueError(
+                raise ToolError(
                     "`audio_path` is only available to loopback callers — "
                     "remote callers must use `audio_base64`."
                 )
             path = Path(audio_path)
             if not path.is_absolute():
-                raise ValueError("`audio_path` must be absolute.")
+                raise ToolError("`audio_path` must be absolute.")
             if not path.is_file():
-                raise ValueError(f"File not found: {audio_path}")
+                raise ToolError(f"File not found: {audio_path}")
             if path.stat().st_size > MAX_TRANSCRIBE_BYTES:
-                raise ValueError(
+                raise ToolError(
                     f"File exceeds {MAX_TRANSCRIBE_BYTES // (1024 * 1024)} MB limit."
                 )
+            _charge_inference(principal)
             return await _transcribe_file(path, language, model)
 
         # Base64 mode: decode into a temp file, transcribe, clean up.
         try:
             raw = b64.b64decode(audio_base64, validate=True)
         except Exception as exc:
-            raise ValueError(f"Invalid audio_base64: {exc}") from exc
+            raise ToolError(f"Invalid audio_base64: {exc}") from exc
         if len(raw) > MAX_TRANSCRIBE_BYTES:
-            raise ValueError(
+            raise ToolError(
                 f"Audio exceeds {MAX_TRANSCRIBE_BYTES // (1024 * 1024)} MB limit."
             )
+        _charge_inference(principal)
         with tempfile.NamedTemporaryFile(
             suffix=".wav", delete=False
         ) as tmp:
@@ -180,10 +224,12 @@ def register_tools(mcp: FastMCP) -> None:
     async def voicebox_list_captures(
         limit: int = 20, offset: int = 0
     ) -> dict[str, Any]:
+        # Captures are the user's own dictation transcripts.
+        _require_admin(_current_principal(), "voicebox.list_captures")
         if not (1 <= limit <= 200):
-            raise ValueError("`limit` must be between 1 and 200.")
+            raise ToolError("`limit` must be between 1 and 200.")
         if offset < 0:
-            raise ValueError("`offset` must be >= 0.")
+            raise ToolError("`offset` must be >= 0.")
         db = next(get_db())
         try:
             items, total = captures_service.list_captures(
@@ -254,7 +300,12 @@ async def _speak(
         personality=personality,
         model_size=model_size,
     )
-    generation = await generate_speech(req, db)
+    try:
+        generation = await generate_speech(req, db)
+    except HTTPException as e:
+        # 404/400/429 from the route carry user-facing guidance; keep it
+        # under mask_error_details by re-raising as a ToolError.
+        raise ToolError(str(e.detail)) from e
     return _speak_response(generation, profile_name, source="mcp")
 
 
@@ -305,7 +356,7 @@ async def _transcribe_file(
     model_size = model or whisper.model_size
     valid = list(WHISPER_HF_REPOS.keys())
     if model_size not in valid:
-        raise ValueError(
+        raise ToolError(
             f"Invalid STT model '{model_size}'. Must be one of: {', '.join(valid)}"
         )
 
@@ -316,12 +367,16 @@ async def _transcribe_file(
     if (
         not whisper.is_loaded() or whisper.model_size != model_size
     ) and not whisper._is_model_cached(model_size):
-        raise ValueError(
+        raise ToolError(
             f"Whisper model '{model_size}' is not yet downloaded. Open "
             "Voicebox → Settings → Models to download it first."
         )
 
-    text = await whisper.transcribe(str(path), language, model_size)
+    try:
+        async with whisper_slot.acquire():
+            text = await whisper.transcribe(str(path), language, model_size)
+    except InferenceBusyError as e:
+        raise ToolError(str(e)) from e
     return {
         "text": text,
         "duration": duration,

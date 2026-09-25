@@ -190,8 +190,9 @@ async def list_generations(
     
     # Apply search filter (searches in text content)
     if query.search:
-        search_pattern = f"%{query.search}%"
-        q = q.filter(DBGeneration.text.like(search_pattern))
+        # Escape LIKE wildcards so a search for "100%" does not match everything.
+        escaped = query.search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        q = q.filter(DBGeneration.text.like(f"%{escaped}%", escape="\\"))
     
     # Get total count before pagination
     total_count = q.count()

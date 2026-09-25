@@ -10,10 +10,17 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from .. import config, models
-from ..services import history, personality, profiles
+from ..auth import charge, get_principal
 from ..database import Generation as DBGeneration, VoiceProfile as DBVoiceProfile, get_db
+from ..services import history, personality, profiles
 from ..services.generation import StreamSession, new_stream_session, run_generation, run_generation_stream
-from ..services.task_queue import cancel_generation as cancel_generation_job, enqueue_generation
+from ..services.inference_slots import InferenceBusyError, llm_slot
+from ..services.task_queue import (
+    QueueFullError,
+    cancel_generation as cancel_generation_job,
+    enqueue_generation,
+    ensure_capacity,
+)
 from ..utils.audio import load_audio
 from ..utils.tasks import get_task_manager
 from ..utils.wav_stream import float_to_pcm16_bytes, streaming_wav_header
@@ -30,11 +37,7 @@ IMPORT_AUDIO_MAX_BYTES = 200 * 1024 * 1024  # 200 MB
 def _get_or_create_import_profile(db: Session) -> DBVoiceProfile:
     """Singleton profile every imported audio clip points at — keeps the
     Generation FK happy without making profile_id nullable across the schema."""
-    row = (
-        db.query(DBVoiceProfile)
-        .filter(DBVoiceProfile.name == IMPORTED_AUDIO_PROFILE_NAME)
-        .first()
-    )
+    row = db.query(DBVoiceProfile).filter(DBVoiceProfile.name == IMPORTED_AUDIO_PROFILE_NAME).first()
     if row is not None:
         return row
     row = DBVoiceProfile(
@@ -54,12 +57,23 @@ def _resolve_generation_engine(data: models.GenerationRequest, profile) -> str:
     return data.engine or getattr(profile, "default_engine", None) or getattr(profile, "preset_engine", None) or "qwen"
 
 
+def _queue_full(error: QueueFullError) -> HTTPException:
+    return HTTPException(status_code=429, detail=str(error), headers={"Retry-After": str(error.retry_after_s)})
+
+
+def _busy(error: InferenceBusyError) -> HTTPException:
+    return HTTPException(status_code=429, detail=str(error), headers={"Retry-After": str(error.retry_after_s)})
+
+
 async def _rewrite_for_personality(data: models.GenerationRequest, profile) -> tuple[str, str]:
     """Return ``(text, source)``, rewriting through the profile's personality LLM when asked."""
     if not (data.personality and getattr(profile, "personality", None)):
         return data.text, "manual"
     try:
-        llm_result = await personality.rewrite_as_profile(profile.personality, data.text)
+        async with llm_slot.acquire():
+            llm_result = await personality.rewrite_as_profile(profile.personality, data.text)
+    except InferenceBusyError as e:
+        raise _busy(e) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     text = llm_result.text.strip()
@@ -93,11 +107,18 @@ async def generate_speech(
     task_manager = get_task_manager()
     generation_id = str(uuid.uuid4())
 
+    principal = get_principal()
+    try:
+        ensure_capacity(principal.key_id, principal.limits.max_pending_jobs)
+    except QueueFullError as e:
+        raise _queue_full(e) from e
+    charge("tts_chars", len(data.text))
+
     profile = await profiles.get_profile(data.profile_id, db)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
 
-    from ..backends import engine_has_model_sizes
+    from ..backends import engine_has_model_sizes, ensure_model_cached_or_raise
 
     engine = _resolve_generation_engine(data, profile)
     try:
@@ -106,6 +127,9 @@ async def generate_speech(
         raise HTTPException(status_code=400, detail=str(e))
 
     model_size = (data.model_size or "1.7B") if engine_has_model_sizes(engine) else None
+    if not principal.is_admin:
+        # Only admins may trigger a multi-gigabyte model download from the queue worker.
+        await ensure_model_cached_or_raise(engine, model_size or "default")
 
     text, source = await _rewrite_for_personality(data, profile)
 
@@ -133,24 +157,31 @@ async def generate_speech(
 
     effects_chain_config = _resolve_effects_chain(data, db)
 
-    enqueue_generation(
-        generation_id,
-        run_generation(
-            generation_id=generation_id,
-            profile_id=data.profile_id,
-            text=text,
-            language=data.language,
-            engine=engine,
-            model_size=model_size,
-            seed=data.seed,
-            normalize=data.normalize,
-            effects_chain=effects_chain_config,
-            instruct=data.instruct,
-            mode="generate",
-            max_chunk_chars=data.max_chunk_chars,
-            crossfade_ms=data.crossfade_ms,
+    try:
+        enqueue_generation(
+            generation_id,
+            run_generation(
+                generation_id=generation_id,
+                profile_id=data.profile_id,
+                text=text,
+                language=data.language,
+                engine=engine,
+                model_size=model_size,
+                seed=data.seed,
+                normalize=data.normalize,
+                effects_chain=effects_chain_config,
+                instruct=data.instruct,
+                mode="generate",
+                max_chunk_chars=data.max_chunk_chars,
+                crossfade_ms=data.crossfade_ms,
+            ),
+            owner=principal.key_id,
+            max_pending=principal.limits.max_pending_jobs,
         )
-    )
+    except QueueFullError as e:
+        task_manager.complete_generation(generation_id)
+        await history.update_generation_status(generation_id=generation_id, status="failed", db=db, error="Queue full")
+        raise _queue_full(e) from e
 
     return generation
 
@@ -164,6 +195,13 @@ async def retry_generation(generation_id: str, db: Session = Depends(get_db)):
 
     if (gen.status or "completed") != "failed":
         raise HTTPException(status_code=400, detail="Only failed generations can be retried")
+
+    principal = get_principal()
+    try:
+        ensure_capacity(principal.key_id, principal.limits.max_pending_jobs)
+    except QueueFullError as e:
+        raise _queue_full(e) from e
+    charge("tts_chars", len(gen.text or ""))
 
     gen.status = "generating"
     gen.error = None
@@ -179,20 +217,29 @@ async def retry_generation(generation_id: str, db: Session = Depends(get_db)):
         text=gen.text,
     )
 
-    enqueue_generation(
-        generation_id,
-        run_generation(
-            generation_id=generation_id,
-            profile_id=gen.profile_id,
-            text=gen.text,
-            language=gen.language,
-            engine=gen.engine or "qwen",
-            model_size=gen.model_size or "1.7B",
-            seed=gen.seed,
-            instruct=gen.instruct,
-            mode="retry",
+    try:
+        enqueue_generation(
+            generation_id,
+            run_generation(
+                generation_id=generation_id,
+                profile_id=gen.profile_id,
+                text=gen.text,
+                language=gen.language,
+                engine=gen.engine or "qwen",
+                model_size=gen.model_size or "1.7B",
+                seed=gen.seed,
+                instruct=gen.instruct,
+                mode="retry",
+            ),
+            owner=principal.key_id,
+            max_pending=principal.limits.max_pending_jobs,
         )
-    )
+    except QueueFullError as e:
+        task_manager.complete_generation(generation_id)
+        gen.status = "failed"
+        gen.error = "Queue full"
+        db.commit()
+        raise _queue_full(e) from e
 
     return models.GenerationResponse.model_validate(gen)
 
@@ -209,6 +256,13 @@ async def regenerate_generation(generation_id: str, db: Session = Depends(get_db
     if (gen.status or "completed") != "completed":
         raise HTTPException(status_code=400, detail="Generation must be completed to regenerate")
 
+    principal = get_principal()
+    try:
+        ensure_capacity(principal.key_id, principal.limits.max_pending_jobs)
+    except QueueFullError as e:
+        raise _queue_full(e) from e
+    charge("tts_chars", len(gen.text or ""))
+
     gen.status = "generating"
     gen.error = None
     db.commit()
@@ -223,21 +277,29 @@ async def regenerate_generation(generation_id: str, db: Session = Depends(get_db
 
     version_id = str(uuid.uuid4())
 
-    enqueue_generation(
-        generation_id,
-        run_generation(
-            generation_id=generation_id,
-            profile_id=gen.profile_id,
-            text=gen.text,
-            language=gen.language,
-            engine=gen.engine or "qwen",
-            model_size=gen.model_size or "1.7B",
-            seed=gen.seed,
-            instruct=gen.instruct,
-            mode="regenerate",
-            version_id=version_id,
+    try:
+        enqueue_generation(
+            generation_id,
+            run_generation(
+                generation_id=generation_id,
+                profile_id=gen.profile_id,
+                text=gen.text,
+                language=gen.language,
+                engine=gen.engine or "qwen",
+                model_size=gen.model_size or "1.7B",
+                seed=gen.seed,
+                instruct=gen.instruct,
+                mode="regenerate",
+                version_id=version_id,
+            ),
+            owner=principal.key_id,
+            max_pending=principal.limits.max_pending_jobs,
         )
-    )
+    except QueueFullError as e:
+        task_manager.complete_generation(generation_id)
+        gen.status = "completed"
+        db.commit()
+        raise _queue_full(e) from e
 
     return models.GenerationResponse.model_validate(gen)
 
@@ -348,6 +410,13 @@ async def stream_speech(
     from ..backends import engine_has_model_sizes, ensure_model_cached_or_raise
     from ..utils.effects import validate_effects_chain
 
+    principal = get_principal()
+    try:
+        ensure_capacity(principal.key_id, principal.limits.max_pending_jobs)
+    except QueueFullError as e:
+        raise _queue_full(e) from e
+    charge("tts_chars", len(data.text))
+
     profile = await profiles.get_profile(data.profile_id, db)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
@@ -374,24 +443,29 @@ async def stream_speech(
         first_chunk_chars = min(first_chunk_chars, data.max_chunk_chars)
 
     session = new_stream_session()
-    enqueue_generation(
-        session.job_id,
-        run_generation_stream(
-            session=session,
-            profile_id=data.profile_id,
-            text=text,
-            language=data.language,
-            engine=engine,
-            model_size=model_size,
-            seed=data.seed,
-            instruct=data.instruct,
-            normalize=data.normalize,
-            effects_chain=effects_chain,
-            max_chunk_chars=data.max_chunk_chars,
-            crossfade_ms=data.crossfade_ms,
-            first_chunk_chars=first_chunk_chars,
-        ),
-    )
+    try:
+        enqueue_generation(
+            session.job_id,
+            run_generation_stream(
+                session=session,
+                profile_id=data.profile_id,
+                text=text,
+                language=data.language,
+                engine=engine,
+                model_size=model_size,
+                seed=data.seed,
+                instruct=data.instruct,
+                normalize=data.normalize,
+                effects_chain=effects_chain,
+                max_chunk_chars=data.max_chunk_chars,
+                crossfade_ms=data.crossfade_ms,
+                first_chunk_chars=first_chunk_chars,
+            ),
+            owner=principal.key_id,
+            max_pending=principal.limits.max_pending_jobs,
+        )
+    except QueueFullError as e:
+        raise _queue_full(e) from e
 
     # Wait for the first playable chunk (or the failure) before sending
     # headers: early errors keep a real status code and the sample rate is
@@ -407,7 +481,8 @@ async def stream_speech(
     if isinstance(first, ValueError):
         raise HTTPException(status_code=400, detail=str(first))
     if isinstance(first, Exception):
-        raise HTTPException(status_code=500, detail=str(first))
+        logger.error("Stream %s failed before the first chunk: %s", session.job_id, first)
+        raise HTTPException(status_code=500, detail="Speech synthesis failed; see the server log")
     first_audio, sample_rate = first
 
     async def body():
@@ -492,10 +567,8 @@ async def import_audio(
             target.unlink()
         except OSError:
             pass
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not decode audio: {decode_err}",
-        ) from decode_err
+        logger.warning("Rejected audio import %s: %s", generation_id, decode_err)
+        raise HTTPException(status_code=400, detail="Could not decode the audio file") from decode_err
 
     profile = _get_or_create_import_profile(db)
     display_name = Path(file.filename or "Imported audio").stem or "Imported audio"

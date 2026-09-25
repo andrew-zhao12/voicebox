@@ -1,17 +1,18 @@
 """Capture (voice input) endpoints."""
 
 import logging
+import re
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from .. import config, models
-from ..backends import get_llm_model_configs, get_stt_model_configs
+from ..backends import WHISPER_HF_REPOS, get_llm_model_configs, get_stt_model_configs
 from ..backends.base import is_model_cached
 from ..database import Capture as DBCapture, get_db
-from ..services import captures as captures_service
-from ..services import settings as settings_service
+from ..services import captures as captures_service, settings as settings_service
+from ..services.inference_slots import InferenceBusyError, llm_slot, whisper_slot
 from ..services.refinement import RefinementFlags
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB
+
+# "auto" or a BCP-47-ish code such as "en", "pt-BR", "yue".
+LANGUAGE_RE = re.compile(r"^(auto|[a-z]{2,3}(-[A-Za-z]{2,4})?)$")
+
+
+def _busy(error: InferenceBusyError) -> HTTPException:
+    return HTTPException(status_code=429, detail=str(error), headers={"Retry-After": str(error.retry_after_s)})
 
 
 @router.post("/captures", response_model=models.CaptureCreateResponse)
@@ -37,6 +45,14 @@ async def create_capture_endpoint(
 
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    if stt_model is not None and stt_model not in WHISPER_HF_REPOS:
+        # An unknown value would otherwise become an arbitrary "openai/whisper-*" download.
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid STT model '{stt_model}'. Must be one of: {', '.join(WHISPER_HF_REPOS)}",
+        )
+    if language is not None and not LANGUAGE_RE.match(language):
+        raise HTTPException(status_code=400, detail="Invalid language code")
 
     saved = settings_service.get_capture_settings(db)
     resolved_stt = stt_model or saved.stt_model
@@ -46,19 +62,22 @@ async def create_capture_endpoint(
         resolved_language = None if language == "auto" else language
 
     try:
-        capture = await captures_service.create_capture(
-            audio_bytes=audio_bytes,
-            filename=file.filename or "capture.wav",
-            source=source,
-            language=resolved_language,
-            stt_model=resolved_stt,
-            db=db,
-        )
+        async with whisper_slot.acquire():
+            capture = await captures_service.create_capture(
+                audio_bytes=audio_bytes,
+                filename=file.filename or "capture.wav",
+                source=source,
+                language=resolved_language,
+                stt_model=resolved_stt,
+                db=db,
+            )
+    except InferenceBusyError as e:
+        raise _busy(e) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception("Failed to create capture")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to create capture") from e
 
     return models.CaptureCreateResponse(
         **capture.model_dump(),
@@ -139,15 +158,18 @@ async def refine_capture_endpoint(
     resolved_model = request.model_size or saved.llm_model
 
     try:
-        capture = await captures_service.refine_capture(
-            capture_id=capture_id,
-            flags=flags,
-            model_size=resolved_model,
-            db=db,
-        )
+        async with llm_slot.acquire():
+            capture = await captures_service.refine_capture(
+                capture_id=capture_id,
+                flags=flags,
+                model_size=resolved_model,
+                db=db,
+            )
+    except InferenceBusyError as e:
+        raise _busy(e) from e
     except Exception as e:
         logger.exception("Refinement failed for capture %s", capture_id)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Refinement failed") from e
 
     if not capture:
         raise HTTPException(status_code=404, detail="Capture not found")
@@ -214,17 +236,20 @@ async def retranscribe_capture_endpoint(
         resolved_language = request.language
 
     try:
-        capture = await captures_service.retranscribe_capture(
-            capture_id=capture_id,
-            stt_model=resolved_stt,
-            language=resolved_language,
-            db=db,
-        )
+        async with whisper_slot.acquire():
+            capture = await captures_service.retranscribe_capture(
+                capture_id=capture_id,
+                stt_model=resolved_stt,
+                language=resolved_language,
+                db=db,
+            )
+    except InferenceBusyError as e:
+        raise _busy(e) from e
     except FileNotFoundError as e:
         raise HTTPException(status_code=410, detail=str(e))
     except Exception as e:
         logger.exception("Retranscribe failed for capture %s", capture_id)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Retranscription failed") from e
 
     if not capture:
         raise HTTPException(status_code=404, detail="Capture not found")

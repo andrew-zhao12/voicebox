@@ -230,8 +230,14 @@ class ProgressManager:
             else:
                 logger.info(f"No initial progress available for {model_name}")
 
-            # Stream updates
+            # Stream updates; give up after ten minutes without a terminal
+            # event so a subscriber to an unknown or finished model name
+            # cannot hold the connection open forever.
+            deadline = asyncio.get_running_loop().time() + 600
             while True:
+                if asyncio.get_running_loop().time() > deadline:
+                    logger.info(f"Progress stream for {model_name} timed out, closing SSE connection")
+                    break
                 try:
                     # Wait for update with timeout
                     progress = await asyncio.wait_for(queue.get(), timeout=1.0)

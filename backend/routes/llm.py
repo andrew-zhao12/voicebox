@@ -6,8 +6,10 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
 from .. import models
+from ..auth import get_principal
 from ..backends import get_llm_model_configs
 from ..services import llm
+from ..services.inference_slots import InferenceBusyError, llm_slot
 from ..services.task_queue import create_background_task
 from ..utils.tasks import get_task_manager
 
@@ -31,6 +33,11 @@ async def llm_generate(request: models.LLMGenerateRequest):
 
     already_loaded = backend.is_loaded() and backend.model_size == model_size
     if not already_loaded and not backend._is_model_cached(model_size):
+        if not get_principal().is_admin:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Qwen3 {model_size} is not downloaded; ask an admin to download it first.",
+            )
         progress_model_name = f"qwen3-{model_size.lower()}"
         task_manager = get_task_manager()
 
@@ -64,15 +71,18 @@ async def llm_generate(request: models.LLMGenerateRequest):
         examples = [(pair[0], pair[1]) for pair in request.examples]
 
     try:
-        text = await backend.generate(
-            prompt=request.prompt,
-            system=request.system,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            model_size=model_size,
-            examples=examples,
-        )
+        async with llm_slot.acquire():
+            text = await backend.generate(
+                prompt=request.prompt,
+                system=request.system,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                model_size=model_size,
+                examples=examples,
+            )
         return models.LLMGenerateResponse(text=text, model_size=model_size)
+    except InferenceBusyError as e:
+        raise HTTPException(status_code=429, detail=str(e), headers={"Retry-After": str(e.retry_after_s)}) from e
     except Exception as e:
         # The backend exception text can include filesystem paths and stack
         # frames — log it server-side and hand the client a generic message.

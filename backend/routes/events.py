@@ -9,11 +9,10 @@ import asyncio
 import json
 import logging
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
 from ..mcp_server import events as mcp_events
-
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +22,14 @@ router = APIRouter()
 @router.get("/events/speak")
 async def speak_events(request: Request):
     """SSE stream of speak-start / speak-end events."""
+    try:
+        queue = mcp_events.subscribe()
+    except mcp_events.TooManySubscribersError:
+        raise HTTPException(
+            status_code=429, detail="Too many speak-event subscribers", headers={"Retry-After": "5"}
+        ) from None
 
     async def event_stream():
-        queue = mcp_events.subscribe()
         try:
             # Immediate hello so EventSource knows the connection is live.
             yield {"event": "ready", "data": "{}"}

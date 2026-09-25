@@ -6,13 +6,13 @@ import signal
 from pathlib import Path
 
 import torch
-from fastapi import APIRouter, Depends
-from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Request
+from fastapi.responses import FileResponse, JSONResponse
 
 from .. import config, models
+from ..auth.middleware import MINIMAL_HEALTH
+from ..auth.principal import principal_from_scope
 from ..services import tts
-from ..database import get_db
 from ..utils.platform_detect import get_backend_type, is_amd_gpu_windows
 
 router = APIRouter()
@@ -22,13 +22,15 @@ _frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
 
 
 @router.get("/")
-async def root():
+async def root(request: Request):
     """Root endpoint — serves SPA index.html in Docker, JSON otherwise."""
     from .. import __version__
 
     index = _frontend_dir / "index.html"
     if index.is_file():
         return FileResponse(index, media_type="text/html")
+    if not principal_from_scope(request.scope).authenticated:
+        return {"message": "voicebox API"}
     return {"message": "voicebox API", "version": __version__}
 
 
@@ -54,10 +56,19 @@ async def watchdog_disable():
 
 
 @router.get("/health", response_model=models.HealthResponse)
-async def health():
-    """Health check endpoint."""
-    from huggingface_hub import constants as hf_constants
+async def health(request: Request):
+    """Health check endpoint.
+
+    Callers without an API key get the minimal liveness body (the auth
+    middleware answers them before this handler runs; the check here is a
+    second line of defence).  Authenticated callers get the full report.
+    """
     from pathlib import Path
+
+    from huggingface_hub import constants as hf_constants
+
+    if not principal_from_scope(request.scope).authenticated:
+        return JSONResponse(MINIMAL_HEALTH)
 
     tts_model = tts.get_tts_model()
     backend_type = get_backend_type()

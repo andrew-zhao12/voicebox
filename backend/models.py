@@ -12,6 +12,10 @@ from .utils.capture_chords import (
 )
 from .utils.chunked_tts import DEFAULT_FIRST_CHUNK_CHARS
 
+# Story timelines are bounded so an export can never be asked for an absurd buffer.
+MAX_STORY_MS = 24 * 60 * 60 * 1000
+MAX_STORY_TRACKS = 64
+
 
 class VoiceProfileCreate(BaseModel):
     """Request model for creating a voice profile."""
@@ -153,7 +157,7 @@ class HistoryQuery(BaseModel):
     """Query model for generation history."""
 
     profile_id: Optional[str] = None
-    search: Optional[str] = None
+    search: Optional[str] = Field(default=None, max_length=200)
     limit: int = Field(default=50, ge=1, le=100)
     offset: int = Field(default=0, ge=0)
 
@@ -373,6 +377,7 @@ class SpeakRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=10000)
     profile: Optional[str] = Field(
         None,
+        max_length=200,
         description="Voice profile name or id. Falls back to per-client binding, then default.",
     )
     engine: Optional[str] = Field(
@@ -508,13 +513,13 @@ class ModelStatusListResponse(BaseModel):
 class ModelDownloadRequest(BaseModel):
     """Request model for triggering model download."""
 
-    model_name: str
+    model_name: str = Field(min_length=1, max_length=100)
 
 
 class ModelMigrateRequest(BaseModel):
     """Request model for migrating models to a new directory."""
 
-    destination: str
+    destination: str = Field(min_length=1, max_length=4096)
 
 
 class ActiveDownloadTask(BaseModel):
@@ -656,15 +661,15 @@ class StoryItemCreate(BaseModel):
     """Request model for adding a generation to a story."""
 
     generation_id: str
-    start_time_ms: Optional[int] = None  # If not provided, will be calculated automatically
-    track: Optional[int] = 0  # Track number (0 = main track)
+    start_time_ms: Optional[int] = Field(default=None, ge=0, le=MAX_STORY_MS)  # None: calculated automatically
+    track: Optional[int] = Field(default=0, ge=0, le=MAX_STORY_TRACKS)  # 0 = main track
 
 
 class StoryItemUpdateTime(BaseModel):
     """Request model for updating a story item's timecode."""
 
     generation_id: str
-    start_time_ms: int = Field(..., ge=0)
+    start_time_ms: int = Field(..., ge=0, le=MAX_STORY_MS)
 
 
 class StoryItemBatchUpdate(BaseModel):
@@ -682,21 +687,21 @@ class StoryItemReorder(BaseModel):
 class StoryItemMove(BaseModel):
     """Request model for moving a story item (position and/or track)."""
 
-    start_time_ms: int = Field(..., ge=0)
-    track: int = 0
+    start_time_ms: int = Field(..., ge=0, le=MAX_STORY_MS)
+    track: int = Field(default=0, ge=0, le=MAX_STORY_TRACKS)
 
 
 class StoryItemTrim(BaseModel):
     """Request model for trimming a story item."""
 
-    trim_start_ms: int = Field(..., ge=0)
-    trim_end_ms: int = Field(..., ge=0)
+    trim_start_ms: int = Field(..., ge=0, le=MAX_STORY_MS)
+    trim_end_ms: int = Field(..., ge=0, le=MAX_STORY_MS)
 
 
 class StoryItemSplit(BaseModel):
     """Request model for splitting a story item."""
 
-    split_time_ms: int = Field(..., ge=0)  # Time within the clip to split at (relative to clip start)
+    split_time_ms: int = Field(..., ge=0, le=MAX_STORY_MS)  # Time within the clip to split at (relative to clip start)
 
 
 class StoryItemVersionUpdate(BaseModel):

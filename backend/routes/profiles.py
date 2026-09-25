@@ -15,6 +15,7 @@ from .. import config, models
 from ..app import safe_content_disposition
 from ..database import VoiceProfile as DBVoiceProfile, get_db
 from ..services import channels, export_import, personality, profiles
+from ..services.inference_slots import InferenceBusyError, llm_slot
 from ..services.profiles import _profile_to_response
 
 logger = logging.getLogger(__name__)
@@ -384,7 +385,10 @@ async def compose_in_character(
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
     try:
-        result = await personality.compose_as_profile(profile.personality)
+        async with llm_slot.acquire():
+            result = await personality.compose_as_profile(profile.personality)
+    except InferenceBusyError as e:
+        raise HTTPException(status_code=429, detail=str(e), headers={"Retry-After": str(e.retry_after_s)}) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return models.PersonalityTextResponse(

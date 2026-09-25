@@ -102,18 +102,20 @@ if not os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
 if not os.environ.get("MIOPEN_LOG_LEVEL"):
     os.environ["MIOPEN_LOG_LEVEL"] = "4"
 
-import torch
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from urllib.parse import quote
 
+import torch
+from fastapi import FastAPI
+
 from . import __version__, config, database
-from .services import tts, transcribe, llm
+from .auth.install import install_security
+from .auth.settings import SecuritySettings
 from .database import get_db
+from .routes import register_routers
+from .services import llm, transcribe, tts
+from .services.task_queue import create_background_task, init_queue
 from .utils.platform_detect import get_backend_type
 from .utils.progress import get_progress_manager
-from .services.task_queue import create_background_task, init_queue
-from .routes import register_routers
 
 
 def safe_content_disposition(disposition_type: str, filename: str) -> str:
@@ -129,8 +131,8 @@ def safe_content_disposition(disposition_type: str, filename: str) -> str:
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
-    from .mcp_server.server import build_mcp_server, compose_lifespan
     from .mcp_server.context import ClientIdMiddleware
+    from .mcp_server.server import build_mcp_server, compose_lifespan
 
     # Build the MCP app up-front so we can wire its lifespan into FastAPI's —
     # FastMCP's Streamable HTTP transport only works if its session manager
@@ -157,68 +159,46 @@ def create_app() -> FastAPI:
     # models out from under any MCP request that was still generating.
     lifespan = compose_lifespan(voicebox_lifespan, mcp_app.router.lifespan_context)
 
+    frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
+    security_settings = SecuritySettings.from_env(frontend_dir=frontend_dir if frontend_dir.is_dir() else None)
+    docs_kwargs = {"docs_url": None, "redoc_url": None, "openapi_url": None} if security_settings.disable_docs else {}
+
     application = FastAPI(
         title="voicebox API",
         description="Production-quality Qwen3-TTS voice cloning API",
         version=__version__,
         lifespan=lifespan,
+        **docs_kwargs,
     )
 
-    _configure_cors(application)
+    # add_middleware wraps outward, so ClientIdMiddleware goes first and the
+    # security stack (CORS → headers → auth → rate limit → body limit) ends
+    # up around it: only authenticated requests reach the client-id stamping.
     application.add_middleware(ClientIdMiddleware)
+    install_security(application, security_settings)
     register_routers(application)
     application.mount("/mcp", mcp_app)
     logger.info("MCP: mounted at /mcp")
-    _mount_frontend(application)
+    _mount_frontend(application, security_settings.frontend_dir)
 
     return application
 
 
-def _configure_cors(application: FastAPI) -> None:
-    """Set up CORS middleware with local-first defaults."""
-    default_origins = [
-        "http://localhost:5173",  # Vite dev server
-        "http://127.0.0.1:5173",
-        "http://localhost:17493",
-        "http://127.0.0.1:17493",
-        "tauri://localhost",  # Tauri webview (macOS)
-        "https://tauri.localhost",  # Tauri webview (Windows/Linux)
-        "http://tauri.localhost",  # Tauri webview (Windows, some builds)
-    ]
-    env_origins = os.environ.get("VOICEBOX_CORS_ORIGINS", "")
-    all_origins = default_origins + [o.strip() for o in env_origins.split(",") if o.strip()]
-
-    application.add_middleware(
-        CORSMiddleware,
-        allow_origins=all_origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        # Let browser clients read the streaming metadata set by /generate/stream.
-        expose_headers=[
-            "X-Voicebox-Sample-Rate",
-            "X-Voicebox-Channels",
-            "X-Voicebox-Sample-Format",
-            "X-Voicebox-Stream-Mode",
-            "X-Voicebox-Job-Id",
-        ],
-    )
-
-
-def _mount_frontend(application: FastAPI) -> None:
+def _mount_frontend(application: FastAPI, frontend_dir: Path | None) -> None:
     """Serve the built web frontend when present (Docker / web deployment).
 
     The Dockerfile copies the Vite build output to ``/app/frontend/``.  When
     that directory exists we mount static assets and add a catch-all route so
-    the React SPA handles client-side routing.  In dev or API-only mode the
-    directory is absent and this function is a no-op.
+    the React SPA handles client-side routing.  Unauthenticated browser
+    navigations never get here: the auth middleware serves ``index.html`` for
+    them itself.  In dev or API-only mode the directory is absent and this
+    function is a no-op.
     """
-    frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
-    if not frontend_dir.is_dir():
+    if frontend_dir is None:
         return
 
-    from fastapi.staticfiles import StaticFiles
     from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
 
     # Mount hashed assets (JS, CSS, images) that Vite places under /assets
     assets_dir = frontend_dir / "assets"
@@ -258,9 +238,9 @@ def _get_gpu_status() -> str:
         if not compatible:
             label += " [UNSUPPORTED - see logs]"
         return label
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "MPS (Apple Silicon)"
-    elif backend_type == "mlx":
+    if backend_type == "mlx":
         return "Metal (Apple Silicon via MLX)"
 
     # Intel XPU (Arc / Data Center) via IPEX
@@ -300,7 +280,11 @@ async def _run_startup(application: FastAPI) -> None:
     logger.info("Database: %s", _db_path)
     logger.info("Data directory: %s", config.get_data_dir())
 
-    init_queue()
+    # Keys are loaded here, after --data-dir is final, never at import time.
+    security = application.state.security
+    security.startup()
+
+    init_queue(max_depth=security.settings.max_queue_depth)
 
     # Mark stale "generating" records as failed -- leftovers from a killed process
     from sqlalchemy import text as sa_text
@@ -317,7 +301,7 @@ async def _run_startup(application: FastAPI) -> None:
         if result.rowcount > 0:
             logger.info("Marked %d stale generation(s) as failed", result.rowcount)
 
-        from .database import VoiceProfile as DBVoiceProfile, Generation as DBGeneration
+        from .database import Generation as DBGeneration, VoiceProfile as DBVoiceProfile
 
         profile_count = db.query(DBVoiceProfile).count()
         generation_count = db.query(DBGeneration).count()

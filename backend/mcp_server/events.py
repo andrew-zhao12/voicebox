@@ -8,13 +8,21 @@ floating pill surfaces whenever an agent is speaking.
 import asyncio
 from typing import Any
 
-
 # Each subscriber gets its own queue. Bounded to drop oldest if a client lags.
 _subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
+
+# The desktop shell and a couple of pills are the only legitimate listeners.
+MAX_SUBSCRIBERS = 16
+
+
+class TooManySubscribersError(Exception):
+    pass
 
 
 def subscribe() -> asyncio.Queue[dict[str, Any]]:
     """Register a new subscriber; caller must call unsubscribe() when done."""
+    if len(_subscribers) >= MAX_SUBSCRIBERS:
+        raise TooManySubscribersError(f"More than {MAX_SUBSCRIBERS} speak-event subscribers")
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=64)
     _subscribers.add(queue)
     return queue

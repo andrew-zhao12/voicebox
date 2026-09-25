@@ -1,15 +1,20 @@
 """Transcription endpoints."""
 
 import asyncio
+import logging
 import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from .. import models
+from ..auth import get_principal
 from ..services import transcribe
+from ..services.inference_slots import InferenceBusyError, whisper_slot
 from ..services.task_queue import create_background_task
 from ..utils.tasks import get_task_manager
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -37,8 +42,8 @@ async def transcribe_audio(
 
     stt_path = tmp_path
     try:
-        from ..utils.audio import load_audio, save_audio
         from ..backends import WHISPER_HF_REPOS
+        from ..utils.audio import load_audio, save_audio
 
         audio, sr = await asyncio.to_thread(load_audio, tmp_path)
         duration = len(audio) / sr
@@ -66,6 +71,12 @@ async def transcribe_audio(
 
         already_loaded = whisper_model.is_loaded() and whisper_model.model_size == model_size
         if not already_loaded and not whisper_model._is_model_cached(model_size):
+            if not get_principal().is_admin:
+                # Downloads are an operator action; client keys only use cached models.
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Whisper model {model_size} is not downloaded; ask an admin to download it first.",
+                )
             progress_model_name = f"whisper-{model_size}"
             task_manager = get_task_manager()
 
@@ -88,7 +99,11 @@ async def transcribe_audio(
                 },
             )
 
-        text = await whisper_model.transcribe(stt_path, language, model_size)
+        try:
+            async with whisper_slot.acquire():
+                text = await whisper_model.transcribe(stt_path, language, model_size)
+        except InferenceBusyError as e:
+            raise HTTPException(status_code=429, detail=str(e), headers={"Retry-After": str(e.retry_after_s)}) from e
 
         return models.TranscriptionResponse(
             text=text,
@@ -98,7 +113,9 @@ async def transcribe_audio(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Decoder and model errors can carry temp paths; keep them in the log.
+        logger.exception("Transcription failed")
+        raise HTTPException(status_code=500, detail="Transcription failed") from e
     finally:
         Path(tmp_path).unlink(missing_ok=True)
         if stt_path != tmp_path:
