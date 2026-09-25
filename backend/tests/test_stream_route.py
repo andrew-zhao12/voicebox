@@ -15,11 +15,13 @@ import pytest
 from fastapi import HTTPException
 
 from backend import models
+from backend.auth.principal import KeyLimits, Principal
 from backend.routes import generations
 from backend.services import generation as generation_service, task_queue
 from backend.utils.wav_stream import WAV_HEADER_BYTES, float_to_pcm16_bytes, streaming_wav_header
 
 SAMPLE_RATE = 24000
+ADMIN = Principal(key_id="test", role="admin", via="header", limits=KeyLimits.defaults_for("admin"))
 # Three sentences over 50 characters each: with the minimum max_chunk_chars of
 # 100, only one fits per window, so the text always splits into exactly three chunks.
 SENTENCES = [
@@ -88,6 +90,10 @@ async def fake_backend(monkeypatch, tmp_path):
     async def ensure_cached(engine, model_size="default"):
         return None
 
+    # The route reads the caller from the auth middleware's ContextVar and
+    # charges its rate-limit buckets; neither exists in this direct-call test.
+    monkeypatch.setattr(generations, "get_principal", lambda: ADMIN)
+    monkeypatch.setattr(generations, "charge", lambda *args, **kwargs: None)
     monkeypatch.setattr(generations.profiles, "get_profile", get_profile)
     monkeypatch.setattr(generations.profiles, "validate_profile_engine", lambda profile, engine: None)
     monkeypatch.setattr(generation_service, "prepare_engine", prepare_engine)
@@ -166,14 +172,17 @@ async def test_null_first_chunk_cap_keeps_the_normal_chunking(fake_backend):
     assert fake_backend.calls == [text]
 
 
-async def test_engine_failure_before_first_chunk_is_a_real_http_error(fake_backend):
+async def test_engine_failure_before_first_chunk_is_a_real_http_error(fake_backend, caplog):
     fake_backend.fail_with = RuntimeError("model exploded")
 
     with pytest.raises(HTTPException) as excinfo:
         await generations.stream_speech(request(), db=FakeDb())
 
+    # Engine errors can carry paths, so the client gets a generic message
+    # and the real one goes to the log.
     assert excinfo.value.status_code == 500
-    assert "model exploded" in excinfo.value.detail
+    assert "model exploded" not in excinfo.value.detail
+    assert "model exploded" in caplog.text
 
 
 async def test_value_error_before_first_chunk_is_a_400(fake_backend):

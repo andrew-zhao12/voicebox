@@ -4,48 +4,28 @@ Tests for CORS origin restrictions.
 Validates that the CORS middleware only allows known local origins
 and respects the VOICEBOX_CORS_ORIGINS environment variable.
 
-Uses a minimal FastAPI app that mirrors the exact CORS configuration
-from backend/main.py, so tests run without heavy ML dependencies.
+Uses a minimal FastAPI app wired with the real ``backend.auth.install.add_cors``
+so the configuration under test is the one the server uses, without heavy ML
+dependencies.
 
 Usage:
     pip install httpx pytest fastapi starlette
     python -m pytest backend/tests/test_cors.py -v
 """
 
-import os
 import pytest
-from unittest.mock import patch
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from starlette.testclient import TestClient
+
+from backend.auth.install import add_cors
+from backend.auth.settings import SecuritySettings
 
 
 def _build_app(env_origins: str = "") -> FastAPI:
-    """
-    Build a minimal FastAPI app with the same CORS logic as backend/main.py.
-
-    This mirrors the exact code in main.py so the test validates the real
-    configuration without needing torch/numpy/transformers installed.
-    """
+    """Build a minimal FastAPI app with the server's real CORS configuration."""
     app = FastAPI()
-
-    _default_origins = [
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:17493",
-        "http://127.0.0.1:17493",
-        "tauri://localhost",
-        "https://tauri.localhost",
-    ]
-    _cors_origins = _default_origins + [o.strip() for o in env_origins.split(",") if o.strip()]
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=_cors_origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    settings = SecuritySettings.from_env(environ={"VOICEBOX_CORS_ORIGINS": env_origins, "VOICEBOX_API_KEY": "vbx_test"})
+    add_cors(app, settings)
 
     @app.get("/health")
     async def health():
@@ -54,12 +34,12 @@ def _build_app(env_origins: str = "") -> FastAPI:
     return app
 
 
-@pytest.fixture()
+@pytest.fixture
 def client():
     return TestClient(_build_app())
 
 
-@pytest.fixture()
+@pytest.fixture
 def client_with_custom_origins():
     return TestClient(_build_app("https://custom.example.com,https://other.example.com"))
 
@@ -85,24 +65,31 @@ def _preflight(client: TestClient, origin: str) -> dict:
 class TestCORSDefaultOrigins:
     """CORS should allow known local origins and block everything else."""
 
-    @pytest.mark.parametrize("origin", [
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:17493",
-        "http://127.0.0.1:17493",
-        "tauri://localhost",
-        "https://tauri.localhost",
-    ])
+    @pytest.mark.parametrize(
+        "origin",
+        [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:17493",
+            "http://127.0.0.1:17493",
+            "tauri://localhost",
+            "https://tauri.localhost",
+            "http://tauri.localhost",
+        ],
+    )
     def test_allowed_origins(self, client, origin):
         headers = _get_with_origin(client, origin)
         assert headers.get("access-control-allow-origin") == origin
 
-    @pytest.mark.parametrize("origin", [
-        "http://evil.com",
-        "http://localhost:9999",
-        "https://attacker.example.com",
-        "null",
-    ])
+    @pytest.mark.parametrize(
+        "origin",
+        [
+            "http://evil.com",
+            "http://localhost:9999",
+            "https://attacker.example.com",
+            "null",
+        ],
+    )
     def test_blocked_origins(self, client, origin):
         headers = _get_with_origin(client, origin)
         assert "access-control-allow-origin" not in headers
