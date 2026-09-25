@@ -61,6 +61,7 @@ DOCS_PATHS = ("/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json")
 PUBLIC_RULES: tuple[Rule, ...] = (
     rule("GET", "/"),
     rule("GET", "/health"),
+    rule("GET", "/health/ready"),
     rule("GET", "/cloud/callback"),
     rule("GET", "/docs"),
     rule("GET", "/docs/oauth2-redirect"),
@@ -102,6 +103,7 @@ ADMIN_RULES: tuple[Rule, ...] = (
     rule("POST", "/shutdown"),
     rule("POST", "/watchdog/disable"),
     rule("GET", "/health/filesystem"),
+    rule("POST", "/maintenance/prune"),
     rule("POST", "/profiles"),
     rule("POST", "/profiles/import"),
     rule("PUT DELETE", "/profiles/{profile_id}"),

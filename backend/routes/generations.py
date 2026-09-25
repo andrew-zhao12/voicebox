@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from .. import config, models
+from .. import config, lifecycle, models
 from ..auth import charge, get_principal
 from ..database import Generation as DBGeneration, VoiceProfile as DBVoiceProfile, get_db
 from ..services import history, personality, profiles
@@ -58,7 +58,8 @@ def _resolve_generation_engine(data: models.GenerationRequest, profile) -> str:
 
 
 def _queue_full(error: QueueFullError) -> HTTPException:
-    return HTTPException(status_code=429, detail=str(error), headers={"Retry-After": str(error.retry_after_s)})
+    status = 503 if error.reason == "draining" else 429
+    return HTTPException(status_code=status, detail=str(error), headers={"Retry-After": str(error.retry_after_s)})
 
 
 def _busy(error: InferenceBusyError) -> HTTPException:
@@ -370,6 +371,9 @@ async def get_generation_status(generation_id: str, db: Session = Depends(get_db
                 yield f"data: {json.dumps(payload)}\n\n"
 
                 if (gen.status or "completed") in ("completed", "failed"):
+                    return
+                if lifecycle.is_draining():
+                    # Let uvicorn's graceful shutdown finish; the client reconnects.
                     return
 
                 await asyncio.sleep(1)

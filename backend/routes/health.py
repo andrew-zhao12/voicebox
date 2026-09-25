@@ -9,10 +9,10 @@ import torch
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, JSONResponse
 
-from .. import config, models
+from .. import config, lifecycle, models
 from ..auth.middleware import MINIMAL_HEALTH
 from ..auth.principal import principal_from_scope
-from ..services import tts
+from ..services import task_queue, tts
 from ..utils.platform_detect import get_backend_type, is_amd_gpu_windows
 
 router = APIRouter()
@@ -200,6 +200,19 @@ async def health(request: Request):
         supports_rocm=is_amd_gpu_windows(),
         gpu_compatibility_warning=gpu_compat_warning,
     )
+
+
+@router.get("/health/ready")
+async def readiness():
+    """Readiness probe for load balancers and orchestrators.
+
+    200 once every model in ``VOICEBOX_PRELOAD_MODELS`` is resident and the
+    queue worker runs; 503 while still loading, after a load failed, or once
+    the server is draining.  Public like ``/health``, and the body names
+    models only, never error text.
+    """
+    ready, body = lifecycle.readiness(task_queue.worker_running())
+    return JSONResponse(body, status_code=200 if ready else 503, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/health/filesystem", response_model=models.FilesystemHealthResponse)

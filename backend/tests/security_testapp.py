@@ -16,6 +16,7 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from backend import lifecycle
 from backend.auth.install import SecurityRuntime, charge, install_security
 from backend.auth.principal import Principal, current_principal
 from backend.auth.settings import SecuritySettings
@@ -42,6 +43,11 @@ def build_test_app(
     @app.get("/health")
     async def health():
         return {"status": "healthy", "model_loaded": False, "gpu_available": True}
+
+    @app.get("/health/ready")
+    async def ready():
+        ok, body = lifecycle.readiness(True)
+        return JSONResponse(body, status_code=200 if ok else 503)
 
     @app.get("/profiles")
     async def profiles():

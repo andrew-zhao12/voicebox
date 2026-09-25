@@ -842,3 +842,20 @@ class CloudStatusResponse(BaseModel):
     key_prefix: Optional[str] = None
     connected_at: Optional[datetime] = None
     dashboard_url: str
+
+
+class PruneRequest(BaseModel):
+    """Body for ``POST /maintenance/prune``; ``days`` falls back to ``VOICEBOX_RETENTION_DAYS``."""
+
+    days: int | None = Field(None, ge=0, le=36500)
+
+
+class PruneReportResponse(BaseModel):
+    """What one retention sweep removed."""
+
+    days: int
+    generations: int
+    captures: int
+    orphan_files: int
+    freed_bytes: int
+    errors: int

@@ -10,6 +10,10 @@ import threading
 from datetime import datetime
 
 
+# Absolute on purpose: tests/test_progress.py imports this module as top-level ``utils.progress``.
+from backend import lifecycle
+
+
 class ProgressManager:
     """Manages download progress for multiple models.
     
@@ -237,6 +241,9 @@ class ProgressManager:
             while True:
                 if asyncio.get_running_loop().time() > deadline:
                     logger.info(f"Progress stream for {model_name} timed out, closing SSE connection")
+                    break
+                if lifecycle.is_draining():
+                    logger.info(f"Progress stream for {model_name} closing: server draining")
                     break
                 try:
                     # Wait for update with timeout

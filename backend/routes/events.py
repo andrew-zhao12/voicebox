@@ -12,6 +12,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
+from .. import lifecycle
 from ..mcp_server import events as mcp_events
 
 logger = logging.getLogger(__name__)
@@ -33,15 +34,20 @@ async def speak_events(request: Request):
         try:
             # Immediate hello so EventSource knows the connection is live.
             yield {"event": "ready", "data": "{}"}
+            last_ping = asyncio.get_running_loop().time()
             while True:
-                if await request.is_disconnected():
+                if await request.is_disconnected() or lifecycle.is_draining():
                     return
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
                 except TimeoutError:
-                    # Heartbeat so proxies don't reap idle streams.
-                    yield {"event": "ping", "data": "{}"}
+                    now = asyncio.get_running_loop().time()
+                    if now - last_ping >= 15.0:
+                        # Heartbeat so proxies don't reap idle streams.
+                        yield {"event": "ping", "data": "{}"}
+                        last_ping = now
                     continue
+                last_ping = asyncio.get_running_loop().time()
                 kind = event.pop("kind", "message")
                 yield {"event": kind, "data": json.dumps(event)}
         finally:

@@ -31,8 +31,17 @@ class ColoredFormatter(logging.Formatter):
 # Configure logging to match uvicorn's format with colors
 handler = logging.StreamHandler(sys.stderr)
 handler.setFormatter(ColoredFormatter("%(levelname)s:     %(message)s"))
+
+
+def _log_level_from_env() -> int:
+    """``VOICEBOX_LOG_LEVEL`` (or the documented ``LOG_LEVEL``), default INFO."""
+    raw = os.environ.get("VOICEBOX_LOG_LEVEL") or os.environ.get("LOG_LEVEL") or "INFO"
+    level = logging.getLevelName(raw.strip().upper())
+    return level if isinstance(level, int) else logging.INFO
+
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=_log_level_from_env(),
     handlers=[handler],
 )
 
@@ -107,12 +116,12 @@ from urllib.parse import quote
 import torch
 from fastapi import FastAPI
 
-from . import __version__, config, database
+from . import __version__, config, database, lifecycle
 from .auth.install import install_security
 from .auth.settings import SecuritySettings
 from .database import get_db
 from .routes import register_routers
-from .services import llm, transcribe, tts
+from .services import llm, preload, retention, task_queue, transcribe, tts
 from .services.task_queue import create_background_task, init_queue
 from .utils.platform_detect import get_backend_type
 from .utils.progress import get_progress_manager
@@ -286,6 +295,11 @@ async def _run_startup(application: FastAPI) -> None:
 
     init_queue(max_depth=security.settings.max_queue_depth)
 
+    # The first SIGTERM/SIGINT starts draining before uvicorn closes the socket.
+    hooked = lifecycle.install_signal_hooks()
+    if hooked:
+        logger.debug("Drain hooks installed for %s", ", ".join(hooked))
+
     # Mark stale "generating" records as failed -- leftovers from a killed process
     from sqlalchemy import text as sa_text
 
@@ -345,12 +359,28 @@ async def _run_startup(application: FastAPI) -> None:
     except Exception as e:
         logger.warning("Could not create HuggingFace cache directory: %s", e)
 
+    preload_names = preload.configured_models()
+    if preload_names:
+        logger.info("Preloading models: %s", ", ".join(preload_names))
+        create_background_task(preload.run(preload_names))
+
+    retention_days = retention.configured_days()
+    if retention_days is not None:
+        logger.info("Retention: pruning generations and captures older than %d day(s), daily", retention_days)
+        create_background_task(retention.run_loop(retention_days))
+
     logger.info("Ready")
 
 
 async def _run_shutdown() -> None:
-    """Unload models on lifespan exit."""
+    """Drain the generation queue, then unload models on lifespan exit."""
     logger.info("Voicebox server shutting down...")
+    try:
+        if await task_queue.shutdown(lifecycle.drain_timeout_s()):
+            logger.info("Generation queue drained")
+    except Exception:
+        logger.exception("Failed to drain the generation queue")
+    lifecycle.restore_signal_hooks()
     try:
         tts.unload_tts_model()
     except Exception:

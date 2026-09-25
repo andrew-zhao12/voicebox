@@ -4,10 +4,16 @@ to avoid GPU contention.
 """
 
 import asyncio
+import contextlib
+import logging
 import traceback
 from collections.abc import Coroutine
 from dataclasses import dataclass
 from typing import Literal
+
+from .. import lifecycle
+
+logger = logging.getLogger(__name__)
 
 # Keep references to fire-and-forget background tasks to prevent GC
 _background_tasks: set = set()
@@ -15,13 +21,19 @@ _background_tasks: set = set()
 # Job ids of streaming generations (``POST /generate/stream``). They share the
 # queue with regular generations but have no ``generations`` row.
 STREAM_JOB_PREFIX = "stream-"
+# Job ids of startup preloads (``services/preload.py``); no ``generations`` row either.
+PRELOAD_JOB_PREFIX = "preload-"
 
 
 class QueueFullError(Exception):
-    """Raised by ``enqueue_generation`` when the global or the caller's pending cap is reached."""
+    """Raised by ``enqueue_generation`` when a pending cap is reached or the server is draining."""
 
-    def __init__(self, reason: Literal["global", "owner"], retry_after_s: int = 5) -> None:
-        super().__init__(f"Generation queue is full ({reason} limit); retry in {retry_after_s} s")
+    def __init__(self, reason: Literal["global", "owner", "draining"], retry_after_s: int = 5) -> None:
+        if reason == "draining":
+            message = f"Server is shutting down; retry in {retry_after_s} s"
+        else:
+            message = f"Generation queue is full ({reason} limit); retry in {retry_after_s} s"
+        super().__init__(message)
         self.reason = reason
         self.retry_after_s = retry_after_s
 
@@ -96,8 +108,8 @@ async def _force_fail_if_active(generation_id: str, error: str) -> None:
     """Best-effort recovery — flip an active row to failed if the worker
     bailed before writing a terminal status. Catches the case where the gen
     coroutine's own status-write raised (e.g. SQLite lock contention)."""
-    if generation_id.startswith(STREAM_JOB_PREFIX):
-        # Streaming jobs have no DB row; they report failures to their consumer.
+    if generation_id.startswith((STREAM_JOB_PREFIX, PRELOAD_JOB_PREFIX)):
+        # Streaming and preload jobs have no DB row; they report failures themselves.
         return
     try:
         from ..database import Generation as DBGeneration, get_db
@@ -131,6 +143,8 @@ def ensure_capacity(owner: str | None = None, max_pending: int | None = None) ->
     """Raise ``QueueFullError`` when the global depth or the owner's cap is reached."""
     if _generation_queue is None:
         raise RuntimeError("Generation queue has not been initialized")
+    if lifecycle.is_draining():
+        raise QueueFullError("draining", retry_after_s=10)
     if pending_count() >= _max_depth:
         raise QueueFullError("global")
     if owner is not None and max_pending is not None and _pending_by_owner.get(owner, 0) >= max_pending:
@@ -183,6 +197,47 @@ def cancel_generation(generation_id: str) -> Literal["queued", "running"] | None
         return "queued"
 
     return None
+
+
+def worker_running() -> bool:
+    """Whether the queue worker exists and is still alive."""
+    return _generation_worker_task is not None and not _generation_worker_task.done()
+
+
+async def shutdown(drain_timeout_s: float) -> bool:
+    """Drain, then stop the worker.
+
+    Refuses new jobs at once, waits up to *drain_timeout_s* for the pending
+    ones, then cancels whatever is still running and closes the coroutines
+    still queued.  Returns True when every job finished on its own.
+    """
+    lifecycle.begin_drain("shutdown")
+    if _generation_queue is None:
+        return True
+    drained = await lifecycle.wait_for_idle(pending_count, drain_timeout_s)
+    if not drained:
+        logger.warning(
+            "Drain timeout (%.0f s) reached with %d job(s) pending; cancelling them",
+            drain_timeout_s,
+            pending_count(),
+        )
+    tasks = list(_running_generation_tasks.values())
+    worker = _generation_worker_task
+    for task in tasks:
+        task.cancel()
+    if worker is not None and not worker.done():
+        worker.cancel()
+    for task in [*tasks, worker]:
+        if task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+    while not _generation_queue.empty():
+        job = _generation_queue.get_nowait()
+        job.coro.close()
+        _queued_generation_ids.discard(job.generation_id)
+        _release(job.generation_id)
+        _generation_queue.task_done()
+    return drained
 
 
 def init_queue(force: bool = False, *, max_depth: int | None = None):
