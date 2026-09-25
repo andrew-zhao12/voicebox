@@ -1,0 +1,37 @@
+# TLS overlay: Caddy terminates HTTPS in front of the backend.
+#
+#   export VOICEBOX_DOMAIN=voice.example.com
+#   export VOICEBOX_API_KEY=$(openssl rand -base64 32)
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+#
+# The backend port is no longer published; only Caddy reaches it on the
+# compose network, which is why it may trust X-Forwarded-For from any peer.
+
+services:
+  voicebox:
+    ports: !reset []
+    environment:
+      - FORWARDED_ALLOW_IPS=*
+
+  caddy:
+    image: caddy:2
+    container_name: voicebox-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      - VOICEBOX_DOMAIN=${VOICEBOX_DOMAIN:?set VOICEBOX_DOMAIN to the public hostname}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - voicebox-net
+    depends_on:
+      - voicebox
+
+volumes:
+  caddy-data:
+  caddy-config:

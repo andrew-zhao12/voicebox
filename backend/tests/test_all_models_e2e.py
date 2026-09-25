@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import platform
 import shutil
 import signal
@@ -123,6 +124,11 @@ def build_binary() -> Path:
 
 # ── Server spawn + log capture ───────────────────────────────────────
 
+# Admin key for the spawned server: reuse the caller's when set, else a
+# throwaway one for this run.
+API_KEY = os.environ.get("VOICEBOX_API_KEY") or "vbx_e2e_" + secrets.token_urlsafe(24)
+
+
 class ServerProcess:
     def __init__(self, binary: Path, port: int, data_dir: Path, log_path: Path):
         self.binary = binary
@@ -144,6 +150,8 @@ class ServerProcess:
         print(f"[spawn] {' '.join(args)}", flush=True)
         self._log_fh = open(self.log_path, "w", encoding="utf-8", errors="replace")
         # Combine stderr into stdout so we get a single ordered stream.
+        # The server requires an API key on every endpoint; hand it the one
+        # this run uses through the environment (never argv).
         self.proc = subprocess.Popen(
             args,
             stdout=subprocess.PIPE,
@@ -151,6 +159,7 @@ class ServerProcess:
             bufsize=1,
             text=True,
             errors="replace",
+            env={**os.environ, "VOICEBOX_API_KEY": API_KEY},
         )
         self._reader_thread = threading.Thread(target=self._pump_logs, daemon=True)
         self._reader_thread.start()
@@ -534,7 +543,7 @@ def main() -> int:
         wait_for_health(base_url, server, HEALTH_TIMEOUT)
         print("[health] ready", flush=True)
 
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(timeout=30.0, headers={"Authorization": f"Bearer {API_KEY}"}) as client:
             # Profile setup (only create what's needed)
             cloned_profile_id: Optional[str] = None
             kokoro_profile_id: Optional[str] = None

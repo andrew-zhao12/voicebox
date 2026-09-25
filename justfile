@@ -125,11 +125,38 @@ setup-js:
 
 # ─── Development ──────────────────────────────────────────────────────
 
-# Start backend (if not already running) + frontend for development
+# Print the dev admin API key (data/api_key), creating it on first use
 [unix]
-dev: _ensure-venv _ensure-sidecar
+api-key:
     #!/usr/bin/env bash
     set -euo pipefail
+    mkdir -p data
+    if [ ! -s data/api_key ]; then
+        (umask 077; printf 'vbx_%s\n' "$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')" > data/api_key)
+    fi
+    cat data/api_key
+
+[windows]
+api-key:
+    if (-not (Test-Path data)) { New-Item -ItemType Directory data | Out-Null }; \
+    if (-not (Test-Path data/api_key) -or (Get-Item data/api_key).Length -eq 0) { \
+        $bytes = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Fill($bytes); \
+        $key = "vbx_" + [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_'); \
+        Set-Content -Path data/api_key -Value $key -NoNewline; \
+    }; \
+    Get-Content data/api_key
+
+# Start backend (if not already running) + frontend for development
+[unix]
+dev: _ensure-venv _ensure-sidecar api-key
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # The backend reads data/api_key on its own; the Tauri shell (debug
+    # build) and Vite need to be told where it is so the UI connects without
+    # prompting. The key never goes on a command line.
+    export VOICEBOX_API_KEY_FILE="$(pwd)/data/api_key"
+    export VITE_VOICEBOX_API_KEY="$(cat data/api_key)"
 
     backend_pid=""
     if curl -sf http://127.0.0.1:17493/health > /dev/null 2>&1; then
@@ -147,7 +174,8 @@ dev: _ensure-venv _ensure-sidecar
     cd {{ tauri_dir }} && bun run tauri dev
 
 [windows]
-dev: _ensure-venv _ensure-sidecar
+dev: _ensure-venv _ensure-sidecar api-key
+    $env:VOICEBOX_API_KEY_FILE = "$PWD\data\api_key"; $env:VITE_VOICEBOX_API_KEY = (Get-Content data/api_key -Raw).Trim(); \
     $backendJob = $null; \
     try { $null = Invoke-WebRequest -Uri "http://127.0.0.1:17493/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop; Write-Host "Backend already running on http://localhost:17493" } catch { \
         Write-Host "Starting backend on http://localhost:17493 ..."; \
@@ -177,9 +205,13 @@ dev-frontend: _ensure-sidecar
 
 # Start backend (if not already running) + web app (no Tauri)
 [unix]
-dev-web: _ensure-venv
+dev-web: _ensure-venv api-key
     #!/usr/bin/env bash
     set -euo pipefail
+
+    # Dev-only: the web shell seeds its API key from this variable so the
+    # Connect screen is skipped. Production builds never embed a key.
+    export VITE_VOICEBOX_API_KEY="$(cat data/api_key)"
 
     backend_pid=""
     if curl -sf http://127.0.0.1:17493/health > /dev/null 2>&1; then
@@ -196,7 +228,8 @@ dev-web: _ensure-venv
     cd {{ web_dir }} && bun run dev
 
 [windows]
-dev-web: _ensure-venv
+dev-web: _ensure-venv api-key
+    $env:VITE_VOICEBOX_API_KEY = (Get-Content data/api_key -Raw).Trim(); \
     $backendJob = $null; \
     try { $null = Invoke-WebRequest -Uri "http://127.0.0.1:17493/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop; Write-Host "Backend already running on http://localhost:17493" } catch { \
         Write-Host "Starting backend on http://localhost:17493 ..."; \

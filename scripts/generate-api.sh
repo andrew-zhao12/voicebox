@@ -5,8 +5,16 @@ set -e
 
 echo "Generating OpenAPI client..."
 
+# /openapi.json is public unless VOICEBOX_DISABLE_DOCS=1; send the dev key
+# anyway so the script also works against a locked-down server.
+API_KEY="${VOICEBOX_API_KEY:-$(cat data/api_key 2>/dev/null || true)}"
+AUTH_HEADER=()
+if [ -n "$API_KEY" ]; then
+    AUTH_HEADER=(-H "Authorization: Bearer $API_KEY")
+fi
+
 # Check if backend is running
-if ! curl -s http://localhost:17493/openapi.json > /dev/null 2>&1; then
+if ! curl -s "${AUTH_HEADER[@]}" http://localhost:17493/openapi.json > /dev/null 2>&1; then
     echo "Backend not running. Starting backend..."
     cd backend
     
@@ -32,13 +40,13 @@ if ! curl -s http://localhost:17493/openapi.json > /dev/null 2>&1; then
     # Wait for server to be ready
     echo "Waiting for server to start..."
     for _ in {1..30}; do
-        if curl -s http://localhost:17493/openapi.json > /dev/null 2>&1; then
+        if curl -s "${AUTH_HEADER[@]}" http://localhost:17493/openapi.json > /dev/null 2>&1; then
             break
         fi
         sleep 1
     done
     
-    if ! curl -s http://localhost:17493/openapi.json > /dev/null 2>&1; then
+    if ! curl -s "${AUTH_HEADER[@]}" http://localhost:17493/openapi.json > /dev/null 2>&1; then
         echo "Error: Backend failed to start"
         kill $BACKEND_PID 2>/dev/null || true
         exit 1
@@ -52,7 +60,7 @@ fi
 
 # Download OpenAPI schema
 echo "Downloading OpenAPI schema..."
-curl -s http://localhost:17493/openapi.json > app/openapi.json
+curl -s "${AUTH_HEADER[@]}" http://localhost:17493/openapi.json > app/openapi.json
 
 # Check if openapi-typescript-codegen is installed
 if ! bunx --bun openapi-typescript-codegen --version > /dev/null 2>&1; then

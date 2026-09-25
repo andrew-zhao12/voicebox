@@ -1,0 +1,16 @@
+# Reverse proxy for the Voicebox API with automatic HTTPS.
+# VOICEBOX_DOMAIN comes from the environment (see docker-compose.tls.yml).
+{$VOICEBOX_DOMAIN} {
+	encode zstd gzip
+
+	# flush_interval -1 keeps SSE and the PCM audio stream unbuffered.
+	reverse_proxy voicebox:17493 {
+		flush_interval -1
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+	}
+}
