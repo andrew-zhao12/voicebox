@@ -118,11 +118,15 @@ from . import __version__, config, database, lifecycle
 from .auth.install import install_security
 from .auth.settings import SecuritySettings
 from .database import get_db
+from .observability import logs as observability_logs, metrics
 from .routes import register_routers
 from .services import llm, preload, retention, task_queue, transcribe, tts
 from .services.task_queue import create_background_task, init_queue
 from .utils.http import safe_content_disposition  # noqa: F401 -- re-export; routes import utils.http directly
 from .utils.platform_detect import get_backend_type
+
+if observability_logs.json_logging_enabled():
+    observability_logs.apply_json_logging()
 from .utils.progress import get_progress_manager
 
 
@@ -282,6 +286,16 @@ async def _run_startup(application: FastAPI) -> None:
     security.startup()
 
     init_queue(max_depth=security.settings.max_queue_depth)
+
+    # uvicorn may have reconfigured its loggers after the import-time setup.
+    if observability_logs.json_logging_enabled():
+        observability_logs.apply_json_logging()
+    metrics_port = os.environ.get("VOICEBOX_METRICS_PORT", "").strip()
+    if metrics_port:
+        try:
+            metrics.start_exporter(int(metrics_port))
+        except (ValueError, OSError) as e:
+            logger.warning("Could not start the metrics exporter on %r: %s", metrics_port, e)
 
     # The first SIGTERM/SIGINT starts draining before uvicorn closes the socket.
     hooked = lifecycle.install_signal_hooks()

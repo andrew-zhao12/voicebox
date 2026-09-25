@@ -8,10 +8,12 @@ import contextlib
 import logging
 import traceback
 from collections.abc import Coroutine
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Literal
 
 from .. import lifecycle
+from ..observability import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,7 @@ class GenerationJob:
     generation_id: str
     coro: Coroutine
     owner: str | None = None
+    enqueued_at: float = field(default_factory=perf_counter)
 
 
 DEFAULT_MAX_DEPTH = 32
@@ -79,6 +82,7 @@ async def _generation_worker():
                 job.coro.close()
                 continue
 
+            metrics.QUEUE_WAIT_SECONDS.observe(perf_counter() - job.enqueued_at)
             task = asyncio.create_task(job.coro)
             _running_generation_tasks[job.generation_id] = task
             _queued_generation_ids.discard(job.generation_id)
@@ -102,6 +106,7 @@ async def _generation_worker():
             _queued_generation_ids.discard(job.generation_id)
             _release(job.generation_id)
             _generation_queue.task_done()
+            metrics.QUEUE_PENDING.set(pending_count())
 
 
 async def _force_fail_if_active(generation_id: str, error: str) -> None:
@@ -169,6 +174,7 @@ def enqueue_generation(generation_id: str, coro, *, owner: str | None = None, ma
         _job_owner[generation_id] = owner
         _pending_by_owner[owner] = _pending_by_owner.get(owner, 0) + 1
     _generation_queue.put_nowait(GenerationJob(generation_id=generation_id, coro=coro, owner=owner))
+    metrics.QUEUE_PENDING.set(pending_count())
 
 
 def _release(generation_id: str) -> None:
@@ -194,6 +200,7 @@ def cancel_generation(generation_id: str) -> Literal["queued", "running"] | None
         _queued_generation_ids.discard(generation_id)
         _cancelled_generation_ids.add(generation_id)
         _release(generation_id)
+        metrics.QUEUE_PENDING.set(pending_count())
         return "queued"
 
     return None

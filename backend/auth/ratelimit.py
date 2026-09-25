@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from fastapi import HTTPException
 
+from ..observability import metrics
 from .principal import Principal
 
 logger = logging.getLogger(__name__)
@@ -124,6 +125,7 @@ class RateLimiter:
     def charge_or_raise(self, principal: Principal, dimension: str, cost: float = 1.0) -> Decision:
         decision = self.charge_principal(principal, dimension, cost)
         if not decision.allowed:
+            metrics.RATE_LIMITED.labels(dimension).inc()
             raise RateLimited(decision, dimension)
         return decision
 

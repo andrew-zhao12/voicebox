@@ -109,6 +109,7 @@ ADMIN_RULES: tuple[Rule, ...] = (
     rule("POST", "/watchdog/disable"),
     rule("GET", "/health/filesystem"),
     rule("POST", "/maintenance/prune"),
+    rule("GET", "/metrics"),
     rule("POST", "/profiles"),
     rule("POST", "/profiles/import"),
     rule("PUT DELETE", "/profiles/{profile_id}"),

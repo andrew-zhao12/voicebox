@@ -18,6 +18,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ..api_errors import error_body
+from ..observability import metrics
 from . import policy
 from .principal import ANONYMOUS, Principal, principal_from_scope, principal_var
 
@@ -172,6 +173,7 @@ class AuthMiddleware:
                 return
             decision = limiter.charge_public(ip)
             if not decision.allowed:
+                metrics.RATE_LIMITED.labels("public").inc()
                 await _json(scope, 429, "Too many requests", limiter.headers_for(decision))(scope, receive, send)
                 return
             await self._run_as(ANONYMOUS, scope, receive, send)
@@ -190,6 +192,7 @@ class AuthMiddleware:
         if failure in ("missing", "invalid") and not token_path:
             decision = limiter.note_auth_failure(ip)
             if not decision.allowed:
+                metrics.RATE_LIMITED.labels("auth_failures").inc()
                 await _json(scope, 429, "Too many failed authentication attempts", limiter.headers_for(decision))(
                     scope, receive, send
                 )
@@ -287,6 +290,7 @@ class RateLimitMiddleware:
 
     async def _reject(self, scope: Scope, receive: Receive, send: Send, dimension: str, decision) -> None:
         detail = f"Rate limit exceeded for {dimension}; retry in {max(1, decision.retry_after_s)} s"
+        metrics.RATE_LIMITED.labels(dimension).inc()
         await _json(scope, 429, detail, self.runtime.limiter.headers_for(decision))(scope, receive, send)
 
 

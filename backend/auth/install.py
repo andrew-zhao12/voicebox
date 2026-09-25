@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from ..observability.requestid import RequestIdMiddleware
 from .errors import unhandled_exception_handler
 from .keystore import KeyStore
 from .logfilter import install_access_log_redaction
@@ -123,8 +124,10 @@ def install_security(app: FastAPI, settings: SecuritySettings) -> SecurityRuntim
     """Add the security middlewares, the ``/auth`` routes and the error handler.
 
     Starlette's ``add_middleware`` inserts at the outside, so after this call
-    the stack is CORS → SecurityHeaders → Auth → RateLimit → BodyLimit → the
-    middlewares the caller added before → router.
+    the stack is RequestId → CORS → SecurityHeaders → Auth → RateLimit →
+    BodyLimit → the middlewares the caller added before → router.  The
+    request id sits outermost so every response, including the auth
+    middleware's own 401s and 429s, carries ``X-Request-Id``.
     """
     global _runtime
     runtime = build_runtime(settings)
@@ -134,6 +137,7 @@ def install_security(app: FastAPI, settings: SecuritySettings) -> SecurityRuntim
     app.add_middleware(AuthMiddleware, runtime=runtime)
     app.add_middleware(SecurityHeadersMiddleware)
     add_cors(app, settings)
+    app.add_middleware(RequestIdMiddleware)
     app.include_router(auth_router)
     app.add_exception_handler(Exception, unhandled_exception_handler)
     if not settings.disable_docs:

@@ -60,7 +60,10 @@ def test_every_policy_template_exists():
 def test_middleware_stack_order_and_error_handler():
     from fastapi.middleware.cors import CORSMiddleware
 
+    from backend.observability.requestid import RequestIdMiddleware
+
     assert [m.cls for m in app.user_middleware] == [
+        RequestIdMiddleware,
         CORSMiddleware,
         SecurityHeadersMiddleware,
         AuthMiddleware,

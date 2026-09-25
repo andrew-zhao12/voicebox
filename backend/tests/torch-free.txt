@@ -10,6 +10,7 @@ backend/tests/test_encode.py
 backend/tests/test_inference_slots.py
 backend/tests/test_keys_cli.py
 backend/tests/test_lifecycle.py
+backend/tests/test_observability.py
 backend/tests/test_preload.py
 backend/tests/test_ratelimit.py
 backend/tests/test_retention.py

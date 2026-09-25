@@ -10,6 +10,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from time import perf_counter
+
+from ..observability import metrics
 
 
 class InferenceBusyError(Exception):
@@ -34,15 +37,19 @@ class InferenceSlot:
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[None]:
         if self._semaphore.locked() and self._waiters >= self.max_waiters:
+            metrics.RATE_LIMITED.labels(f"slot:{self.name}").inc()
             raise InferenceBusyError(self.name)
         self._waiters += 1
+        started = perf_counter()
         try:
             try:
                 await asyncio.wait_for(self._semaphore.acquire(), timeout=self.wait_timeout_s)
             except TimeoutError:
+                metrics.RATE_LIMITED.labels(f"slot:{self.name}").inc()
                 raise InferenceBusyError(self.name) from None
         finally:
             self._waiters -= 1
+            metrics.SLOT_WAIT_SECONDS.labels(self.name).observe(perf_counter() - started)
         try:
             yield
         finally:

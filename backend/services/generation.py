@@ -22,6 +22,7 @@ import traceback
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Literal, Optional
 
 import numpy as np
@@ -33,6 +34,7 @@ from . import history, personality, profiles, task_queue
 from .inference_slots import InferenceBusyError, llm_slot
 from .task_queue import QueueFullError, cancel_generation, enqueue_generation, ensure_capacity
 from ..database import get_db
+from ..observability import metrics
 from ..utils.tasks import get_task_manager
 
 logger = logging.getLogger(__name__)
@@ -123,10 +125,14 @@ async def prepare_engine(
     from ..utils.audio import find_tts_runaway_cut, has_tts_runaway, trim_tts_output
 
     tts_model = get_tts_backend_for_engine(engine)
-    if on_loading is not None and not tts_model.is_loaded():
+    was_loaded = tts_model.is_loaded()
+    if on_loading is not None and not was_loaded:
         await on_loading()
 
+    load_started = perf_counter()
     await load_engine_model(engine, model_size)
+    if not was_loaded:
+        metrics.MODEL_LOAD_SECONDS.labels(f"{engine}:{model_size or 'default'}").observe(perf_counter() - load_started)
 
     voice_prompt = await profiles.create_voice_prompt_for_profile(
         profile_id,
@@ -172,6 +178,8 @@ async def run_generation(
 
     task_manager = get_task_manager()
     bg_db = next(get_db())
+    started = perf_counter()
+    outcome = "failed"
 
     try:
 
@@ -236,8 +244,11 @@ async def run_generation(
             audio_path=final_path,
             duration=duration,
         )
+        outcome = "completed"
+        metrics.TTS_CHARACTERS.labels(engine).inc(len(text))
 
     except asyncio.CancelledError:
+        outcome = "cancelled"
         await history.update_generation_status(
             generation_id=generation_id,
             status="failed",
@@ -257,6 +268,8 @@ async def run_generation(
     else:
         _notify_speak_end(generation_id, status="completed")
     finally:
+        metrics.GENERATION_SECONDS.labels(engine, mode).observe(perf_counter() - started)
+        metrics.GENERATIONS.labels(engine, mode, outcome).inc()
         task_manager.complete_generation(generation_id)
         bg_db.close()
 
@@ -310,6 +323,8 @@ async def run_generation_stream(
     from ..utils.effects import StreamingEffects
 
     frames = session.frames
+    started = perf_counter()
+    outcome = "failed"
     try:
         bg_db = next(get_db())
         try:
@@ -335,11 +350,16 @@ async def run_generation_stream(
             runaway_cut_fn=prep.runaway_cut_fn,
         ):
             if session.consumer_gone.is_set():
+                outcome = "abandoned"
                 break
             if normalizer is not None or effects is not None:
                 audio = await asyncio.to_thread(_post_process_chunk, audio, sample_rate, normalizer, effects)
             frames.put_nowait((audio, sample_rate))
+        else:
+            outcome = "completed"
+            metrics.TTS_CHARACTERS.labels(engine).inc(len(text))
     except asyncio.CancelledError:
+        outcome = "cancelled"
         frames.put_nowait(None)
         raise
     except Exception as e:
@@ -347,6 +367,9 @@ async def run_generation_stream(
         frames.put_nowait(e)
     else:
         frames.put_nowait(None)
+    finally:
+        metrics.GENERATION_SECONDS.labels(engine, "stream").observe(perf_counter() - started)
+        metrics.GENERATIONS.labels(engine, "stream", outcome).inc()
 
 
 def _post_process_chunk(audio, sample_rate: int, normalizer, effects):
@@ -515,6 +538,7 @@ async def open_stream(data: models.StreamGenerationRequest, db, principal: Princ
         first_chunk_chars = min(first_chunk_chars, data.max_chunk_chars)
 
     session = new_stream_session()
+    enqueued_at = perf_counter()
     try:
         enqueue_generation(
             session.job_id,
@@ -552,6 +576,7 @@ async def open_stream(data: models.StreamGenerationRequest, db, principal: Princ
         logger.error("Stream %s failed before the first chunk: %s", session.job_id, first)
         raise GenerationRefused(500, "Speech synthesis failed; see the server log")
     first_audio, sample_rate = first
+    metrics.STREAM_FIRST_CHUNK_SECONDS.labels(engine).observe(perf_counter() - enqueued_at)
     return OpenedStream(session=session, first_audio=first_audio, sample_rate=sample_rate, engine=engine, text=text)
 
 
