@@ -148,6 +148,14 @@ just fix-python         # auto-fix lint issues + reformat
 just test               # run pytest
 ```
 
+## Server operation
+
+Environment variables the server reads on a host or in Docker: `VOICEBOX_DATA_DIR` (or `--data-dir`), `VOICEBOX_PRELOAD_MODELS` (models loaded at boot; `GET /health/ready` is 503 until they are resident), `VOICEBOX_RETENTION_DAYS` (daily pruning of old generations and captures), `VOICEBOX_DRAIN_TIMEOUT_S` (how long a SIGTERM waits for queued generations), `LOG_LEVEL` / `VOICEBOX_LOG_LEVEL`, plus the key and limit variables from `auth/settings.py`. `python -m backend.preload <names>` downloads models ahead of time (`--list` prints the names). See `docs/content/docs/overview/deployment.mdx`.
+
 ## Dependencies
+
+The Docker image installs `requirements.lock`, generated from `requirements.txt` plus `requirements-docker.in` by `scripts/lock-backend.sh` (`just lock-backend`, needs `uv`). torch and torchaudio are left out of the lock on purpose: the `Dockerfile` installs the chosen `PYTORCH_VARIANT`'s wheels first. Regenerate the lock whenever `requirements.txt` changes; the desktop and dev environments keep using `requirements.txt` directly.
+
+### Desktop and development environment
 
 Runtime dependencies are in `requirements.txt`. macOS-only MLX dependencies are in `requirements-mlx.txt`. Dev tools (ruff, pytest) are installed automatically by `just setup-python`.

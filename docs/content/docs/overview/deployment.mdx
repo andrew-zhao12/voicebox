@@ -1,0 +1,87 @@
+---
+title: Deployment Checklist
+description: "Run Voicebox as a service: image variants, probes, warm-up, graceful stop, retention, backups and keys"
+---
+
+This page is for operators putting the backend in front of applications, as a container on one host. It complements [Docker Deployment](/overview/docker) (how to run the container) and [API Keys](/overview/api-keys) (who may call what).
+
+## 1. Pick an image variant
+
+| Variant | Build arg | Wheels | When |
+|---------|-----------|--------|------|
+| `cpu` | `PYTORCH_VARIANT=cpu` (default) | PyTorch CPU build, about 4.5 GB image | Kokoro, LuxTTS, Chatterbox Turbo at usable speed; anything else is slow |
+| `cu128` | `docker-compose.cuda.yml` | CUDA 12.8, torch 2.11, Blackwell included | NVIDIA GPUs with driver 570 or newer |
+| `cu130` | `PYTORCH_VARIANT=cu130` with the CUDA overlay | CUDA 13.0, torch 2.14 | NVIDIA GPUs with driver 580 or newer |
+| `rocm` | `docker-compose.rocm.yml` | ROCm 6.3 (7.2 for RDNA4) | AMD GPUs |
+
+Prebuilt `-cpu` and `-cu128` images are published for every release tag (see [Prebuilt Images](/overview/docker#prebuilt-images)). Dependencies are pinned in `backend/requirements.lock`, so two builds of the same commit install the same versions.
+
+## 2. Set the environment
+
+```bash
+export VOICEBOX_API_KEY="$(openssl rand -base64 32)"   # admin key; the UI and operators use it
+export VOICEBOX_DISABLE_DOCS=1                          # no /docs on a server
+export VOICEBOX_PRELOAD_MODELS=kokoro,whisper-turbo     # what /health/ready waits for
+export VOICEBOX_RETENTION_DAYS=30                       # delete old generations and captures
+```
+
+Then give each application its own **client** key, which can synthesize, transcribe and read profiles but cannot change settings, delete data or download models:
+
+```bash
+docker compose exec voicebox python -m backend.keys create --id myapp --role client
+```
+
+The full variable list is in [Docker Deployment](/overview/docker#environment-variables).
+
+## 3. Probes
+
+| Probe | Path | Key | Meaning |
+|-------|------|-----|---------|
+| Liveness | `GET /health` | none | The process answers. Docker's `HEALTHCHECK` uses it. |
+| Readiness | `GET /health/ready` | none | `200` once every model in `VOICEBOX_PRELOAD_MODELS` is resident and the queue worker runs; `503` while loading, after a load failed, or once the server is draining. |
+
+Point load balancers and orchestrators at `/health/ready` so traffic only arrives once the first request can be served without a multi-minute model download. The body names the models that are still pending or failed; failed loads are retried every two minutes, and the reason is in the server log.
+
+Kubernetes, for example:
+
+```yaml
+livenessProbe:
+  httpGet: { path: /health, port: 17493 }
+  periodSeconds: 30
+readinessProbe:
+  httpGet: { path: /health/ready, port: 17493 }
+  periodSeconds: 5
+  failureThreshold: 3
+```
+
+## 4. Warm-up
+
+Models load on first use and stay resident. On a server, load them at boot instead:
+
+- `VOICEBOX_PRELOAD_MODELS` takes registry names (`python -m backend.preload --list` prints them, for example `kokoro`, `qwen-tts-1.7B`, `chatterbox-turbo`, `whisper-turbo`). Each one is loaded as a job on the generation queue, so a generation that arrives during the warm-up simply waits behind it.
+- To bake the weights into an image or an init container, run `python -m backend.preload kokoro whisper-turbo` (or `--from-env`) with the same `VOICEBOX_MODELS_DIR` / HuggingFace cache the server will use. It downloads and loads each model, then exits.
+- Client keys cannot trigger downloads; a request for a model that is not on disk gets a `409`. Preloading avoids that.
+
+## 5. Graceful stop
+
+On `SIGTERM` the server stops accepting connections, finishes streams and SSE responses that are already open (up to 40 s), then drains its generation queue: new jobs are refused with `503` and `Retry-After`, `/health/ready` turns `503`, and queued and running generations get up to `VOICEBOX_DRAIN_TIMEOUT_S` (default 30) to finish before they are cancelled and the models unload. The compose file sets `stop_grace_period: 45s` to match; give your orchestrator a termination grace period of at least that.
+
+## 6. Retention
+
+Generated audio and captures stay forever by default. With `VOICEBOX_RETENTION_DAYS=N`, a daily sweep deletes generations older than N days that are not favourited and not placed in a story, captures older than N days, and audio files that no database row references. `POST /maintenance/prune` (admin key; optional body `{"days": N}`) runs the same sweep on demand and returns what it removed. `0` keeps nothing older than today.
+
+## 7. Backups
+
+Everything lives in the data directory (`/app/data` in the container, the `voicebox-data` volume): `voicebox.db`, `profiles/`, `generations/`, `captures/`, `api_key` and `api_keys.json`. The database runs in WAL mode, so a file copy must include `voicebox.db-wal` and `voicebox.db-shm`, or use `sqlite3 /app/data/voicebox.db ".backup /backup/voicebox.db"` for a consistent snapshot. Keep the data directory on a local disk: SQLite's WAL is not safe on NFS.
+
+Models are cached separately (`huggingface-cache` volume or `VOICEBOX_MODELS_DIR`); they are redownloadable and need no backup.
+
+## 8. Transport and limits
+
+- Terminate TLS in front of the server: the Caddy overlay (`docker-compose.tls.yml`) does it with automatic certificates. Keys must never travel over plain HTTP outside loopback or a private network.
+- Behind your own proxy, set `FORWARDED_ALLOW_IPS` to the proxy's address so per-IP limits see the real client, and disable response buffering for `/generate/stream` and the SSE routes.
+- Per-key rate limits, upload caps and the queue depth are described in [API Keys](/overview/api-keys). Raise a key's limits in `api_keys.json` rather than turning limiting off.
+
+## 9. Upgrading
+
+Pull the new image (or rebuild), then `docker compose up -d`. Schema migrations run at startup and are idempotent. Stop the old container gracefully first (see above) so in-flight generations finish, and take a backup before a major version.

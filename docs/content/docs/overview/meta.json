@@ -5,6 +5,7 @@
     "introduction",
     "installation",
     "docker",
+    "deployment",
     "api-keys",
     "quick-start",
     "gpu-acceleration",

@@ -25,7 +25,7 @@ Open [http://localhost:17600](http://localhost:17600) in your browser. The full 
 The UI opens on a **Connect** screen. Enter the server URL (`http://localhost:17600`) and the API key, click **Test** to confirm the server recognises the key, then **Connect**. The browser remembers both in its local storage; use **Settings → General** to disconnect or switch servers.
 
 <Callout type="info">
-  The first build takes a few minutes (compiling the frontend, installing Python dependencies). Subsequent starts are fast thanks to Docker layer caching.
+  The first build takes a few minutes (compiling the frontend, installing Python dependencies). Subsequent starts are fast thanks to Docker layer caching. Prefer not to build? Use a [prebuilt image](#prebuilt-images).
 </Callout>
 
 ## How It Works
@@ -111,12 +111,17 @@ ports:
 | `VOICEBOX_RATE_LIMITING` | `1` | Set to `0` to disable the per-key rate limits. The queue depth and upload caps stay. |
 | `FORWARDED_ALLOW_IPS` | loopback | Proxies whose `X-Forwarded-For` header the server trusts for per-IP limits. The TLS overlay sets it; never use `*` on a published port. |
 | `VOICEBOX_MODELS_DIR` | (HuggingFace cache) | Custom path for model storage |
+| `VOICEBOX_PRELOAD_MODELS` | (unset) | Comma-separated model names (`python -m backend.preload --list`) to download and load at boot. `/health/ready` answers `503` until they are resident. |
+| `VOICEBOX_RETENTION_DAYS` | (unset) | Delete generations and captures older than this many days, daily. Unset keeps everything. |
+| `VOICEBOX_DRAIN_TIMEOUT_S` | `30` | How long a stop waits for queued generations before cancelling them. |
+| `VOICEBOX_DATA_DIR` | `/app/data` | Data directory (database, profiles, generated audio, keys). |
+| `LOG_LEVEL` / `VOICEBOX_LOG_LEVEL` | `info` | Log level of the application loggers (`debug`, `info`, `warning`, `error`). |
 
-`VOICEBOX_API_KEY`, `VOICEBOX_DISABLE_DOCS` and `VOICEBOX_CORS_ORIGINS` are forwarded from the shell you run `docker compose` in. Set the others under `environment:` in a `docker-compose.override.yml`.
+`VOICEBOX_API_KEY`, `VOICEBOX_DISABLE_DOCS`, `VOICEBOX_CORS_ORIGINS`, `VOICEBOX_PRELOAD_MODELS`, `VOICEBOX_RETENTION_DAYS` and `VOICEBOX_DRAIN_TIMEOUT_S` are forwarded from the shell you run `docker compose` in. Set the others under `environment:` in a `docker-compose.override.yml`. The [Deployment Checklist](/overview/deployment) explains how they fit together.
 
 ### Resource Limits
 
-The default compose file limits the container to 4 CPUs and 8GB RAM. Adjust these based on your hardware:
+The default compose file caps the container at 4 CPUs and 16GB RAM (a limit, not a reservation). Adjust these based on your hardware:
 
 ```yaml
 deploy:
@@ -140,45 +145,33 @@ deploy:
 
 The `huggingface-cache` volume is important -- without it, models would be re-downloaded every time the container is rebuilt.
 
-## GPU Acceleration
+## Image Variants and GPU Acceleration
 
-### NVIDIA GPU (CUDA)
+The `PYTORCH_VARIANT` build argument picks the PyTorch wheels, and a compose overlay per GPU vendor sets it together with the device access:
 
-To use your NVIDIA GPU inside the container, install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) and add GPU access to your compose file:
+| Variant | How | Notes |
+|---------|-----|-------|
+| `cpu` | `docker compose up --build` | Default. CPU-only PyTorch, the smallest image (about 4.5 GB). |
+| `cu128` | `docker compose -f docker-compose.yml -f docker-compose.cuda.yml up --build` | NVIDIA, CUDA 12.8 wheels (torch 2.11, Blackwell/sm_120 included). Needs the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) and driver 570 or newer. |
+| `cu130` | `PYTORCH_VARIANT=cu130 docker compose -f docker-compose.yml -f docker-compose.cuda.yml up --build` | NVIDIA, CUDA 13.0 wheels (torch 2.14). Driver 580 or newer. Any other PyTorch CUDA index name works the same way. |
+| `rocm` | `docker compose -f docker-compose.yml -f docker-compose.rocm.yml up --build` | AMD. ROCm 6.3 by default, `ROCM_VERSION=7.2` for RDNA4; see the overlay for `HSA_OVERRIDE_GFX_VERSION`. |
 
-```yaml
-services:
-  voicebox:
-    build: .
-    # ... existing config ...
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-```
-
-### AMD GPU (ROCm)
-
-For AMD GPUs, use the ROCm runtime:
-
-```yaml
-services:
-  voicebox:
-    build: .
-    # ... existing config ...
-    devices:
-      - /dev/kfd
-      - /dev/dri
-    group_add:
-      - video
-```
+Python dependencies are installed from `backend/requirements.lock` in every variant; only torch and torchaudio come from the variant's index. Regenerate the lock with `just lock-backend` after changing `backend/requirements.txt`.
 
 ### CPU Only
 
-The default configuration runs on CPU. This works fine but generation will be slower. LuxTTS is the fastest engine on CPU (150x realtime).
+The default configuration runs on CPU. This works fine but generation will be slower. Kokoro and LuxTTS are the fastest engines on CPU (real-time and better).
+
+## Warm-up, Readiness and Graceful Stop
+
+- **Liveness**: `GET /health` answers without a key as soon as the port is open. The image's `HEALTHCHECK` uses it.
+- **Readiness**: `GET /health/ready` answers `200` once every model in `VOICEBOX_PRELOAD_MODELS` is resident and the queue worker runs, and `503` while loading, after a load failed, or once the server is draining. Point load balancers and orchestrators at it.
+- **Warm-up**: set `VOICEBOX_PRELOAD_MODELS=kokoro,whisper-turbo` (names from `python -m backend.preload --list`) so the first request does not wait for a multi-gigabyte download. To bake weights into an image or an init container, run `python -m backend.preload <names>` with the same model cache.
+- **Stop**: on `SIGTERM` the server finishes open streams (up to 40 s), then drains its queue: new jobs get `503` with `Retry-After`, running generations get `VOICEBOX_DRAIN_TIMEOUT_S` (default 30) to finish. The compose file's `stop_grace_period: 45s` covers both.
+
+## Retention
+
+Generated audio and captures stay forever unless `VOICEBOX_RETENTION_DAYS` is set. Then a daily sweep removes generations older than that many days that are not favourited and not part of a story, captures older than that, and files nothing references. `POST /maintenance/prune` (admin key, optional body `{"days": N}`) runs the sweep on demand.
 
 ## Security
 
@@ -264,18 +257,20 @@ ports:
   - "127.0.0.1:8080:17493"
 ```
 
-## Prebuilt Images (Coming Soon)
+## Prebuilt Images
 
-We plan to publish prebuilt Docker images to GitHub Container Registry so you won't need to build locally:
+The `Docker` GitHub workflow builds the CPU image on every push to `main`, smoke-tests it (boot, preload Kokoro, stream speech with a client key, graceful stop) and publishes to GitHub Container Registry under the repository owner:
 
 ```bash
-# Not available yet — coming in a future release
-docker run -p 17493:17493 -e VOICEBOX_API_KEY ghcr.io/jamiepine/voicebox:latest
+# Release tags publish <version>-cpu, latest-cpu, <version>-cu128 and latest-cu128;
+# pushes to main publish main-cpu.
+docker run -d -p 127.0.0.1:17600:17493 \
+  -e VOICEBOX_API_KEY -e VOICEBOX_PRELOAD_MODELS=kokoro \
+  -v voicebox-data:/app/data -v huggingface-cache:/home/voicebox/.cache/huggingface \
+  ghcr.io/<owner>/voicebox:latest-cpu
 ```
 
-The CPU image will be ~3-4 GB (Python + PyTorch + TTS packages). A separate CUDA tag (~6-8 GB) will be available for NVIDIA GPU users. This is normal for ML containers.
-
-For now, use `docker compose up` to build from source as described above.
+Replace `<owner>` with the GitHub account or organisation that runs the workflow. The CPU image is about 4.5 GB and the CUDA image several gigabytes more, which is normal for ML containers. To use a published image with the compose files, replace `build: .` with `image: ghcr.io/<owner>/voicebox:latest-cpu` in `docker-compose.yml` (or `latest-cu128` together with the CUDA overlay).
 
 ## Connecting the Desktop App
 
