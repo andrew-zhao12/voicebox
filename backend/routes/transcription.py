@@ -32,6 +32,17 @@ async def transcribe_audio(
     model: str | None = Form(None),
 ):
     """Transcribe audio file to text."""
+    text, duration = await transcribe_upload(file, language, model)
+    return models.TranscriptionResponse(text=text, duration=duration)
+
+
+async def transcribe_upload(file: UploadFile, language: str | None, model: str | None) -> tuple[str, float]:
+    """Decode an upload, run Whisper and return ``(text, duration_seconds)``.
+
+    Shared by ``POST /transcribe`` and ``POST /v1/audio/transcriptions``;
+    raises ``HTTPException`` for bad model names, missing models (409 for
+    client keys, 202 while an admin's download runs) and decoder failures.
+    """
     uploaded_ext = Path(file.filename or "").suffix.lower()
     file_suffix = uploaded_ext if uploaded_ext in ALLOWED_AUDIO_EXTS else ".wav"
 
@@ -105,10 +116,7 @@ async def transcribe_audio(
         except InferenceBusyError as e:
             raise HTTPException(status_code=429, detail=str(e), headers={"Retry-After": str(e.retry_after_s)}) from e
 
-        return models.TranscriptionResponse(
-            text=text,
-            duration=duration,
-        )
+        return text, duration
 
     except HTTPException:
         raise

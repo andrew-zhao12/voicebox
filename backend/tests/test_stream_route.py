@@ -93,7 +93,7 @@ async def fake_backend(monkeypatch, tmp_path):
     # The route reads the caller from the auth middleware's ContextVar and
     # charges its rate-limit buckets; neither exists in this direct-call test.
     monkeypatch.setattr(generations, "get_principal", lambda: ADMIN)
-    monkeypatch.setattr(generations, "charge", lambda *args, **kwargs: None)
+    monkeypatch.setattr(generation_service, "charge", lambda *args, **kwargs: None)
     monkeypatch.setattr(generations.profiles, "get_profile", get_profile)
     monkeypatch.setattr(generations.profiles, "validate_profile_engine", lambda profile, engine: None)
     monkeypatch.setattr(generation_service, "prepare_engine", prepare_engine)

@@ -111,8 +111,6 @@ if not os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
 if not os.environ.get("MIOPEN_LOG_LEVEL"):
     os.environ["MIOPEN_LOG_LEVEL"] = "4"
 
-from urllib.parse import quote
-
 import torch
 from fastapi import FastAPI
 
@@ -123,19 +121,9 @@ from .database import get_db
 from .routes import register_routers
 from .services import llm, preload, retention, task_queue, transcribe, tts
 from .services.task_queue import create_background_task, init_queue
+from .utils.http import safe_content_disposition  # noqa: F401 -- re-export; routes import utils.http directly
 from .utils.platform_detect import get_backend_type
 from .utils.progress import get_progress_manager
-
-
-def safe_content_disposition(disposition_type: str, filename: str) -> str:
-    """Build a Content-Disposition header safe for non-ASCII filenames.
-
-    Uses RFC 5987 ``filename*`` parameter so browsers can decode UTF-8
-    filenames while the ``filename`` fallback stays ASCII-only.
-    """
-    ascii_name = "".join(c for c in filename if c.isascii() and (c.isalnum() or c in " -_.")).strip() or "download"
-    utf8_name = quote(filename, safe="")
-    return f"{disposition_type}; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}"
 
 
 def create_app() -> FastAPI:

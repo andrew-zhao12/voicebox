@@ -20,16 +20,72 @@ import asyncio
 import logging
 import traceback
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-from .. import config
-from . import history, profiles, task_queue
+import numpy as np
+
+from .. import config, models
+from ..auth import charge
+from ..auth.principal import Principal
+from . import history, personality, profiles, task_queue
+from .inference_slots import InferenceBusyError, llm_slot
+from .task_queue import QueueFullError, cancel_generation, enqueue_generation, ensure_capacity
 from ..database import get_db
 from ..utils.tasks import get_task_manager
 
 logger = logging.getLogger(__name__)
+
+
+class GenerationRefused(Exception):
+    """A request cannot be served; carries the HTTP status the route should answer with."""
+
+    def __init__(self, status_code: int, detail: str, headers: dict[str, str] | None = None) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+        self.headers = headers
+
+
+def resolve_engine(data: models.GenerationRequest, profile) -> str:
+    """The request's engine, else the profile's default or preset engine, else qwen."""
+    return data.engine or getattr(profile, "default_engine", None) or getattr(profile, "preset_engine", None) or "qwen"
+
+
+async def rewrite_for_personality(data: models.GenerationRequest, profile) -> tuple[str, str]:
+    """Return ``(text, source)``, rewriting through the profile's personality LLM when asked."""
+    if not (data.personality and getattr(profile, "personality", None)):
+        return data.text, "manual"
+    try:
+        async with llm_slot.acquire():
+            llm_result = await personality.rewrite_as_profile(profile.personality, data.text)
+    except InferenceBusyError as e:
+        raise GenerationRefused(429, str(e), {"Retry-After": str(e.retry_after_s)}) from e
+    except ValueError as e:
+        raise GenerationRefused(400, str(e)) from e
+    text = llm_result.text.strip()
+    if not text:
+        raise GenerationRefused(500, "LLM produced empty output; nothing to speak.")
+    return text, "personality_speak"
+
+
+def resolve_effects_chain(data: models.GenerationRequest, db) -> list | None:
+    """Effects from the request, else the profile's saved default chain, else ``None``."""
+    if data.effects_chain is not None:
+        return [e.model_dump() for e in data.effects_chain]
+
+    import json as _json
+
+    from ..database import VoiceProfile as DBVoiceProfile
+
+    profile_obj = db.query(DBVoiceProfile).filter_by(id=data.profile_id).first()
+    if profile_obj and profile_obj.effects_chain:
+        try:
+            return _json.loads(profile_obj.effects_chain)
+        except Exception:
+            return None
+    return None
 
 
 @dataclass
@@ -393,59 +449,138 @@ def _save_retry(
     return config.to_storage_path(audio_path)
 
 
-async def generate_audio_sync(
-    *,
-    profile_id: str,
-    text: str,
-    language: str,
-    engine: str,
-    model_size: str,
-    seed: Optional[int] = None,
-    instruct: Optional[str] = None,
-    normalize: bool = True,
-    max_chunk_chars: Optional[int] = None,
-    crossfade_ms: Optional[int] = None,
-) -> bytes:
-    """Run a TTS generation synchronously and return the resulting wav bytes.
+@dataclass
+class OpenedStream:
+    """A streaming job that has produced its first playable chunk."""
 
-    Unlike :func:`run_generation`, this path does not touch the
-    ``generations`` table, enqueue work, or write anything to the
-    generations directory. It's used by ``POST /profiles/{id}/speak``
-    when the caller passes ``persist=false`` — they just want the audio
-    back in the HTTP response without polluting their history.
+    session: StreamSession
+    first_audio: np.ndarray
+    sample_rate: int
+    engine: str
+    text: str
 
-    Loads the engine model on demand, runs ``generate_chunked``, optional
-    normalize, then encodes in-memory via :func:`tts.audio_to_wav_bytes`
-    (same helper ``/generate/stream`` uses).
+
+def abandon_stream(session: StreamSession) -> None:
+    """Stop a streaming job whose consumer went away (queued jobs are skipped, running ones cancelled)."""
+    session.consumer_gone.set()
+    cancel_generation(session.job_id)
+
+
+async def open_stream(data: models.StreamGenerationRequest, db, principal: Principal) -> OpenedStream:
+    """Validate a streamed request, queue its job and wait for the first chunk.
+
+    Shared by ``POST /generate/stream`` and ``POST /v1/audio/speech``: caps and
+    the ``tts_chars`` charge are applied here, the model must already be on
+    disk, and the first chunk (or the failure) arrives before any response
+    headers are sent, so early errors keep a real status code.  Raises
+    ``GenerationRefused`` for anything the caller must answer with an error.
     """
-    from ..utils.chunked_tts import generate_chunked
-    from ..utils.audio import normalize_audio
-    from . import tts
+    from fastapi import HTTPException
 
-    bg_db = next(get_db())
+    from ..backends import engine_has_model_sizes, ensure_model_cached_or_raise
+    from ..utils.effects import validate_effects_chain
+
     try:
-        prep = await prepare_engine(engine, model_size, profile_id, bg_db)
+        ensure_capacity(principal.key_id, principal.limits.max_pending_jobs)
+    except QueueFullError as e:
+        raise _refused_queue(e) from e
+    charge("tts_chars", len(data.text))
+
+    profile = await profiles.get_profile(data.profile_id, db)
+    if not profile:
+        raise GenerationRefused(404, "Profile not found")
+
+    engine = resolve_engine(data, profile)
+    try:
+        profiles.validate_profile_engine(profile, engine)
+    except ValueError as e:
+        raise GenerationRefused(400, str(e)) from e
+
+    model_size = (data.model_size or "1.7B") if engine_has_model_sizes(engine) else None
+    try:
+        await ensure_model_cached_or_raise(engine, model_size or "default")
+    except HTTPException as e:
+        raise GenerationRefused(e.status_code, str(e.detail)) from e
+
+    effects_chain = resolve_effects_chain(data, db)
+    if effects_chain:
+        error_msg = validate_effects_chain(effects_chain)
+        if error_msg:
+            raise GenerationRefused(400, f"Invalid effects chain: {error_msg}")
+
+    text, _source = await rewrite_for_personality(data, profile)
+
+    first_chunk_chars = data.first_chunk_chars
+    if first_chunk_chars is not None:
+        first_chunk_chars = min(first_chunk_chars, data.max_chunk_chars)
+
+    session = new_stream_session()
+    try:
+        enqueue_generation(
+            session.job_id,
+            run_generation_stream(
+                session=session,
+                profile_id=data.profile_id,
+                text=text,
+                language=data.language,
+                engine=engine,
+                model_size=model_size,
+                seed=data.seed,
+                instruct=data.instruct,
+                normalize=data.normalize,
+                effects_chain=effects_chain,
+                max_chunk_chars=data.max_chunk_chars,
+                crossfade_ms=data.crossfade_ms,
+                first_chunk_chars=first_chunk_chars,
+            ),
+            owner=principal.key_id,
+            max_pending=principal.limits.max_pending_jobs,
+        )
+    except QueueFullError as e:
+        raise _refused_queue(e) from e
+
+    try:
+        first = await session.frames.get()
+    except asyncio.CancelledError:
+        abandon_stream(session)
+        raise
+    if first is None:
+        raise GenerationRefused(500, "TTS produced no audio")
+    if isinstance(first, ValueError):
+        raise GenerationRefused(400, str(first))
+    if isinstance(first, Exception):
+        logger.error("Stream %s failed before the first chunk: %s", session.job_id, first)
+        raise GenerationRefused(500, "Speech synthesis failed; see the server log")
+    first_audio, sample_rate = first
+    return OpenedStream(session=session, first_audio=first_audio, sample_rate=sample_rate, engine=engine, text=text)
+
+
+def _refused_queue(error: QueueFullError) -> GenerationRefused:
+    status = 503 if error.reason == "draining" else 429
+    return GenerationRefused(status, str(error), {"Retry-After": str(error.retry_after_s)})
+
+
+async def stream_frames(opened: OpenedStream) -> AsyncIterator[np.ndarray]:
+    """Yield the first chunk, then every later one, abandoning the job if the consumer stops early."""
+    session = opened.session
+    finished = False
+    try:
+        yield opened.first_audio
+        while True:
+            item = await session.frames.get()
+            if item is None:
+                finished = True
+                return
+            if isinstance(item, Exception):
+                finished = True
+                logger.error("Stream %s ended early: %s", session.job_id, item)
+                return
+            yield item[0]
     finally:
-        bg_db.close()
-
-    gen_kwargs: dict = dict(
-        language=language,
-        seed=seed,
-        instruct=instruct,
-        trim_fn=prep.trim_fn,
-        runaway_detector=prep.runaway_detector,
-    )
-    if max_chunk_chars is not None:
-        gen_kwargs["max_chunk_chars"] = max_chunk_chars
-    if crossfade_ms is not None:
-        gen_kwargs["crossfade_ms"] = crossfade_ms
-
-    audio, sample_rate = await generate_chunked(prep.backend, text, prep.voice_prompt, **gen_kwargs)
-
-    if normalize:
-        audio = normalize_audio(audio)
-
-    return tts.audio_to_wav_bytes(audio, sample_rate)
+        # Also runs on client disconnect (CancelledError) and generator
+        # close, so an abandoned stream stops holding the queue.
+        if not finished:
+            abandon_stream(session)
 
 
 def _save_regenerate(

@@ -12,9 +12,16 @@ from sqlalchemy.orm import Session
 from .. import config, lifecycle, models
 from ..auth import charge, get_principal
 from ..database import Generation as DBGeneration, VoiceProfile as DBVoiceProfile, get_db
-from ..services import history, personality, profiles
-from ..services.generation import StreamSession, new_stream_session, run_generation, run_generation_stream
-from ..services.inference_slots import InferenceBusyError, llm_slot
+from ..services import history, profiles
+from ..services.generation import (
+    GenerationRefused,
+    open_stream,
+    resolve_effects_chain,
+    resolve_engine,
+    rewrite_for_personality,
+    run_generation,
+    stream_frames,
+)
 from ..services.task_queue import (
     QueueFullError,
     cancel_generation as cancel_generation_job,
@@ -53,50 +60,20 @@ def _get_or_create_import_profile(db: Session) -> DBVoiceProfile:
     return row
 
 
-def _resolve_generation_engine(data: models.GenerationRequest, profile) -> str:
-    return data.engine or getattr(profile, "default_engine", None) or getattr(profile, "preset_engine", None) or "qwen"
-
-
 def _queue_full(error: QueueFullError) -> HTTPException:
     status = 503 if error.reason == "draining" else 429
     return HTTPException(status_code=status, detail=str(error), headers={"Retry-After": str(error.retry_after_s)})
 
 
-def _busy(error: InferenceBusyError) -> HTTPException:
-    return HTTPException(status_code=429, detail=str(error), headers={"Retry-After": str(error.retry_after_s)})
+def _refused(error: GenerationRefused) -> HTTPException:
+    return HTTPException(status_code=error.status_code, detail=error.detail, headers=error.headers)
 
 
 async def _rewrite_for_personality(data: models.GenerationRequest, profile) -> tuple[str, str]:
-    """Return ``(text, source)``, rewriting through the profile's personality LLM when asked."""
-    if not (data.personality and getattr(profile, "personality", None)):
-        return data.text, "manual"
     try:
-        async with llm_slot.acquire():
-            llm_result = await personality.rewrite_as_profile(profile.personality, data.text)
-    except InferenceBusyError as e:
-        raise _busy(e) from e
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    text = llm_result.text.strip()
-    if not text:
-        raise HTTPException(status_code=500, detail="LLM produced empty output; nothing to speak.")
-    return text, "personality_speak"
-
-
-def _resolve_effects_chain(data: models.GenerationRequest, db: Session) -> list | None:
-    """Effects from the request, else the profile's saved default chain, else ``None``."""
-    if data.effects_chain is not None:
-        return [e.model_dump() for e in data.effects_chain]
-
-    import json as _json
-
-    profile_obj = db.query(DBVoiceProfile).filter_by(id=data.profile_id).first()
-    if profile_obj and profile_obj.effects_chain:
-        try:
-            return _json.loads(profile_obj.effects_chain)
-        except Exception:
-            return None
-    return None
+        return await rewrite_for_personality(data, profile)
+    except GenerationRefused as e:
+        raise _refused(e) from e
 
 
 @router.post("/generate", response_model=models.GenerationResponse)
@@ -121,7 +98,7 @@ async def generate_speech(
 
     from ..backends import engine_has_model_sizes, ensure_model_cached_or_raise
 
-    engine = _resolve_generation_engine(data, profile)
+    engine = resolve_engine(data, profile)
     try:
         profiles.validate_profile_engine(profile, engine)
     except ValueError as e:
@@ -156,7 +133,7 @@ async def generate_speech(
         text=text,
     )
 
-    effects_chain_config = _resolve_effects_chain(data, db)
+    effects_chain_config = resolve_effects_chain(data, db)
 
     try:
         enqueue_generation(
@@ -391,12 +368,6 @@ async def get_generation_status(generation_id: str, db: Session = Depends(get_db
     )
 
 
-def _abandon_stream(session: StreamSession) -> None:
-    """Stop a streaming job whose consumer went away (queued jobs are skipped, running ones cancelled)."""
-    session.consumer_gone.set()
-    cancel_generation_job(session.job_id)
-
-
 @router.post("/generate/stream")
 async def stream_speech(
     data: models.StreamGenerationRequest,
@@ -411,111 +382,23 @@ async def stream_speech(
     little-endian mono samples.  The sample rate is reported in the
     ``X-Voicebox-Sample-Rate`` header.  Nothing is written to history.
     """
-    from ..backends import engine_has_model_sizes, ensure_model_cached_or_raise
-    from ..utils.effects import validate_effects_chain
-
-    principal = get_principal()
     try:
-        ensure_capacity(principal.key_id, principal.limits.max_pending_jobs)
-    except QueueFullError as e:
-        raise _queue_full(e) from e
-    charge("tts_chars", len(data.text))
-
-    profile = await profiles.get_profile(data.profile_id, db)
-    if not profile:
-        raise HTTPException(status_code=404, detail="Profile not found")
-
-    engine = _resolve_generation_engine(data, profile)
-    try:
-        profiles.validate_profile_engine(profile, engine)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    model_size = (data.model_size or "1.7B") if engine_has_model_sizes(engine) else None
-    await ensure_model_cached_or_raise(engine, model_size or "default")
-
-    effects_chain = _resolve_effects_chain(data, db)
-    if effects_chain:
-        error_msg = validate_effects_chain(effects_chain)
-        if error_msg:
-            raise HTTPException(status_code=400, detail=f"Invalid effects chain: {error_msg}")
-
-    text, _source = await _rewrite_for_personality(data, profile)
-
-    first_chunk_chars = data.first_chunk_chars
-    if first_chunk_chars is not None:
-        first_chunk_chars = min(first_chunk_chars, data.max_chunk_chars)
-
-    session = new_stream_session()
-    try:
-        enqueue_generation(
-            session.job_id,
-            run_generation_stream(
-                session=session,
-                profile_id=data.profile_id,
-                text=text,
-                language=data.language,
-                engine=engine,
-                model_size=model_size,
-                seed=data.seed,
-                instruct=data.instruct,
-                normalize=data.normalize,
-                effects_chain=effects_chain,
-                max_chunk_chars=data.max_chunk_chars,
-                crossfade_ms=data.crossfade_ms,
-                first_chunk_chars=first_chunk_chars,
-            ),
-            owner=principal.key_id,
-            max_pending=principal.limits.max_pending_jobs,
-        )
-    except QueueFullError as e:
-        raise _queue_full(e) from e
-
-    # Wait for the first playable chunk (or the failure) before sending
-    # headers: early errors keep a real status code and the sample rate is
-    # known for the WAV header.  The first chunk is the earliest playable
-    # audio anyway, so this costs no latency.
-    try:
-        first = await session.frames.get()
-    except asyncio.CancelledError:
-        _abandon_stream(session)
-        raise
-    if first is None:
-        raise HTTPException(status_code=500, detail="TTS produced no audio")
-    if isinstance(first, ValueError):
-        raise HTTPException(status_code=400, detail=str(first))
-    if isinstance(first, Exception):
-        logger.error("Stream %s failed before the first chunk: %s", session.job_id, first)
-        raise HTTPException(status_code=500, detail="Speech synthesis failed; see the server log")
-    first_audio, sample_rate = first
+        opened = await open_stream(data, db, get_principal())
+    except GenerationRefused as e:
+        raise _refused(e) from e
 
     async def body():
-        finished = False
-        try:
-            head = streaming_wav_header(sample_rate) if data.format == "wav" else b""
-            yield head + float_to_pcm16_bytes(first_audio)
-            while True:
-                item = await session.frames.get()
-                if item is None:
-                    finished = True
-                    return
-                if isinstance(item, Exception):
-                    finished = True
-                    logger.error("Stream %s ended early: %s", session.job_id, item)
-                    return
-                yield float_to_pcm16_bytes(item[0])
-        finally:
-            # Also runs on client disconnect (CancelledError) and generator
-            # close, so an abandoned stream stops holding the queue.
-            if not finished:
-                _abandon_stream(session)
+        head = streaming_wav_header(opened.sample_rate) if data.format == "wav" else b""
+        async for frame in stream_frames(opened):
+            yield head + float_to_pcm16_bytes(frame)
+            head = b""
 
     headers = {
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
         "X-Voicebox-Stream-Mode": "chunked",
-        "X-Voicebox-Job-Id": session.job_id,
-        "X-Voicebox-Sample-Rate": str(sample_rate),
+        "X-Voicebox-Job-Id": opened.session.job_id,
+        "X-Voicebox-Sample-Rate": str(opened.sample_rate),
         "X-Voicebox-Channels": "1",
         "X-Voicebox-Sample-Format": "s16le",
     }
