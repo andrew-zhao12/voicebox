@@ -391,6 +391,10 @@ db-reset:
 
 # ─── Utilities ────────────────────────────────────────────────────────
 
+# Regenerate backend/requirements.lock for the Docker image (needs uv)
+lock-backend:
+    ./scripts/lock-backend.sh
+
 # Generate TypeScript API client (backend must be running)
 [unix]
 generate-api:

@@ -1,0 +1,25 @@
+# NVIDIA GPU overlay: CUDA 12.8 PyTorch wheels (torch 2.11, Blackwell/sm_120 included).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cuda.yml up --build
+#
+# Needs the NVIDIA Container Toolkit on the host and a driver >= 570.
+# Other CUDA indexes work with a build arg, e.g. cu130 for driver >= 580:
+#   PYTORCH_VARIANT=cu130 docker compose -f docker-compose.yml -f docker-compose.cuda.yml build
+
+services:
+  voicebox:
+    build:
+      context: .
+      args:
+        PYTORCH_VARIANT: ${PYTORCH_VARIANT:-cu128}
+
+    deploy:
+      resources:
+        limits:
+          cpus: '8'
+          memory: 24G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

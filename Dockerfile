@@ -1,10 +1,12 @@
 # ============================================================
-# Voicebox — Local TTS Server with Web UI
+# Voicebox — TTS/STT server with the web UI
 # 3-stage build: Frontend → Python deps → Runtime
 #
-# Build variants:
-#   CPU (default):  docker compose up --build
-#   ROCm (AMD GPU): docker compose -f docker-compose.yml -f docker-compose.rocm.yml up --build
+# Build variants (PYTORCH_VARIANT build arg):
+#   cpu   (default)  docker compose up --build
+#   cu128 (NVIDIA)   docker compose -f docker-compose.yml -f docker-compose.cuda.yml up --build
+#   rocm  (AMD)      docker compose -f docker-compose.yml -f docker-compose.rocm.yml up --build
+# Any other PyTorch CUDA index name (cu126, cu130) works too; see the torch step.
 # ============================================================
 
 # Top-level ARG so it is visible to all stages.
@@ -31,11 +33,18 @@ RUN bun install --no-save
 RUN cd web && bunx --bun vite build
 
 
-# === Stage 2: Build Python dependencies ===
-FROM python:3.11-slim AS backend-builder
+# === Stage 2: Python dependencies ===
+# python:3.12-slim — the backend uses 3.12 syntax (pyproject: requires-python >= 3.12).
+FROM python:3.12-slim AS backend-builder
 
-# Re-declare ARG inside the stage (Docker scoping requirement).
+# Re-declare ARGs inside the stage (Docker scoping requirement).
 ARG PYTORCH_VARIANT=cpu
+# ROCm wheel index. Default 6.3 (RDNA1/2/3); set ROCM_VERSION=7.2 for RDNA4.
+ARG ROCM_VERSION=6.3
+# torch/torchaudio are the only packages requirements.lock does not pin, because
+# the variant picks their wheels.  Empty TORCH_VERSION = the variant's default.
+ARG TORCH_VERSION=
+ARG TORCHAUDIO_VERSION=2.11.0
 
 WORKDIR /build
 
@@ -44,31 +53,44 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# A virtualenv rather than --prefix: pip then sees the torch installed below
+# and never resolves a second copy from PyPI while installing the lock.
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir --upgrade pip
 
-COPY backend/requirements.txt .
+# 1. torch for the chosen variant.  The cu128 index stops at torch 2.11 (newer
+#    builds moved to cu126/cu130) and the ROCm indexes lag further, so ROCm
+#    takes whatever its index currently has.  Every later install keeps the
+#    variant index primary so nothing pulls the default CUDA torch from PyPI.
+RUN set -eu; \
+    case "$PYTORCH_VARIANT" in \
+      cpu)   index="https://download.pytorch.org/whl/cpu";   default_torch="2.14.0" ;; \
+      cu128) index="https://download.pytorch.org/whl/cu128"; default_torch="2.11.0" ;; \
+      cu*)   index="https://download.pytorch.org/whl/${PYTORCH_VARIANT}"; default_torch="2.14.0" ;; \
+      rocm)  index="https://download.pytorch.org/whl/rocm${ROCM_VERSION}"; default_torch="" ;; \
+      *) echo "PYTORCH_VARIANT must be cpu, cu<version> or rocm (got '$PYTORCH_VARIANT')" >&2; exit 1 ;; \
+    esac; \
+    version="${TORCH_VERSION:-$default_torch}"; \
+    if [ -n "$version" ]; then \
+      spec="torch==${version} torchaudio==${TORCHAUDIO_VERSION}"; \
+    else \
+      spec="torch torchaudio"; \
+    fi; \
+    pip install --no-cache-dir --index-url "$index" $spec; \
+    printf '[global]\nindex-url = %s\nextra-index-url = https://pypi.org/simple\n' "$index" > /etc/pip.conf
 
-# ROCm wheel index. Default 6.3 (RDNA1/2/3); set ROCM_VERSION=7.2 for RDNA4.
-ARG ROCM_VERSION=6.3
+# 2. Everything else, pinned. scripts/lock-backend.sh regenerates the lock.
+COPY backend/requirements.lock .
+RUN pip install --no-cache-dir -r requirements.lock
 
-# For ROCm, make the PyTorch ROCm index primary so every install below resolves
-# torch to ROCm wheels instead of the default CUDA build.
-RUN if [ "$PYTORCH_VARIANT" = "rocm" ]; then \
-      pip install --no-cache-dir --prefix=/install \
-        --index-url "https://download.pytorch.org/whl/rocm${ROCM_VERSION}" \
-        torch torchaudio && \
-      printf '[global]\nindex-url = https://download.pytorch.org/whl/rocm%s\nextra-index-url = https://pypi.org/simple\n' "$ROCM_VERSION" > /etc/pip.conf; \
-    fi
-
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
-RUN pip install --no-cache-dir --prefix=/install --no-deps chatterbox-tts
-RUN pip install --no-cache-dir --prefix=/install --no-deps hume-tada
-RUN pip install --no-cache-dir --prefix=/install \
-    git+https://github.com/QwenLM/Qwen3-TTS.git
+# 3. Two packages whose own pins conflict with the stack, installed without
+#    dependencies (their real dependencies are already in the lock).
+RUN pip install --no-cache-dir --no-deps chatterbox-tts==0.1.7 hume-tada==0.1.9
 
 
 # === Stage 3: Runtime ===
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 # Create non-root user; the entrypoint joins GPU device groups at runtime.
 RUN groupadd -r voicebox && \
@@ -83,8 +105,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gosu \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy installed Python packages from builder stage
-COPY --from=backend-builder /install /usr/local
+# The virtualenv from the builder stage (same base image, so its python symlink resolves)
+COPY --from=backend-builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1
 
 # Copy backend application code
 COPY --chown=voicebox:voicebox backend/ /app/backend/
@@ -99,7 +123,8 @@ RUN mkdir -p /app/data/generations /app/data/profiles /app/data/cache \
 # Expose the API port
 EXPOSE 17493
 
-# Health check — auto-restart if the server hangs
+# Liveness: /health answers without a key as soon as the port is open.
+# Readiness (models resident) is GET /health/ready — point load balancers there.
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
     CMD curl -f http://localhost:17493/health || exit 1
 
@@ -110,4 +135,6 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
 COPY --chmod=755 scripts/rocm-entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "17493"]
+# SIGTERM: uvicorn stops accepting, waits up to 40 s for open responses (streams,
+# SSE), then the app drains its generation queue (VOICEBOX_DRAIN_TIMEOUT_S).
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "17493", "--timeout-graceful-shutdown", "40"]

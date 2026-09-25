@@ -1,0 +1,14 @@
+# Extra inputs for the Docker lock (scripts/lock-backend.sh); not used by the
+# desktop build.
+#
+# Qwen3-TTS is git-only, so it is pinned to a commit here and resolved
+# together with requirements.txt.  chatterbox-tts and hume-tada stay out on
+# purpose: the Dockerfile installs them --no-deps because their own pins
+# (torch, numpy, transformers) conflict with the stack.
+#
+# torch/torchaudio are resolved as the CPU builds so no CUDA libraries end up
+# in the lock; they are excluded from the output and the Dockerfile installs
+# the chosen variant's wheels before the lock.
+qwen-tts @ git+https://github.com/QwenLM/Qwen3-TTS.git@022e286b98fbec7e1e916cb940cdf532cd9f488e
+torch==2.14.0
+torchaudio==2.11.0

@@ -13,13 +13,22 @@ scripts/*
 
 # Dependencies & build artifacts (rebuilt in Docker)
 node_modules/
+**/node_modules/
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 *.egg-info/
 dist/
+**/dist/
 build/
+**/build/
 *.spec
+# The local Python environment and PyInstaller output must never enter the image
+backend/venv/
+**/venv/
+backend/dist/
+backend/build/
 
 # Data (will be bind-mounted)
 data/
