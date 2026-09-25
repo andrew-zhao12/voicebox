@@ -65,7 +65,6 @@ export function VoiceInspector({ profileId }: VoiceInspectorProps) {
   const updateProfile = useUpdateProfile();
   const uploadAvatar = useUploadAvatar();
   const deleteAvatar = useDeleteAvatar();
-  const serverUrl = useServerStore((state) => state.serverUrl);
   const mediaToken = useServerStore((state) => state.mediaToken?.token ?? null);
   const { toast } = useToast();
 

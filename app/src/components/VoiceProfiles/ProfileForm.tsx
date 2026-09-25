@@ -157,7 +157,6 @@ export function ProfileForm() {
   const avatarInputRef = useRef<HTMLInputElement>(null);
   const { isPlaying, playPause, cleanup: cleanupAudio } = useAudioPlayer();
   const isCreating = !editingProfileId;
-  const serverUrl = useServerStore((state) => state.serverUrl);
   const mediaToken = useServerStore((state) => state.mediaToken?.token ?? null);
   const [profileEffectsChain, setProfileEffectsChain] = useState<EffectConfig[]>([]);
   const [effectsDirty, setEffectsDirty] = useState(false);
