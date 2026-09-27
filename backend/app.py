@@ -120,7 +120,7 @@ from .auth.settings import SecuritySettings
 from .database import get_db
 from .observability import logs as observability_logs, metrics
 from .routes import register_routers
-from .services import llm, preload, retention, task_queue, transcribe, tts
+from .services import idle_unload, llm, preload, retention, task_queue, transcribe, tts
 from .services.task_queue import create_background_task, init_queue
 from .utils.http import safe_content_disposition  # noqa: F401 -- re-export; routes import utils.http directly
 from .utils.platform_detect import get_backend_type
@@ -285,7 +285,12 @@ async def _run_startup(application: FastAPI) -> None:
     security = application.state.security
     security.startup()
 
-    init_queue(max_depth=security.settings.max_queue_depth)
+    workers = task_queue.configured_workers()
+    if workers > 1 and get_backend_type() == "mlx":
+        logger.warning("VOICEBOX_GENERATION_WORKERS ignored: MLX inference stays on one lane")
+        workers = 1
+    init_queue(max_depth=security.settings.max_queue_depth, workers=workers)
+    logger.info("Generation lanes: %s", ", ".join(task_queue.lane_names()))
 
     # uvicorn may have reconfigured its loggers after the import-time setup.
     if observability_logs.json_logging_enabled():
@@ -365,6 +370,14 @@ async def _run_startup(application: FastAPI) -> None:
     if preload_names:
         logger.info("Preloading models: %s", ", ".join(preload_names))
         create_background_task(preload.run(preload_names))
+
+    idle_s = idle_unload.configured_idle_s()
+    if idle_s is not None:
+        from .backends import get_model_config
+
+        protected = {cfg.engine for name in preload_names if (cfg := get_model_config(name)) is not None}
+        logger.info("Idle unload: models unused for %.0f s are unloaded (kept: %s)", idle_s, ", ".join(sorted(protected)) or "none")
+        create_background_task(idle_unload.run_loop(idle_s, protected))
 
     retention_days = retention.configured_days()
     if retention_days is not None:

@@ -7,6 +7,7 @@ backend/tests/test_auth_tokens.py
 backend/tests/test_chunked_tts_stream.py
 backend/tests/test_cors.py
 backend/tests/test_encode.py
+backend/tests/test_idle_unload.py
 backend/tests/test_inference_slots.py
 backend/tests/test_keys_cli.py
 backend/tests/test_lifecycle.py
@@ -16,4 +17,5 @@ backend/tests/test_ratelimit.py
 backend/tests/test_retention.py
 backend/tests/test_task_queue_cancellation.py
 backend/tests/test_task_queue_caps.py
+backend/tests/test_task_queue_lanes.py
 backend/tests/test_wav_stream.py

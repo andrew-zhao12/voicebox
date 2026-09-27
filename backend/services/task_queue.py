@@ -1,13 +1,23 @@
-"""
-Serial generation queue — ensures only one TTS inference runs at a time
-to avoid GPU contention.
+"""Generation queue: one worker per lane.
+
+By default there is a single lane (``all``) with one worker, so TTS
+inference is strictly serial, which is what one GPU wants.  With
+``VOICEBOX_GENERATION_WORKERS=2`` (``init_queue(workers=2)``) the work splits
+into a ``cpu`` and a ``gpu`` lane, each with its own FIFO and worker, so a
+CPU engine such as Kokoro synthesizes while a GPU engine does; jobs in the
+same lane still run one at a time.  Seeded jobs are *exclusive*:
+``torch.manual_seed`` is process-wide, so an exclusive job waits until the
+other lane is idle and blocks new starts until it finishes.  Model loading
+is serialized separately by ``services/generation.prepare_engine``.
 """
 
 import asyncio
 import contextlib
 import logging
+import os
+import time
 import traceback
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Literal
@@ -25,6 +35,12 @@ _background_tasks: set = set()
 STREAM_JOB_PREFIX = "stream-"
 # Job ids of startup preloads (``services/preload.py``); no ``generations`` row either.
 PRELOAD_JOB_PREFIX = "preload-"
+
+LANE_ALL = "all"
+LANE_CPU = "cpu"
+LANE_GPU = "gpu"
+WORKERS_ENV = "VOICEBOX_GENERATION_WORKERS"
+MAX_WORKERS = 2
 
 
 class QueueFullError(Exception):
@@ -48,12 +64,48 @@ class GenerationJob:
     coro: Coroutine
     owner: str | None = None
     enqueued_at: float = field(default_factory=perf_counter)
+    lane: str = LANE_ALL
+    engine: str | None = None
+    exclusive: bool = False
+
+
+@dataclass
+class _Lane:
+    name: str
+    queue: asyncio.Queue
+    worker: asyncio.Task | None = None
+
+
+class _ExclusiveGate:
+    """Readers/writer gate: an exclusive job runs alone, everything else may overlap."""
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._active = 0
+        self._exclusive = False
+
+    async def enter(self, exclusive: bool) -> None:
+        async with self._condition:
+            if exclusive:
+                await self._condition.wait_for(lambda: self._active == 0 and not self._exclusive)
+                self._exclusive = True
+            else:
+                await self._condition.wait_for(lambda: not self._exclusive)
+            self._active += 1
+
+    async def leave(self, exclusive: bool) -> None:
+        async with self._condition:
+            self._active -= 1
+            if exclusive:
+                self._exclusive = False
+            self._condition.notify_all()
 
 
 DEFAULT_MAX_DEPTH = 32
 
-# Generation queue — serializes TTS inference to avoid GPU contention
-_generation_queue: asyncio.Queue = None  # type: ignore  # initialized at startup
+_lanes: dict[str, _Lane] = {}
+_gate: _ExclusiveGate | None = None
+# The first lane's worker; kept for tests and ``worker_running``.
 _generation_worker_task: asyncio.Task | None = None
 _queued_generation_ids: set[str] = set()
 _running_generation_tasks: dict[str, asyncio.Task] = {}
@@ -62,6 +114,24 @@ _max_depth: int = DEFAULT_MAX_DEPTH
 # Pending (queued + running) jobs per owner (API key id), for per-key caps.
 _pending_by_owner: dict[str, int] = {}
 _job_owner: dict[str, str] = {}
+# Engine per queued or running job, and when each engine last finished a job.
+_job_engine: dict[str, str] = {}
+_engine_last_used: dict[str, float] = {}
+
+
+def configured_workers(environ: Mapping[str, str] = os.environ) -> int:
+    """``VOICEBOX_GENERATION_WORKERS``: 1 (serial, default) or 2 (a cpu and a gpu lane)."""
+    raw = environ.get(WORKERS_ENV)
+    if raw is None or not raw.strip():
+        return 1
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using 1", WORKERS_ENV, raw)
+        return 1
+    if value > MAX_WORKERS:
+        logger.warning("%s=%d: only the cpu and gpu lanes exist; using %d", WORKERS_ENV, value, MAX_WORKERS)
+    return max(1, min(value, MAX_WORKERS))
 
 
 def create_background_task(coro) -> asyncio.Task:
@@ -72,10 +142,31 @@ def create_background_task(coro) -> asyncio.Task:
     return task
 
 
-async def _generation_worker():
-    """Worker that processes generation tasks one at a time."""
+def lane_names() -> list[str]:
+    return list(_lanes)
+
+
+def parallel() -> bool:
+    """Whether more than one lane exists."""
+    return len(_lanes) > 1
+
+
+def default_lane() -> str:
+    """Where a job without a lane goes: the only lane, or the gpu lane (the safe assumption)."""
+    return LANE_GPU if parallel() else LANE_ALL
+
+
+def resolve_lane(lane: str | None) -> str:
+    if not parallel():
+        return LANE_ALL
+    return lane if lane in _lanes else default_lane()
+
+
+async def _lane_worker(lane: _Lane):
+    """Run the lane's jobs one at a time."""
     while True:
-        job = await _generation_queue.get()
+        job = await lane.queue.get()
+        entered = False
         try:
             if job.generation_id in _cancelled_generation_ids:
                 _cancelled_generation_ids.discard(job.generation_id)
@@ -83,6 +174,9 @@ async def _generation_worker():
                 continue
 
             metrics.QUEUE_WAIT_SECONDS.observe(perf_counter() - job.enqueued_at)
+            if _gate is not None:
+                await _gate.enter(job.exclusive)
+                entered = True
             task = asyncio.create_task(job.coro)
             _running_generation_tasks[job.generation_id] = task
             _queued_generation_ids.discard(job.generation_id)
@@ -102,10 +196,12 @@ async def _generation_worker():
                 "Worker exited without writing terminal status",
             )
         finally:
+            if entered and _gate is not None:
+                await _gate.leave(job.exclusive)
             _running_generation_tasks.pop(job.generation_id, None)
             _queued_generation_ids.discard(job.generation_id)
             _release(job.generation_id)
-            _generation_queue.task_done()
+            lane.queue.task_done()
             metrics.QUEUE_PENDING.set(pending_count())
 
 
@@ -140,13 +236,23 @@ async def _force_fail_if_active(generation_id: str, error: str) -> None:
 
 
 def pending_count() -> int:
-    """Jobs queued or running right now."""
+    """Jobs queued or running right now, across all lanes."""
     return len(_queued_generation_ids) + len(_running_generation_tasks)
+
+
+def engine_in_use(engine: str) -> int:
+    """Queued or running jobs for *engine* (so an unload can be refused)."""
+    return sum(1 for job_engine in _job_engine.values() if job_engine == engine)
+
+
+def engines_last_used() -> dict[str, float]:
+    """``time.monotonic()`` of each engine's last finished job."""
+    return dict(_engine_last_used)
 
 
 def ensure_capacity(owner: str | None = None, max_pending: int | None = None) -> None:
     """Raise ``QueueFullError`` when the global depth or the owner's cap is reached."""
-    if _generation_queue is None:
+    if not _lanes:
         raise RuntimeError("Generation queue has not been initialized")
     if lifecycle.is_draining():
         raise QueueFullError("draining", retry_after_s=10)
@@ -156,12 +262,23 @@ def ensure_capacity(owner: str | None = None, max_pending: int | None = None) ->
         raise QueueFullError("owner")
 
 
-def enqueue_generation(generation_id: str, coro, *, owner: str | None = None, max_pending: int | None = None):
-    """Add a generation coroutine to the serial queue.
+def enqueue_generation(
+    generation_id: str,
+    coro,
+    *,
+    owner: str | None = None,
+    max_pending: int | None = None,
+    lane: str | None = None,
+    engine: str | None = None,
+    exclusive: bool = False,
+):
+    """Add a generation coroutine to its lane's queue.
 
     ``owner`` (an API key id) and ``max_pending`` enforce a per-caller cap on
-    top of the global depth; a rejected coroutine is closed so it never warns
-    about being un-awaited.
+    top of the global depth; ``lane`` picks the worker (ignored with a single
+    lane), ``engine`` is recorded for ``engine_in_use``, and ``exclusive``
+    jobs (seeded synthesis) run with nothing else in flight.  A rejected
+    coroutine is closed so it never warns about being un-awaited.
     """
     try:
         ensure_capacity(owner, max_pending)
@@ -169,16 +286,31 @@ def enqueue_generation(generation_id: str, coro, *, owner: str | None = None, ma
         coro.close()
         raise
 
+    lane_name = resolve_lane(lane)
     _queued_generation_ids.add(generation_id)
     if owner is not None:
         _job_owner[generation_id] = owner
         _pending_by_owner[owner] = _pending_by_owner.get(owner, 0) + 1
-    _generation_queue.put_nowait(GenerationJob(generation_id=generation_id, coro=coro, owner=owner))
+    if engine is not None:
+        _job_engine[generation_id] = engine
+    _lanes[lane_name].queue.put_nowait(
+        GenerationJob(
+            generation_id=generation_id,
+            coro=coro,
+            owner=owner,
+            lane=lane_name,
+            engine=engine,
+            exclusive=exclusive,
+        )
+    )
     metrics.QUEUE_PENDING.set(pending_count())
 
 
 def _release(generation_id: str) -> None:
-    """Give the owner's pending slot back; safe to call more than once."""
+    """Give the owner's pending slot back and record the engine's last use; safe to call more than once."""
+    engine = _job_engine.pop(generation_id, None)
+    if engine is not None:
+        _engine_last_used[engine] = time.monotonic()
     owner = _job_owner.pop(generation_id, None)
     if owner is None:
         return
@@ -207,19 +339,19 @@ def cancel_generation(generation_id: str) -> Literal["queued", "running"] | None
 
 
 def worker_running() -> bool:
-    """Whether the queue worker exists and is still alive."""
-    return _generation_worker_task is not None and not _generation_worker_task.done()
+    """Whether every lane's worker exists and is still alive."""
+    return bool(_lanes) and all(lane.worker is not None and not lane.worker.done() for lane in _lanes.values())
 
 
 async def shutdown(drain_timeout_s: float) -> bool:
-    """Drain, then stop the worker.
+    """Drain, then stop the workers.
 
     Refuses new jobs at once, waits up to *drain_timeout_s* for the pending
     ones, then cancels whatever is still running and closes the coroutines
     still queued.  Returns True when every job finished on its own.
     """
     lifecycle.begin_drain("shutdown")
-    if _generation_queue is None:
+    if not _lanes:
         return True
     drained = await lifecycle.wait_for_idle(pending_count, drain_timeout_s)
     if not drained:
@@ -229,47 +361,58 @@ async def shutdown(drain_timeout_s: float) -> bool:
             pending_count(),
         )
     tasks = list(_running_generation_tasks.values())
-    worker = _generation_worker_task
+    workers = [lane.worker for lane in _lanes.values() if lane.worker is not None]
     for task in tasks:
         task.cancel()
-    if worker is not None and not worker.done():
-        worker.cancel()
-    for task in [*tasks, worker]:
-        if task is not None:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
-    while not _generation_queue.empty():
-        job = _generation_queue.get_nowait()
-        job.coro.close()
-        _queued_generation_ids.discard(job.generation_id)
-        _release(job.generation_id)
-        _generation_queue.task_done()
+    for worker in workers:
+        if not worker.done():
+            worker.cancel()
+    for task in [*tasks, *workers]:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+    for lane in _lanes.values():
+        while not lane.queue.empty():
+            job = lane.queue.get_nowait()
+            job.coro.close()
+            _queued_generation_ids.discard(job.generation_id)
+            _release(job.generation_id)
+            lane.queue.task_done()
     return drained
 
 
-def init_queue(force: bool = False, *, max_depth: int | None = None):
-    """Initialize the generation queue and start the worker.
+def init_queue(force: bool = False, *, max_depth: int | None = None, workers: int = 1):
+    """Create the lanes and start their workers.
 
-    Must be called once during application startup (inside a running event loop).
+    Must be called once during application startup (inside a running event
+    loop).  ``workers=1`` keeps everything serial in one lane; ``workers=2``
+    creates the ``gpu`` and ``cpu`` lanes.
     """
-    global _generation_queue, _generation_worker_task, _max_depth
+    global _lanes, _gate, _generation_worker_task, _max_depth
     global _queued_generation_ids, _running_generation_tasks, _cancelled_generation_ids
-    global _pending_by_owner, _job_owner
+    global _pending_by_owner, _job_owner, _job_engine, _engine_last_used
 
     # Reset fully so a forced re-init (tests, restarts) never inherits a cap.
     _max_depth = DEFAULT_MAX_DEPTH if max_depth is None else max(1, max_depth)
 
-    if _generation_worker_task is not None and not _generation_worker_task.done():
+    if worker_running():
         if not force:
             return
-        _generation_worker_task.cancel()
+        for lane in _lanes.values():
+            if lane.worker is not None:
+                lane.worker.cancel()
         for task in list(_running_generation_tasks.values()):
             task.cancel()
 
-    _generation_queue = asyncio.Queue()
+    names = [LANE_ALL] if workers <= 1 else [LANE_GPU, LANE_CPU]
+    _lanes = {name: _Lane(name=name, queue=asyncio.Queue()) for name in names}
+    _gate = _ExclusiveGate() if len(names) > 1 else None
     _queued_generation_ids = set()
     _running_generation_tasks = {}
     _cancelled_generation_ids = set()
     _pending_by_owner = {}
     _job_owner = {}
-    _generation_worker_task = create_background_task(_generation_worker())
+    _job_engine = {}
+    _engine_last_used = {}
+    for lane in _lanes.values():
+        lane.worker = create_background_task(_lane_worker(lane))
+    _generation_worker_task = _lanes[names[0]].worker

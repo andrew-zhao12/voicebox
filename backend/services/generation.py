@@ -40,6 +40,31 @@ from ..utils.tasks import get_task_manager
 logger = logging.getLogger(__name__)
 
 
+# Model loads patch tqdm globally (backends/base.model_load_progress) and the
+# backends take no lock of their own, so loads never overlap even with two lanes.
+_load_lock = asyncio.Lock()
+
+
+def lane_for_backend(backend) -> str:
+    """``cpu`` when the backend will run on the CPU, else ``gpu`` (Metal, CUDA, ROCm, XPU, DirectML)."""
+    device = getattr(backend, "device", None)
+    if device is None:
+        getter = getattr(backend, "_get_device", None)
+        if callable(getter):
+            try:
+                device = getter()
+            except Exception:
+                device = None
+    return task_queue.LANE_CPU if str(device) == "cpu" else task_queue.LANE_GPU
+
+
+def lane_for_engine(engine: str) -> str:
+    """The queue lane a TTS engine's jobs belong to (see ``task_queue``)."""
+    from ..backends import get_tts_backend_for_engine  # lazy: heavy import
+
+    return lane_for_backend(get_tts_backend_for_engine(engine))
+
+
 class GenerationRefused(Exception):
     """A request cannot be served; carries the HTTP status the route should answer with."""
 
@@ -130,7 +155,8 @@ async def prepare_engine(
         await on_loading()
 
     load_started = perf_counter()
-    await load_engine_model(engine, model_size)
+    async with _load_lock:
+        await load_engine_model(engine, model_size)
     if not was_loaded:
         metrics.MODEL_LOAD_SECONDS.labels(f"{engine}:{model_size or 'default'}").observe(perf_counter() - load_started)
 
@@ -559,6 +585,9 @@ async def open_stream(data: models.StreamGenerationRequest, db, principal: Princ
             ),
             owner=principal.key_id,
             max_pending=principal.limits.max_pending_jobs,
+            lane=lane_for_engine(engine),
+            engine=engine,
+            exclusive=data.seed is not None,
         )
     except QueueFullError as e:
         raise _refused_queue(e) from e

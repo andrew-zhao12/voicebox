@@ -120,7 +120,10 @@ def save_audio(
     from pathlib import Path
     import os
 
-    temp_path = f"{path}.tmp"
+    import uuid
+
+    # Unique per writer: two lanes may build the same profile's combined prompt at once.
+    temp_path = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
     try:
         # Ensure parent directory exists
         Path(path).parent.mkdir(parents=True, exist_ok=True)

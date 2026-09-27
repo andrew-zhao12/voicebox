@@ -18,7 +18,7 @@ from collections.abc import Callable, Mapping
 
 from .. import lifecycle
 from .inference_slots import llm_slot, whisper_slot
-from .task_queue import PRELOAD_JOB_PREFIX, QueueFullError, enqueue_generation
+from .task_queue import LANE_GPU, PRELOAD_JOB_PREFIX, QueueFullError, enqueue_generation
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,17 @@ def configured_models(
     if unknown:
         logger.warning("%s: ignoring unknown model name(s): %s", ENV_VAR, ", ".join(unknown))
     return known
+
+
+def lane_for_model(name: str) -> str:
+    """The lane a preload job runs in: the engine's device for TTS, the gpu lane otherwise."""
+    from ..backends import TTS_ENGINES, get_model_config  # lazy: heavy import
+    from .generation import lane_for_engine
+
+    cfg = get_model_config(name)
+    if cfg is not None and cfg.engine in TTS_ENGINES:
+        return lane_for_engine(cfg.engine)
+    return LANE_GPU
 
 
 async def _await_maybe(result) -> None:
@@ -100,6 +111,13 @@ async def _load_one(name: str, done: asyncio.Event) -> None:
         done.set()
 
 
+def _lane_for(name: str) -> str | None:
+    try:
+        return lane_for_model(name)
+    except Exception:
+        return None
+
+
 async def run(names: list[str]) -> None:
     """Background task started from the lifespan.
 
@@ -115,7 +133,7 @@ async def run(names: list[str]) -> None:
         for name in remaining:
             done = asyncio.Event()
             try:
-                enqueue_generation(f"{PRELOAD_JOB_PREFIX}{name}-{attempt}", _load_one(name, done))
+                enqueue_generation(f"{PRELOAD_JOB_PREFIX}{name}-{attempt}", _load_one(name, done), lane=_lane_for(name))
             except QueueFullError as e:
                 lifecycle.preload_failed(name, str(e))
                 done.set()

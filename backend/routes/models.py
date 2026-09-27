@@ -47,6 +47,19 @@ def _copy_with_progress(src: Path, dst: Path, progress_manager, copied_so_far: i
     return copied_so_far
 
 
+def _refuse_if_in_use(engine: str) -> None:
+    """Unloading under a running job would pull the model out from under it."""
+    from ..services import task_queue
+
+    pending = task_queue.engine_in_use(engine)
+    if pending:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{engine} has {pending} generation(s) queued or running; retry when they finish",
+            headers={"Retry-After": "5"},
+        )
+
+
 @router.post("/models/load")
 async def load_model(model_size: str = "1.7B"):
     """Manually load TTS model."""
@@ -65,6 +78,7 @@ async def unload_model():
     """Unload the default Qwen TTS model to free memory."""
     from ..services import tts
 
+    _refuse_if_in_use("qwen")
     try:
         tts.unload_tts_model()
         return {"message": "Model unloaded successfully"}
@@ -81,6 +95,7 @@ async def unload_model_by_name(model_name: str):
     if not config:
         raise HTTPException(status_code=400, detail=f"Unknown model: {model_name}")
 
+    _refuse_if_in_use(config.engine)
     try:
         was_loaded = unload_model_by_config(config)
         if not was_loaded:

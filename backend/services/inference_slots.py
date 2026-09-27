@@ -8,6 +8,7 @@ few more wait, and turns everyone else away with a 429.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from time import perf_counter
@@ -29,6 +30,8 @@ class InferenceSlot:
         self.wait_timeout_s = wait_timeout_s
         self._semaphore = asyncio.Semaphore(1)
         self._waiters = 0
+        # ``time.monotonic()`` of the last release; None until first used.
+        self.last_used: float | None = None
 
     @property
     def busy(self) -> bool:
@@ -53,6 +56,7 @@ class InferenceSlot:
         try:
             yield
         finally:
+            self.last_used = time.monotonic()
             self._semaphore.release()
 
 

@@ -15,6 +15,7 @@ from ..database import Generation as DBGeneration, VoiceProfile as DBVoiceProfil
 from ..services import history, profiles
 from ..services.generation import (
     GenerationRefused,
+    lane_for_engine,
     open_stream,
     resolve_effects_chain,
     resolve_engine,
@@ -155,6 +156,9 @@ async def generate_speech(
             ),
             owner=principal.key_id,
             max_pending=principal.limits.max_pending_jobs,
+            lane=lane_for_engine(engine),
+            engine=engine,
+            exclusive=data.seed is not None,
         )
     except QueueFullError as e:
         task_manager.complete_generation(generation_id)
@@ -211,6 +215,9 @@ async def retry_generation(generation_id: str, db: Session = Depends(get_db)):
             ),
             owner=principal.key_id,
             max_pending=principal.limits.max_pending_jobs,
+            lane=lane_for_engine(gen.engine or "qwen"),
+            engine=gen.engine or "qwen",
+            exclusive=gen.seed is not None,
         )
     except QueueFullError as e:
         task_manager.complete_generation(generation_id)
@@ -272,6 +279,8 @@ async def regenerate_generation(generation_id: str, db: Session = Depends(get_db
             ),
             owner=principal.key_id,
             max_pending=principal.limits.max_pending_jobs,
+            lane=lane_for_engine(gen.engine or "qwen"),
+            engine=gen.engine or "qwen",
         )
     except QueueFullError as e:
         task_manager.complete_generation(generation_id)
