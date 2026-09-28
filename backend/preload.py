@@ -1,10 +1,12 @@
 """Download models ahead of time: ``python -m backend.preload kokoro whisper-turbo``.
 
 Loads each model exactly the way the server would (downloading whatever is
-missing into the HuggingFace cache, see ``VOICEBOX_MODELS_DIR``), unloads
-it again and exits.  Meant for baking a Docker image or an init container so
-``VOICEBOX_PRELOAD_MODELS`` finds everything on disk at boot.  ``--list``
-prints the registry names; ``--from-env`` reads ``VOICEBOX_PRELOAD_MODELS``.
+missing into the HuggingFace cache, see ``VOICEBOX_MODELS_DIR``), fetches
+the files an engine would otherwise download lazily after loading (Kokoro's
+voice files), unloads it again and exits.  Meant for baking a Docker image
+or filling a shared model volume, so replicas started with
+``HF_HUB_OFFLINE=1`` find everything on disk.  ``--list`` prints the registry
+names; ``--from-env`` reads ``VOICEBOX_PRELOAD_MODELS``.
 """
 
 from __future__ import annotations
@@ -15,7 +17,31 @@ import logging
 import os
 import sys
 
+# Imported first on purpose: ``backend.config`` maps VOICEBOX_MODELS_DIR onto
+# HF_HUB_CACHE at import time, and huggingface_hub reads that variable once,
+# when it is first imported (by the engine modules below).
+from . import config  # noqa: F401 -- side effect: applies VOICEBOX_MODELS_DIR
+
 logger = logging.getLogger(__name__)
+
+# Files an engine downloads after load_model(), on first use, keyed by engine:
+# (HuggingFace repo, glob patterns).  A replica running with HF_HUB_OFFLINE=1
+# needs them in the cache as well.
+LAZY_ASSETS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "kokoro": ("hexgrad/Kokoro-82M", ("voices/*.pt",)),
+}
+
+
+def prefetch_lazy_assets(engine: str) -> int:
+    """Download the lazily fetched files of *engine* into the cache; returns how many patterns were fetched."""
+    assets = LAZY_ASSETS.get(engine)
+    if assets is None:
+        return 0
+    from huggingface_hub import snapshot_download  # lazy: heavy import
+
+    repo, patterns = assets
+    snapshot_download(repo_id=repo, allow_patterns=list(patterns))
+    return len(patterns)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -42,6 +68,8 @@ async def _load_all(names: list[str]) -> int:
             if asyncio.iscoroutine(result):
                 await result
             unload_model_by_config(cfg)
+            if prefetch_lazy_assets(cfg.engine):
+                print(f"fetched the on-demand files of {cfg.engine}", flush=True)
             print(f"ready: {name}", flush=True)
         except Exception as e:
             print(f"failed: {name}: {e}", file=sys.stderr)

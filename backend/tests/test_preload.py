@@ -86,3 +86,34 @@ async def test_run_stops_retrying_once_draining(monkeypatch):
     assert lifecycle.readiness(True)[1]["models"]["failed"] == ["kokoro"]
     init_queue(force=True)
     await asyncio.sleep(0)
+
+
+def test_the_cli_applies_the_models_dir_before_huggingface_hub_is_imported(tmp_path):
+    """``python -m backend.preload`` must write into VOICEBOX_MODELS_DIR, not the default cache."""
+    import subprocess
+    import sys
+
+    code = (
+        "import os, sys; import backend.preload; "
+        "print(os.environ.get('HF_HUB_CACHE')); print('huggingface_hub' in sys.modules)"
+    )
+    env = {**__import__("os").environ, "VOICEBOX_MODELS_DIR": str(tmp_path)}
+    env.pop("HF_HUB_CACHE", None)
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True)
+    hub_cache, hub_imported = out.stdout.split()
+    assert hub_cache == str(tmp_path)
+    assert hub_imported == "False"
+
+
+def test_lazy_assets_are_prefetched_only_for_engines_that_need_them(monkeypatch):
+    import types
+
+    from backend import preload as preload_cli
+
+    calls = []
+    fake_hub = types.SimpleNamespace(snapshot_download=lambda **kw: calls.append(kw))
+    monkeypatch.setitem(__import__("sys").modules, "huggingface_hub", fake_hub)
+    assert preload_cli.prefetch_lazy_assets("qwen") == 0
+    assert calls == []
+    assert preload_cli.prefetch_lazy_assets("kokoro") == 1
+    assert calls == [{"repo_id": "hexgrad/Kokoro-82M", "allow_patterns": ["voices/*.pt"]}]
