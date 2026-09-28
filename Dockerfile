@@ -116,9 +116,22 @@ COPY --chown=voicebox:voicebox backend/ /app/backend/
 # Copy built frontend from frontend stage
 COPY --from=frontend --chown=voicebox:voicebox /build/web/dist /app/frontend/
 
-# Create data directories owned by non-root user
-RUN mkdir -p /app/data/generations /app/data/profiles /app/data/cache \
-    && chown -R voicebox:voicebox /app/data
+# Create data directories owned by non-root user, plus /models for a baked
+# or mounted model cache (a named volume mounted there inherits the owner).
+RUN mkdir -p /app/data/generations /app/data/profiles /app/data/cache /models \
+    && chown -R voicebox:voicebox /app/data /models
+
+# Optional: bake models into the image, e.g. --build-arg VOICEBOX_BAKE_MODELS=kokoro,whisper-turbo
+# (names from `python -m backend.preload --list`).  The entrypoint then points
+# VOICEBOX_MODELS_DIR at /models unless the operator sets it.  Each model is
+# loaded once at build time, so keep the set small (Cloud Run recommends
+# images under 10 GB; larger sets belong on a mounted volume).
+ARG VOICEBOX_BAKE_MODELS=
+RUN if [ -n "$VOICEBOX_BAKE_MODELS" ]; then \
+      gosu voicebox env HOME=/home/voicebox VOICEBOX_MODELS_DIR=/models NUMBA_CACHE_DIR=/tmp/numba_cache \
+        python -m backend.preload $(echo "$VOICEBOX_BAKE_MODELS" | tr ',' ' ') \
+      && touch /models/.baked; \
+    fi
 
 # Expose the API port
 EXPOSE 17493

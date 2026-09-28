@@ -56,6 +56,17 @@ services:
       - VOICEBOX_DISABLE_DOCS
       # Comma-separated browser origins that may call the API directly.
       - VOICEBOX_CORS_ORIGINS
+      # Fleet inputs (docs: Deployment Checklist, "Running more than one replica"):
+      # a directory of voice bundles applied at boot, a mounted keys file, a
+      # model cache, the per-replica queue depth, a shared media-token secret,
+      # a GPU requirement for readiness and HF_HUB_OFFLINE=1 to forbid downloads.
+      - VOICEBOX_SEED_PROFILES
+      - VOICEBOX_API_KEYS_JSON
+      - VOICEBOX_MODELS_DIR
+      - VOICEBOX_MAX_QUEUE_DEPTH
+      - VOICEBOX_MEDIA_TOKEN_SECRET
+      - VOICEBOX_REQUIRE_GPU
+      - HF_HUB_OFFLINE
 
     security_opt:
       - no-new-privileges:true

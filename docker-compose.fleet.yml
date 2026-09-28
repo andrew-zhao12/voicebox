@@ -1,0 +1,108 @@
+# The smallest fleet: two interchangeable replicas behind Caddy.
+#
+# Replicas share nothing writable. Their inputs are a voice catalog (./seed,
+# bundles from `python -m backend.voices export ./seed`), one keys file
+# (./secrets/api_keys.json from `python -m backend.keys create --id myapp
+# --role client --data-dir ./secrets`) and a model cache the `models` service
+# fills once before the replicas start.  Each replica keeps its own SQLite
+# and generated audio in its own volume, so the stateless /v1 API scales by
+# adding replicas; history and the admin UI stay per replica.
+#
+#   export VOICEBOX_API_KEY="$(openssl rand -base64 32)"
+#   VOICEBOX_IMAGE=voicebox:local docker compose -f docker-compose.fleet.yml up
+#   scripts/fleet-check.sh http://127.0.0.1:17600 <client key> --rounds 6
+#
+# This file is standalone (not an overlay) and is the local stand-in for the
+# cloud recipes under deploy/.
+
+x-image: &image ${VOICEBOX_IMAGE:-voicebox:local}
+
+x-replica-env: &replica-env
+  VOICEBOX_MODELS_DIR: /models
+  HF_HUB_OFFLINE: "1"
+  VOICEBOX_PRELOAD_MODELS: ${VOICEBOX_PRELOAD_MODELS:-kokoro}
+  VOICEBOX_SEED_PROFILES: /seed
+  VOICEBOX_API_KEYS_JSON: /run/secrets/api_keys.json
+  VOICEBOX_API_KEY: ${VOICEBOX_API_KEY:?export VOICEBOX_API_KEY (the admin key) first}
+  VOICEBOX_MEDIA_TOKEN_SECRET: ${VOICEBOX_MEDIA_TOKEN_SECRET:-}
+  VOICEBOX_MAX_QUEUE_DEPTH: ${VOICEBOX_MAX_QUEUE_DEPTH:-4}
+  VOICEBOX_GENERATION_WORKERS: ${VOICEBOX_GENERATION_WORKERS:-1}
+  VOICEBOX_RETENTION_DAYS: "1"
+  VOICEBOX_LOG_FORMAT: json
+  VOICEBOX_DISABLE_DOCS: "1"
+  VOICEBOX_METRICS_PORT: "9464"
+  # Caddy is the only peer on this network, so trust its X-Forwarded-For.
+  FORWARDED_ALLOW_IPS: "*"
+  NUMBA_CACHE_DIR: /tmp/numba_cache
+
+services:
+  # Fills the shared model cache once (an init container in Kubernetes terms).
+  models:
+    image: *image
+    command: ["python", "-m", "backend.preload", "--from-env"]
+    environment:
+      VOICEBOX_MODELS_DIR: /models
+      VOICEBOX_PRELOAD_MODELS: ${VOICEBOX_PRELOAD_MODELS:-kokoro}
+      NUMBA_CACHE_DIR: /tmp/numba_cache
+    volumes:
+      - models:/models
+    networks:
+      - fleet
+
+  voicebox-a:
+    image: *image
+    restart: unless-stopped
+    stop_grace_period: 90s
+    depends_on:
+      models:
+        condition: service_completed_successfully
+    environment: *replica-env
+    volumes:
+      - models:/models
+      - data-a:/app/data
+      - ./seed:/seed:ro
+      - ./secrets/api_keys.json:/run/secrets/api_keys.json:ro
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - fleet
+
+  voicebox-b:
+    image: *image
+    restart: unless-stopped
+    stop_grace_period: 90s
+    depends_on:
+      models:
+        condition: service_completed_successfully
+    environment: *replica-env
+    volumes:
+      - models:/models
+      - data-b:/app/data
+      - ./seed:/seed:ro
+      - ./secrets/api_keys.json:/run/secrets/api_keys.json:ro
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - fleet
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:17600:80"
+    volumes:
+      - ./deploy/Caddyfile.fleet:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - voicebox-a
+      - voicebox-b
+    networks:
+      - fleet
+
+volumes:
+  models:
+  data-a:
+  data-b:
+
+networks:
+  fleet:
+    driver: bridge

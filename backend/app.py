@@ -338,6 +338,7 @@ async def _run_startup(application: FastAPI) -> None:
     backend_type = get_backend_type()
     logger.info("Backend: %s", backend_type.upper())
     logger.info("GPU: %s", _get_gpu_status())
+    _check_required_gpu()
 
     from .backends.base import check_cuda_compatibility
 
@@ -391,6 +392,19 @@ async def _run_startup(application: FastAPI) -> None:
         create_background_task(retention.run_loop(retention_days))
 
     logger.info("Ready")
+
+
+def _check_required_gpu() -> None:
+    """``VOICEBOX_REQUIRE_GPU=1`` keeps ``/health/ready`` at 503 on a replica without a CUDA/ROCm device."""
+    if os.environ.get("VOICEBOX_REQUIRE_GPU", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+    import torch  # lazy: heavy import
+
+    if torch.cuda.is_available():
+        lifecycle.step_done("gpu")
+        return
+    logger.error("VOICEBOX_REQUIRE_GPU is set but no CUDA or ROCm device is visible; readiness stays 503")
+    lifecycle.step_failed("gpu", "no CUDA or ROCm device is visible")
 
 
 async def _run_shutdown() -> None:

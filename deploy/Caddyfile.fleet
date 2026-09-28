@@ -1,0 +1,18 @@
+# Plain-HTTP load balancer for docker-compose.fleet.yml (local verification).
+# Cloud deployments use the platform's load balancer instead; see deploy/.
+:80 {
+	encode zstd gzip
+
+	reverse_proxy voicebox-a:17493 voicebox-b:17493 {
+		# Route to the replica with the fewest open requests (streams are long),
+		# skip replicas whose readiness probe fails, and retry a refused
+		# connection on the other replica before the client sees an error.
+		lb_policy least_conn
+		lb_try_duration 5s
+		health_uri /health/ready
+		health_interval 5s
+		health_timeout 3s
+		# Unbuffered SSE and audio streams.
+		flush_interval -1
+	}
+}

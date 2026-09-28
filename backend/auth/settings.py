@@ -7,6 +7,7 @@ before ``config.set_data_dir`` runs from the CLI entry points; resolving
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from collections.abc import Callable, Mapping
@@ -32,6 +33,20 @@ def _env_flag(env: Mapping[str, str], name: str, default: bool) -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _media_token_secret(raw: str) -> bytes | None:
+    """A 32-byte HMAC key derived from ``VOICEBOX_MEDIA_TOKEN_SECRET``, or ``None`` for a per-process secret.
+
+    Any string of at least 32 characters works (``openssl rand -base64 32``);
+    every replica given the same value verifies the others' media tokens.
+    """
+    if not raw:
+        return None
+    if len(raw) < 32:
+        logger.warning("VOICEBOX_MEDIA_TOKEN_SECRET is shorter than 32 characters; ignoring it")
+        return None
+    return hashlib.sha256(raw.encode("utf-8")).digest()
+
+
 def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
     raw = env.get(name, "").strip()
     if not raw:
@@ -54,6 +69,7 @@ class SecuritySettings:
     rate_limiting: bool
     max_queue_depth: int
     media_token_ttl_s: int
+    media_token_secret: bytes | None
     body_limit_default: int
     body_limit_multipart: int
     cors_extra_origins: tuple[str, ...]
@@ -91,6 +107,7 @@ class SecuritySettings:
             rate_limiting=_env_flag(env, "VOICEBOX_RATE_LIMITING", True),
             max_queue_depth=max(1, _env_int(env, "VOICEBOX_MAX_QUEUE_DEPTH", DEFAULT_MAX_QUEUE_DEPTH)),
             media_token_ttl_s=max(60, _env_int(env, "VOICEBOX_MEDIA_TOKEN_TTL", DEFAULT_MEDIA_TOKEN_TTL_S)),
+            media_token_secret=_media_token_secret(env.get("VOICEBOX_MEDIA_TOKEN_SECRET", "").strip()),
             body_limit_default=DEFAULT_BODY_LIMIT,
             body_limit_multipart=max(DEFAULT_BODY_LIMIT, multipart_mb * MIB),
             cors_extra_origins=origins,

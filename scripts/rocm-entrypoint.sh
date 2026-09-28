@@ -12,4 +12,9 @@ for dev in /dev/kfd /dev/dri/render*; do
     }
     usermod -aG "$grp" voicebox
 done
+# Models baked into the image (VOICEBOX_BAKE_MODELS) live in /models; use them
+# unless the operator points VOICEBOX_MODELS_DIR somewhere else.
+if [ -f /models/.baked ] && [ -z "${VOICEBOX_MODELS_DIR:-}" ]; then
+    export VOICEBOX_MODELS_DIR=/models
+fi
 exec gosu voicebox "$@"

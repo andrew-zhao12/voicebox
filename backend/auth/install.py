@@ -82,7 +82,7 @@ def build_runtime(settings: SecuritySettings) -> SecurityRuntime:
     return SecurityRuntime(
         settings=settings,
         keystore=KeyStore(env_key=settings.api_key_env, key_file=settings.key_file, keys_json=settings.keys_json),
-        tokens=MediaTokenSigner(ttl_s=settings.media_token_ttl_s),
+        tokens=MediaTokenSigner(settings.media_token_secret, ttl_s=settings.media_token_ttl_s),
         limiter=RateLimiter(enabled=settings.rate_limiting),
     )
 
