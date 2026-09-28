@@ -58,6 +58,77 @@ def test_signal_hook_wraps_the_existing_handler_and_restores_it():
         signal.signal(signal.SIGUSR1, original)
 
 
+def test_shutdown_delay_env(caplog):
+    assert lifecycle.shutdown_delay_s({}) == 0.0
+    assert lifecycle.shutdown_delay_s({"VOICEBOX_SHUTDOWN_DELAY_S": "10"}) == 10.0
+    assert lifecycle.shutdown_delay_s({"VOICEBOX_SHUTDOWN_DELAY_S": "-1"}) == 0.0
+    assert lifecycle.shutdown_delay_s({"VOICEBOX_SHUTDOWN_DELAY_S": "9999"}) == lifecycle.MAX_SHUTDOWN_DELAY_S
+    assert lifecycle.shutdown_delay_s({"VOICEBOX_SHUTDOWN_DELAY_S": "later"}) == 0.0
+    assert "not a number" in caplog.text
+
+
+async def test_shutdown_delay_keeps_serving_then_forwards_the_signal_once():
+    calls: list[int] = []
+
+    def previous(signum, frame):
+        calls.append(signum)
+
+    original = signal.signal(signal.SIGUSR1, previous)
+    try:
+        assert lifecycle.install_signal_hooks((signal.SIGUSR1,), delay_s=0.2) == ["SIGUSR1"]
+        os.kill(os.getpid(), signal.SIGUSR1)
+        await asyncio.sleep(0.05)
+        # Stopping: readiness fails, but the server still accepts work and uvicorn was not told yet.
+        ready, body = lifecycle.readiness(True)
+        assert not ready
+        assert body["stopping"] is True
+        assert body["draining"] is False
+        assert lifecycle.is_stopping()
+        assert not lifecycle.is_draining()
+        assert calls == []
+
+        await asyncio.sleep(0.3)
+        assert calls == [signal.SIGUSR1]
+        assert lifecycle.is_draining()
+        assert lifecycle.drain_reason() == "signal SIGUSR1"
+    finally:
+        lifecycle.restore_signal_hooks()
+        signal.signal(signal.SIGUSR1, original)
+
+
+async def test_a_second_signal_skips_the_delay_and_uvicorn_is_called_once():
+    calls: list[int] = []
+
+    def previous(signum, frame):
+        calls.append(signum)
+
+    original = signal.signal(signal.SIGUSR1, previous)
+    try:
+        lifecycle.install_signal_hooks((signal.SIGUSR1,), delay_s=0.3)
+        os.kill(os.getpid(), signal.SIGUSR1)
+        await asyncio.sleep(0.05)
+        assert calls == []
+        os.kill(os.getpid(), signal.SIGUSR1)  # impatient operator
+        await asyncio.sleep(0.05)
+        assert calls == [signal.SIGUSR1]
+        assert lifecycle.is_draining()
+        await asyncio.sleep(0.4)  # the delayed forward must not call uvicorn again (that would force-exit)
+        assert calls == [signal.SIGUSR1]
+    finally:
+        lifecycle.restore_signal_hooks()
+        signal.signal(signal.SIGUSR1, original)
+
+
+async def test_queue_still_accepts_jobs_while_stopping():
+    init_queue(force=True, max_depth=4)
+    assert lifecycle.begin_stopping("test", 5)
+    assert lifecycle.begin_stopping("again", 5) is False
+    ensure_capacity("app", None)  # no QueueFullError: the delay phase still serves
+    lifecycle.begin_drain("test")
+    with pytest.raises(QueueFullError):
+        ensure_capacity("app", None)
+
+
 def test_signals_without_a_python_handler_are_left_alone():
     original = signal.signal(signal.SIGUSR2, signal.SIG_IGN)
     try:
@@ -144,6 +215,7 @@ def test_readiness_route_is_public_and_reflects_draining(tmp_path):
         assert response.json() == {
             "ready": False,
             "draining": True,
+            "stopping": True,
             "worker": True,
             "models": {"ready": [], "pending": {}, "failed": []},
             "startup": {"done": [], "pending": {}, "failed": []},

@@ -306,6 +306,9 @@ async def _run_startup(application: FastAPI) -> None:
     hooked = lifecycle.install_signal_hooks()
     if hooked:
         logger.debug("Drain hooks installed for %s", ", ".join(hooked))
+        delay = lifecycle.shutdown_delay_s()
+        if delay:
+            logger.info("Shutdown delay: %.0f s of 503 readiness before the listener closes", delay)
 
     # Mark stale "generating" records as failed -- leftovers from a killed process
     from sqlalchemy import text as sa_text
