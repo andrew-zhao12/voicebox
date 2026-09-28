@@ -1,0 +1,22 @@
+# Non-secret settings shared by the preload Job and the Deployment.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: voicebox-config
+  namespace: voicebox
+data:
+  VOICEBOX_PRELOAD_MODELS: "kokoro,whisper-turbo"
+  VOICEBOX_MODELS_DIR: "/models"
+  HF_HUB_OFFLINE: "1"
+  VOICEBOX_SEED_PROFILES: "/seed"
+  VOICEBOX_API_KEYS_JSON: "/secrets/api_keys.json"
+  VOICEBOX_MAX_QUEUE_DEPTH: "4"
+  VOICEBOX_GENERATION_WORKERS: "1"
+  VOICEBOX_RETENTION_DAYS: "1"
+  VOICEBOX_SHUTDOWN_DELAY_S: "10"
+  VOICEBOX_LOG_FORMAT: "json"
+  VOICEBOX_DISABLE_DOCS: "1"
+  VOICEBOX_METRICS_PORT: "9464"
+  VOICEBOX_REQUIRE_GPU: "1"
+  FORWARDED_ALLOW_IPS: "*"
+  NUMBA_CACHE_DIR: "/tmp/numba_cache"

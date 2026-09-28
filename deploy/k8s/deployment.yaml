@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voicebox
+  namespace: voicebox
+  labels:
+    app: voicebox
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: voicebox
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: voicebox
+    spec:
+      # 10 s shutdown delay + 40 s for open streams + 30 s queue drain + margin.
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        fsGroup: 999
+      # GPU node selection, one line per cloud (delete the others):
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-l4          # GKE
+        # karpenter.k8s.aws/instance-gpu-manufacturer: nvidia  # EKS + Karpenter
+        # agentpool: gpu                                       # AKS GPU node pool
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: voicebox
+          image: ghcr.io/OWNER/voicebox:VERSION-cu128
+          ports:
+            - name: http
+              containerPort: 17493
+            - name: metrics
+              containerPort: 9464
+          envFrom:
+            - configMapRef:
+                name: voicebox-config
+          env:
+            - name: VOICEBOX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: voicebox-keys
+                  key: VOICEBOX_API_KEY
+            - name: VOICEBOX_MEDIA_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: voicebox-keys
+                  key: VOICEBOX_MEDIA_TOKEN_SECRET
+                  optional: true
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "8"
+              memory: "32Gi"
+              nvidia.com/gpu: 1
+          startupProbe:
+            httpGet: { path: /health/ready, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /health/ready, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 30
+            timeoutSeconds: 5
+          # No preStop sleep needed: VOICEBOX_SHUTDOWN_DELAY_S keeps the pod
+          # serving for 10 s after SIGTERM while endpoints and ingresses drop it.
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: seed
+              mountPath: /seed
+              readOnly: true
+            - name: keys
+              mountPath: /secrets
+              readOnly: true
+            - name: data
+              mountPath: /app/data
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: voicebox-models
+        - name: seed
+          # Small catalogs (presets, a few cloned voices under 1 MiB in total):
+          configMap:
+            name: voicebox-seed
+            optional: true
+          # Larger catalogs: a second RWX PVC or bucket mount filled from ./seed.
+        - name: keys
+          secret:
+            secretName: voicebox-keys
+            items:
+              - key: api_keys.json
+                path: api_keys.json
+        - name: data
+          emptyDir:
+            sizeLimit: 20Gi

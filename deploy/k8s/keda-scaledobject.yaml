@@ -1,0 +1,26 @@
+# KEDA (https://keda.sh) scales the Deployment on the queue depth the
+# replicas export: desired replicas = ceil(sum(pending jobs) / threshold).
+# Requires a Prometheus that scrapes the `metrics` port (servicemonitor.yaml).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: voicebox
+  namespace: voicebox
+spec:
+  scaleTargetRef:
+    name: voicebox
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  pollingInterval: 15
+  cooldownPeriod: 300
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring.svc:9090
+        query: sum(voicebox_queue_pending_jobs{namespace="voicebox"})
+        threshold: "2"

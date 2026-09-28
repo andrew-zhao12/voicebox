@@ -1,0 +1,108 @@
+# Cloud Run service with one NVIDIA L4 per instance.
+#   gcloud run services replace deploy/cloudrun/service.yaml --region us-central1
+# Placeholders: PROJECT, IMAGE, the two buckets and the secrets (see README.md).
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: voicebox
+  annotations:
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "3"
+        # CPU stays allocated between requests: the queue worker, the
+        # retention sweep and the idle-unload loop run in the background.
+        run.googleapis.com/cpu-throttling: "false"
+        run.googleapis.com/startup-cpu-boost: "true"
+        run.googleapis.com/execution-environment: gen2
+        run.googleapis.com/gpu-zonal-redundancy-disabled: "true"
+    spec:
+      # One job runs while one waits per lane; the queue depth (4) leaves
+      # headroom, so Cloud Run's own limit is what actually spreads load.
+      containerConcurrency: 2
+      timeoutSeconds: 900
+      serviceAccountName: voicebox-sa@PROJECT.iam.gserviceaccount.com
+      nodeSelector:
+        run.googleapis.com/accelerator: nvidia-l4
+      containers:
+        - image: ghcr.io/OWNER/voicebox:VERSION-cu128
+          ports:
+            - name: http1
+              containerPort: 17493
+          env:
+            - name: VOICEBOX_PRELOAD_MODELS
+              value: "kokoro,whisper-turbo"
+            - name: VOICEBOX_MODELS_DIR
+              value: /models
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: VOICEBOX_SEED_PROFILES
+              value: /seed
+            - name: VOICEBOX_API_KEYS_JSON
+              value: /secrets/api_keys.json
+            - name: VOICEBOX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: voicebox-admin-key
+                  key: latest
+            - name: VOICEBOX_MAX_QUEUE_DEPTH
+              value: "4"
+            - name: VOICEBOX_RETENTION_DAYS
+              value: "1"
+            - name: VOICEBOX_SHUTDOWN_DELAY_S
+              value: "5"
+            - name: VOICEBOX_LOG_FORMAT
+              value: json
+            - name: VOICEBOX_DISABLE_DOCS
+              value: "1"
+            - name: VOICEBOX_REQUIRE_GPU
+              value: "1"
+            - name: FORWARDED_ALLOW_IPS
+              value: "*"
+            - name: NUMBA_CACHE_DIR
+              value: /tmp/numba_cache
+          resources:
+            limits:
+              cpu: "8"
+              memory: 32Gi
+              nvidia.com/gpu: "1"
+          startupProbe:
+            httpGet:
+              path: /health/ready
+              port: 17493
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 17493
+            periodSeconds: 30
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: seed
+              mountPath: /seed
+            - name: keys
+              mountPath: /secrets
+      volumes:
+        - name: models
+          csi:
+            driver: gcsfuse.run.googleapis.com
+            volumeAttributes:
+              bucketName: PROJECT-voicebox-models
+        - name: seed
+          csi:
+            driver: gcsfuse.run.googleapis.com
+            readOnly: true
+            volumeAttributes:
+              bucketName: PROJECT-voicebox-seed
+        - name: keys
+          secret:
+            secretName: voicebox-keys-json
+            items:
+              - key: latest
+                path: api_keys.json

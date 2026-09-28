@@ -1,0 +1,78 @@
+{
+  "family": "voicebox",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["EC2"],
+  "cpu": "4096",
+  "memory": "28672",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT:role/voicebox-task",
+  "containerDefinitions": [
+    {
+      "name": "voicebox",
+      "image": "ghcr.io/OWNER/voicebox:VERSION-cu128",
+      "essential": true,
+      "portMappings": [
+        { "name": "http", "containerPort": 17493, "protocol": "tcp" },
+        { "name": "metrics", "containerPort": 9464, "protocol": "tcp" }
+      ],
+      "resourceRequirements": [{ "type": "GPU", "value": "1" }],
+      "environment": [
+        { "name": "NVIDIA_DRIVER_CAPABILITIES", "value": "compute,utility" },
+        { "name": "VOICEBOX_PRELOAD_MODELS", "value": "kokoro,whisper-turbo" },
+        { "name": "VOICEBOX_MODELS_DIR", "value": "/models" },
+        { "name": "HF_HUB_OFFLINE", "value": "1" },
+        { "name": "VOICEBOX_SEED_PROFILES", "value": "/seed" },
+        { "name": "VOICEBOX_API_KEYS_JSON", "value": "/secrets/api_keys.json" },
+        { "name": "VOICEBOX_MAX_QUEUE_DEPTH", "value": "4" },
+        { "name": "VOICEBOX_RETENTION_DAYS", "value": "1" },
+        { "name": "VOICEBOX_SHUTDOWN_DELAY_S", "value": "15" },
+        { "name": "VOICEBOX_LOG_FORMAT", "value": "json" },
+        { "name": "VOICEBOX_DISABLE_DOCS", "value": "1" },
+        { "name": "VOICEBOX_METRICS_PORT", "value": "9464" },
+        { "name": "VOICEBOX_REQUIRE_GPU", "value": "1" },
+        { "name": "FORWARDED_ALLOW_IPS", "value": "*" },
+        { "name": "NUMBA_CACHE_DIR", "value": "/tmp/numba_cache" }
+      ],
+      "secrets": [
+        { "name": "VOICEBOX_API_KEY", "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:voicebox/admin-key" },
+        { "name": "VOICEBOX_MEDIA_TOKEN_SECRET", "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:voicebox/media-token-secret" }
+      ],
+      "mountPoints": [
+        { "sourceVolume": "models", "containerPath": "/models" },
+        { "sourceVolume": "seed", "containerPath": "/seed", "readOnly": true },
+        { "sourceVolume": "secrets", "containerPath": "/secrets", "readOnly": true }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -fs http://localhost:17493/health || exit 1"],
+        "interval": 30,
+        "timeout": 10,
+        "retries": 3,
+        "startPeriod": 300
+      },
+      "stopTimeout": 90,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/voicebox",
+          "awslogs-region": "REGION",
+          "awslogs-stream-prefix": "voicebox",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ],
+  "volumes": [
+    {
+      "name": "models",
+      "efsVolumeConfiguration": { "fileSystemId": "fs-EFS", "rootDirectory": "/models", "transitEncryption": "ENABLED" }
+    },
+    {
+      "name": "seed",
+      "efsVolumeConfiguration": { "fileSystemId": "fs-EFS", "rootDirectory": "/seed", "transitEncryption": "ENABLED" }
+    },
+    {
+      "name": "secrets",
+      "efsVolumeConfiguration": { "fileSystemId": "fs-EFS", "rootDirectory": "/secrets", "transitEncryption": "ENABLED" }
+    }
+  ]
+}

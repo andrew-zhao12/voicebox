@@ -10,8 +10,12 @@
 		lb_policy least_conn
 		lb_try_duration 5s
 		health_uri /health/ready
-		health_interval 5s
-		health_timeout 3s
+		health_interval 2s
+		health_timeout 2s
+		# A 503 means the replica is draining (a full queue answers 429), so stop
+		# routing to it at once instead of waiting for the next health check.
+		unhealthy_status 503
+		fail_duration 30s
 		# Unbuffered SSE and audio streams.
 		flush_interval -1
 	}

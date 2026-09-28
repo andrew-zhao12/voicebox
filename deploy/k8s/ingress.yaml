@@ -1,0 +1,30 @@
+# ingress-nginx example: long streams and no buffering. For a cloud-managed
+# ingress raise the backend timeout the same way (GKE BackendConfig
+# timeoutSec, AWS ALB idle timeout annotation, AGIC request-timeout).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: voicebox
+  namespace: voicebox
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "900"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "900"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-body-size: "210m"
+    cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [voice.example.com]
+      secretName: voicebox-tls
+  rules:
+    - host: voice.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: voicebox
+                port:
+                  name: http

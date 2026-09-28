@@ -1,0 +1,114 @@
+# Azure Container Apps with a serverless T4 GPU.
+#   az containerapp create --resource-group voicebox-rg --yaml deploy/azure/containerapp.yaml
+# Placeholders: SUBSCRIPTION, the image, secrets (see README.md).
+location: westus3
+name: voicebox
+resourceGroup: voicebox-rg
+type: Microsoft.App/containerApps
+properties:
+  environmentId: /subscriptions/SUBSCRIPTION/resourceGroups/voicebox-rg/providers/Microsoft.App/managedEnvironments/voicebox-env
+  # The name given to the Consumption-GPU-NC8as-T4 (or NC24-A100) profile
+  # when it was added to the environment.
+  workloadProfileName: gpu-t4
+  configuration:
+    activeRevisionsMode: Single
+    ingress:
+      external: true
+      targetPort: 17493
+      transport: auto
+      allowInsecure: false
+    secrets:
+      - name: admin-key
+        value: REPLACE-WITH-openssl-rand-base64-32
+      - name: media-token-secret
+        value: REPLACE-WITH-openssl-rand-base64-32
+      # The whole api_keys.json (hashes only) as a secret; mounted as a file below.
+      - name: api-keys-json
+        value: REPLACE-WITH-FILE-CONTENT
+  template:
+    terminationGracePeriodSeconds: 90
+    containers:
+      - name: voicebox
+        image: ghcr.io/OWNER/voicebox:VERSION-cu128
+        resources:
+          cpu: 8
+          memory: 56Gi
+        env:
+          - name: VOICEBOX_PRELOAD_MODELS
+            value: "kokoro,whisper-turbo"
+          - name: VOICEBOX_MODELS_DIR
+            value: /models
+          - name: HF_HUB_OFFLINE
+            value: "1"
+          - name: VOICEBOX_SEED_PROFILES
+            value: /seed
+          - name: VOICEBOX_API_KEYS_JSON
+            value: /secrets/api-keys-json
+          - name: VOICEBOX_API_KEY
+            secretRef: admin-key
+          - name: VOICEBOX_MEDIA_TOKEN_SECRET
+            secretRef: media-token-secret
+          - name: VOICEBOX_MAX_QUEUE_DEPTH
+            value: "4"
+          - name: VOICEBOX_RETENTION_DAYS
+            value: "1"
+          - name: VOICEBOX_SHUTDOWN_DELAY_S
+            value: "10"
+          - name: VOICEBOX_LOG_FORMAT
+            value: json
+          - name: VOICEBOX_DISABLE_DOCS
+            value: "1"
+          - name: VOICEBOX_METRICS_PORT
+            value: "9464"
+          - name: VOICEBOX_REQUIRE_GPU
+            value: "1"
+          - name: FORWARDED_ALLOW_IPS
+            value: "*"
+          - name: NUMBA_CACHE_DIR
+            value: /tmp/numba_cache
+        probes:
+          - type: Startup
+            httpGet:
+              path: /health/ready
+              port: 17493
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          - type: Readiness
+            httpGet:
+              path: /health/ready
+              port: 17493
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          - type: Liveness
+            httpGet:
+              path: /health
+              port: 17493
+            periodSeconds: 30
+            timeoutSeconds: 5
+        volumeMounts:
+          - volumeName: models
+            mountPath: /models
+          - volumeName: seed
+            mountPath: /seed
+          - volumeName: secrets
+            mountPath: /secrets
+    scale:
+      minReplicas: 1
+      maxReplicas: 3
+      cooldownPeriod: 300
+      rules:
+        - name: http-concurrency
+          http:
+            metadata:
+              concurrentRequests: "2"
+    volumes:
+      - name: models
+        storageType: AzureFile
+        storageName: voicebox-models
+      - name: seed
+        storageType: AzureFile
+        storageName: voicebox-seed
+      - name: secrets
+        storageType: Secret

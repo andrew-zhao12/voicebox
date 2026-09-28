@@ -74,8 +74,10 @@ for round in $(seq 1 "$ROUNDS"); do
         first_fp="$fp"
         echo "  catalog: $fp (voices, fingerprint)"
         if [ -z "$VOICE" ]; then
-            VOICE=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["data"]; p=[v for v in d if v["kind"]=="profile"]; print((p or d)[0]["name"] if p else "af_heart")' "$WORK/voices.json")
-            echo "  using voice: $VOICE"
+            # A built-in Kokoro voice works with --model tts-1 or kokoro and needs only
+            # the smallest model; otherwise fall back to the first profile.
+            VOICE=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["data"]; ids=[v["id"] for v in d if v["kind"]=="preset"]; p=[v["name"] for v in d if v["kind"]=="profile"]; print("af_heart" if "af_heart" in ids else (p[0] if p else d[0]["id"]))' "$WORK/voices.json")
+            echo "  using voice: $VOICE (pass --voice to choose)"
         fi
     elif [ "$fp" != "$first_fp" ]; then
         fail "catalog differs between replicas: $first_fp vs $fp"

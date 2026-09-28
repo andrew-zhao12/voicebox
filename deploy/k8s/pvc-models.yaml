@@ -1,0 +1,14 @@
+# Shared, read-mostly model cache. Needs a ReadWriteMany storage class:
+# EFS CSI (EKS), Filestore CSI (GKE), Azure Files CSI (AKS), or a bucket
+# CSI driver (gcsfuse, mountpoint-s3, blobfuse2) instead of a PVC.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: voicebox-models
+  namespace: voicebox
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: CHANGE-ME-rwx
+  resources:
+    requests:
+      storage: 50Gi

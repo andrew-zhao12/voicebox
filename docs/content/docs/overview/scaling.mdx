@@ -1,0 +1,64 @@
+---
+title: Scaling
+description: "Run several interchangeable replicas on Kubernetes, Cloud Run, Azure Container Apps or ECS, and let the platform scale them"
+---
+
+One container on one host (the [Deployment Checklist](/overview/deployment)) serves a lot of speech: sentence-length requests stream their first audio after about a second, and a GPU synthesizes many times faster than real time. When that box saturates, the next step is more identical containers behind the platform's load balancer, not a bigger architecture. This page explains what makes a replica interchangeable and gives the settings for each platform; the reviewed manifests live in the repository under `deploy/`.
+
+## What scales, and what does not
+
+`POST /v1/audio/speech`, `POST /v1/audio/transcriptions`, `POST /generate/stream`, `POST /speak` and the MCP `speak` and `transcribe` tools write nothing a later request needs: the audio streams back in the response and no history row is created. A replica that has the same **voices**, the same **keys** and the same **models** as the others answers those calls identically, so any number of them can sit behind one address.
+
+`POST /generate` with `GET /generate/{id}/status` and `GET /audio/{id}`, the history, stories and the admin UI read state in one replica's SQLite. Keep those on a single replica (a separate one-replica service with the same image, or session affinity) or on the desktop app. Sharing that state across replicas (Postgres, object storage, a shared queue) is a later phase that only pays off once the stateless API is what your traffic is made of.
+
+## The three inputs of a replica
+
+1. **Voices as configuration.** Export the catalog you designed in the UI with `python -m backend.voices export ./seed` (one `.voicebox.zip` per profile, the same file the Export button produces; preset and designed profiles export too). Mount that directory into every replica and set `VOICEBOX_SEED_PROFILES=/seed`: the bundles are imported at boot, names that already exist are skipped, and `GET /health/ready` stays `503` until the catalog is applied or if a bundle is broken. Preset voices (`af_heart`, `Ryan`, ...) need no seed at all: `/v1/audio/speech` accepts their ids directly.
+2. **Keys from a secret store.** `python -m backend.keys create --id myapp --role client --data-dir ./secrets` writes `./secrets/api_keys.json` (SHA-256 digests only) and prints the client key once. Mount the file and point `VOICEBOX_API_KEYS_JSON` at it; put the admin key in `VOICEBOX_API_KEY`. Replicas that also serve the browser UI need the same `VOICEBOX_MEDIA_TOKEN_SECRET`, otherwise a media token issued by one replica is rejected by the next.
+3. **Models on disk before traffic.** Either bake them into the image (`docker build --build-arg VOICEBOX_BAKE_MODELS=kokoro,whisper-turbo .`, fine for a few gigabytes) or fill a shared volume or bucket once with `VOICEBOX_MODELS_DIR=/models python -m backend.preload kokoro whisper-turbo` and mount it read-mostly. Set `HF_HUB_OFFLINE=1` so a replica never downloads, `VOICEBOX_PRELOAD_MODELS` so readiness waits for the load, and `VOICEBOX_REQUIRE_GPU=1` on GPU platforms so a replica scheduled without a GPU never becomes ready.
+
+Everything else a replica writes (its SQLite, prompt cache, generated files) is disposable; `VOICEBOX_RETENTION_DAYS=1` keeps it small and no backup is needed.
+
+## Settings that are the same everywhere
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| Liveness probe | `GET /health` every 30 s | the process answers |
+| Readiness and startup probe | `GET /health/ready` every 5 s, allow 5 minutes at start | models resident, seed applied, not draining |
+| `VOICEBOX_SHUTDOWN_DELAY_S` | 10 (15 on ECS, 5 on Cloud Run) | after `SIGTERM` the replica fails readiness but keeps serving, so the balancer stops routing before the listener closes; scale-in drops no requests |
+| Termination grace | 90 s | the delay, 40 s for open streams, 30 s queue drain, margin |
+| Scaling target | 2 concurrent requests per replica (4 with `VOICEBOX_GENERATION_WORKERS=2`) | one job runs while one waits per lane |
+| `VOICEBOX_MAX_QUEUE_DEPTH` | target + 2 | a replica answers `503` + `Retry-After` only when the balancer overshoots; the OpenAI SDKs retry `503` twice on their own |
+| Load-balancer request timeout | 600 s or more where configurable | a long text streams for minutes |
+| Minimum replicas | 1 | a cold start is an image pull plus a model load |
+| Maximum replicas | your GPU quota | |
+| Logs and metrics | `VOICEBOX_LOG_FORMAT=json`, `VOICEBOX_METRICS_PORT=9464` scraped by a sidecar or agent | `request_id` per line, `voicebox_queue_pending_jobs` as the scaling signal |
+
+## Platforms
+
+| Platform | GPU | Scale to zero | Scales on | Watch out for |
+|----------|-----|---------------|-----------|---------------|
+| **Kubernetes** (GKE, AKS, EKS) — `deploy/k8s/` | GPU node pool with the cluster's autoscaler | node pools can | KEDA on `sum(voicebox_queue_pending_jobs)` with threshold 2 | RWX storage for the model cache (EFS, Filestore, Azure Files or a bucket CSI driver) |
+| **Google Cloud Run** — `deploy/cloudrun/` | NVIDIA L4 24 GB; 8 vCPU / 32 GiB recommended | yes; the GPU instance starts in about 5 s plus the model load | `containerConcurrency: 2`, min 1, max 3 | 3 L4 per region by default; keep models in a Cloud Storage volume, images under 10 GB |
+| **Azure Container Apps** — `deploy/azure/` | serverless `Consumption-GPU-NC8as-T4` or `NC24-A100` | yes, billed per second | HTTP rule `concurrentRequests: 2`, min 1 | the ingress request timeout is 240 s: cap `tts_chars` per key so one call streams within it |
+| **AWS ECS on EC2** — `deploy/aws/` | g6.xlarge (L4), g5.xlarge (A10G), g6e (L40S) | a GPU instance boots in minutes, keep min 1 | ALB `RequestCountPerTarget` 2 with a capacity provider adding instances | raise the ALB idle timeout from 60 s to 300 s; Fargate runs the CPU-only image without a GPU |
+
+Which one: the platform you already operate. Without one, Cloud Run and Container Apps are the least work because the GPU, the load balancer, TLS, secrets and autoscaling are all managed; ECS is the AWS equivalent with an instance layer you manage; Kubernetes is the portable choice with the most surface.
+
+## Trying it locally first
+
+`docker-compose.fleet.yml` in the repository runs the smallest fleet on one machine: two replicas behind Caddy, a one-shot service that fills the shared model cache, the seed directory and the keys file mounted read-only.
+
+```bash
+python -m backend.keys create --id myapp --role client --data-dir ./secrets   # prints the client key
+python -m backend.voices export ./seed
+export VOICEBOX_API_KEY="$(openssl rand -base64 32)"
+VOICEBOX_IMAGE=ghcr.io/OWNER/voicebox:VERSION-cpu docker compose -f docker-compose.fleet.yml up -d
+scripts/fleet-check.sh http://127.0.0.1:17600 "$CLIENT_KEY" --rounds 6
+```
+
+`scripts/fleet-check.sh` does what an application does, several times in a row: readiness, the voice catalog (its fingerprint must not change between replicas), a streamed `/v1/audio/speech` call and a `/v1/audio/transcriptions` call. Stop one replica while `scripts/load_test.py` runs to watch the drain: streams already open finish, new requests go to the other replica. Seeded profiles keep the id they had where they were exported, so a voice id is the same on every replica.
+
+## Rollouts
+
+Update the image tag and let the platform roll: a new replica takes traffic only once `/health/ready` is `200`, the old one drains for up to 90 s. Change the voice catalog by updating the seed directory and rolling the replicas (a bundle whose name exists is skipped, so add new names or use `python -m backend.voices import --on-conflict replace` against a replica when a voice must change in place). Rotate keys by editing `api_keys.json` in the secret store; replicas reload the file when it changes.

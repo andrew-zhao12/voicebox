@@ -12,6 +12,9 @@
 #   VOICEBOX_IMAGE=voicebox:local docker compose -f docker-compose.fleet.yml up
 #   scripts/fleet-check.sh http://127.0.0.1:17600 <client key> --rounds 6
 #
+# VOICEBOX_SEED_DIR and VOICEBOX_KEYS_FILE point the mounts elsewhere than
+# ./seed and ./secrets/api_keys.json (both are git-ignored).
+#
 # This file is standalone (not an overlay) and is the local stand-in for the
 # cloud recipes under deploy/.
 
@@ -28,6 +31,9 @@ x-replica-env: &replica-env
   VOICEBOX_MAX_QUEUE_DEPTH: ${VOICEBOX_MAX_QUEUE_DEPTH:-4}
   VOICEBOX_GENERATION_WORKERS: ${VOICEBOX_GENERATION_WORKERS:-1}
   VOICEBOX_RETENTION_DAYS: "1"
+  # On SIGTERM: 10 s of 503 readiness while still serving, so Caddy stops
+  # routing here before the listener closes (see stop_grace_period).
+  VOICEBOX_SHUTDOWN_DELAY_S: "10"
   VOICEBOX_LOG_FORMAT: json
   VOICEBOX_DISABLE_DOCS: "1"
   VOICEBOX_METRICS_PORT: "9464"
@@ -52,6 +58,7 @@ services:
   voicebox-a:
     image: *image
     restart: unless-stopped
+    # 10 s delay + 40 s for open streams + 30 s queue drain + margin.
     stop_grace_period: 90s
     depends_on:
       models:
@@ -60,8 +67,8 @@ services:
     volumes:
       - models:/models
       - data-a:/app/data
-      - ./seed:/seed:ro
-      - ./secrets/api_keys.json:/run/secrets/api_keys.json:ro
+      - ${VOICEBOX_SEED_DIR:-./seed}:/seed:ro
+      - ${VOICEBOX_KEYS_FILE:-./secrets/api_keys.json}:/run/secrets/api_keys.json:ro
     security_opt:
       - no-new-privileges:true
     networks:
@@ -70,6 +77,7 @@ services:
   voicebox-b:
     image: *image
     restart: unless-stopped
+    # 10 s delay + 40 s for open streams + 30 s queue drain + margin.
     stop_grace_period: 90s
     depends_on:
       models:
@@ -78,8 +86,8 @@ services:
     volumes:
       - models:/models
       - data-b:/app/data
-      - ./seed:/seed:ro
-      - ./secrets/api_keys.json:/run/secrets/api_keys.json:ro
+      - ${VOICEBOX_SEED_DIR:-./seed}:/seed:ro
+      - ${VOICEBOX_KEYS_FILE:-./secrets/api_keys.json}:/run/secrets/api_keys.json:ro
     security_opt:
       - no-new-privileges:true
     networks:

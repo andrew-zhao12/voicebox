@@ -1,0 +1,15 @@
+# Prometheus Operator: scrape every replica's unauthenticated metrics port.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: voicebox
+  namespace: voicebox
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: voicebox
+  endpoints:
+    - port: metrics
+      interval: 15s

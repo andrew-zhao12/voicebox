@@ -1,0 +1,33 @@
+# Fills the model cache once, before the first replica starts
+# (re-run after changing VOICEBOX_PRELOAD_MODELS or the image).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: voicebox-preload
+  namespace: voicebox
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: preload
+          image: ghcr.io/OWNER/voicebox:VERSION-cpu
+          command: ["python", "-m", "backend.preload", "--from-env"]
+          env:
+            - name: HF_HUB_OFFLINE
+              value: "0"
+          envFrom:
+            - configMapRef:
+                name: voicebox-config
+          resources:
+            requests: { cpu: "2", memory: "8Gi" }
+            limits: { memory: "16Gi" }
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: voicebox-models

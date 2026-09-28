@@ -1,0 +1,10 @@
+{
+  "TargetValue": 2.0,
+  "PredefinedMetricSpecification": {
+    "PredefinedMetricType": "ALBRequestCountPerTarget",
+    "ResourceLabel": "app/voicebox-alb/ALB-ID/targetgroup/voicebox-tg/TG-ID"
+  },
+  "ScaleOutCooldown": 60,
+  "ScaleInCooldown": 300,
+  "DisableScaleIn": false
+}
