@@ -112,7 +112,7 @@ def register_tools(mcp: FastMCP) -> None:
         db = next(get_db())
         try:
             client_id = current_client_id.get()
-            vp = resolve_profile(profile, client_id, db)
+            vp = resolve_profile(profile, client_id, db, principal=principal)
             if vp is None:
                 raise ToolError(
                     "No voice profile resolved. Pass `profile=` with a "
@@ -254,7 +254,7 @@ def register_tools(mcp: FastMCP) -> None:
     async def voicebox_list_profiles() -> dict[str, Any]:
         db = next(get_db())
         try:
-            profiles = await profiles_service.list_profiles(db)
+            profiles = await profiles_service.list_profiles(db, principal=_current_principal())
             return {
                 "profiles": [
                     {

@@ -4,10 +4,11 @@ import json as _json
 import logging
 import shutil
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from .. import config
@@ -25,6 +26,127 @@ from ..utils.images import process_avatar, validate_image
 logger = logging.getLogger(__name__)
 
 CLONING_ENGINES = {"qwen", "luxtts", "chatterbox", "chatterbox_turbo", "tada"}
+# Engines whose voices are built in; their ids are valid ``voice`` values on /v1 without a profile.
+PRESET_ENGINES = ("kokoro", "qwen_custom_voice")
+
+
+@dataclass(frozen=True)
+class PresetVoice:
+    """A built-in voice addressed directly, without a profile row.
+
+    Duck-types the profile attributes the generation service reads
+    (``voice_type``, ``preset_engine``, ``preset_voice_id``, ``default_engine``,
+    ``language``, ``personality``), so ``/v1/audio/speech`` can use it in
+    place of a ``VoiceProfile``.  ``id`` is the qualified ``engine:voice_id``.
+    """
+
+    engine: str
+    voice_id: str
+    name: str
+    language: str
+    gender: str | None = None
+    description: str | None = None
+    voice_type: str = "preset"
+    personality: None = None
+    owner_key_id: None = None
+
+    @property
+    def id(self) -> str:
+        return f"{self.engine}:{self.voice_id}"
+
+    @property
+    def preset_engine(self) -> str:
+        return self.engine
+
+    @property
+    def preset_voice_id(self) -> str:
+        return self.voice_id
+
+    @property
+    def default_engine(self) -> str:
+        return self.engine
+
+    def voice_prompt(self) -> dict:
+        """The prompt ``create_voice_prompt_for_profile`` builds for a preset profile."""
+        return {"voice_type": "preset", "preset_engine": self.engine, "preset_voice_id": self.voice_id}
+
+
+def list_preset_voices(engine: str | None = None) -> list[PresetVoice]:
+    """Built-in voices of *engine* (or of every preset engine), in catalog order."""
+    engines = [engine] if engine else list(PRESET_ENGINES)
+    voices: list[PresetVoice] = []
+    for name in engines:
+        if name == "kokoro":
+            from ..backends.kokoro_backend import KOKORO_VOICES  # lazy: engine module
+
+            voices.extend(
+                PresetVoice(
+                    engine="kokoro",
+                    voice_id=voice_id,
+                    name=display,
+                    language=lang,
+                    gender=gender,
+                    description=f"Kokoro built-in voice ({gender}, {lang})",
+                )
+                for voice_id, display, gender, lang in KOKORO_VOICES
+            )
+        elif name == "qwen_custom_voice":
+            from ..backends.qwen_custom_voice_backend import QWEN_CUSTOM_VOICES  # lazy: engine module
+
+            voices.extend(
+                PresetVoice(
+                    engine="qwen_custom_voice",
+                    voice_id=voice_id,
+                    name=display,
+                    language=lang,
+                    gender=gender,
+                    description=desc,
+                )
+                for voice_id, display, gender, lang, desc in QWEN_CUSTOM_VOICES
+            )
+    return voices
+
+
+def find_preset_voice(voice: str, engine: str | None = None) -> PresetVoice | None:
+    """The preset whose id is *voice* (``af_heart``, ``Ryan``, or qualified ``kokoro:af_heart``).
+
+    Ids match case-insensitively.  *engine* only orders the search, so a
+    voice of another preset engine is still found and the engine mismatch is
+    reported by ``validate_profile_engine`` instead of as "unknown voice".
+    """
+    wanted = (voice or "").strip()
+    if not wanted:
+        return None
+    prefix, sep, rest = wanted.partition(":")
+    if sep and prefix.lower() in PRESET_ENGINES:
+        engine, wanted = prefix.lower(), rest
+    order = [engine] + [e for e in PRESET_ENGINES if e != engine] if engine in PRESET_ENGINES else list(PRESET_ENGINES)
+    lowered = wanted.lower()
+    for candidate in order:
+        for preset in list_preset_voices(candidate):
+            if preset.voice_id.lower() == lowered:
+                return preset
+    return None
+
+
+def is_visible(profile, principal) -> bool:
+    """Whether *principal* may see *profile*: shared profiles always, owned ones only by their key."""
+    if principal is None or getattr(principal, "is_admin", False):
+        return True
+    owner = getattr(profile, "owner_key_id", None)
+    return owner is None or owner == getattr(principal, "key_id", None)
+
+
+def visibility_filter(principal):
+    """SQLAlchemy criterion matching the profiles *principal* may see, or ``None`` for everything."""
+    if principal is None or getattr(principal, "is_admin", False):
+        return None
+    return or_(DBVoiceProfile.owner_key_id.is_(None), DBVoiceProfile.owner_key_id == principal.key_id)
+
+
+def count_owned(db: Session, key_id: str) -> int:
+    """How many profiles *key_id* created through the API."""
+    return db.query(DBVoiceProfile).filter(DBVoiceProfile.owner_key_id == key_id).count()
 
 
 def _profile_to_response(
@@ -55,6 +177,7 @@ def _profile_to_response(
         design_prompt=getattr(profile, "design_prompt", None),
         default_engine=getattr(profile, "default_engine", None),
         personality=getattr(profile, "personality", None),
+        owner_key_id=getattr(profile, "owner_key_id", None),
         generation_count=generation_count,
         sample_count=sample_count,
         created_at=profile.created_at,
@@ -138,6 +261,8 @@ def validate_profile_engine(profile, engine: str) -> None:
 async def create_profile(
     data: VoiceProfileCreate,
     db: Session,
+    *,
+    owner_key_id: str | None = None,
 ) -> VoiceProfileResponse:
     """
     Create a new voice profile.
@@ -145,6 +270,7 @@ async def create_profile(
     Args:
         data: Profile creation data
         db: Database session
+        owner_key_id: The API key that owns the profile (``None`` = shared)
 
     Returns:
         Created profile
@@ -183,6 +309,7 @@ async def create_profile(
         design_prompt=data.design_prompt,
         default_engine=default_engine,
         personality=data.personality,
+        owner_key_id=owner_key_id,
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
     )
@@ -280,22 +407,24 @@ async def get_profile(
 def get_profile_orm_by_name_or_id(
     name_or_id: str,
     db: Session,
+    principal=None,
 ) -> DBVoiceProfile | None:
     """Resolve a profile from a user-supplied string that may be either id or name.
 
     Id is tried first (fast path, matches UUIDs). Name fallback is
-    case-insensitive so agents can say "Morgan" regardless of casing.
+    case-insensitive so agents can say "Morgan" regardless of casing.  With a
+    *principal*, profiles owned by another key are not found.
     """
     if not name_or_id:
         return None
-    row = db.query(DBVoiceProfile).filter(DBVoiceProfile.id == name_or_id).first()
+    query = db.query(DBVoiceProfile)
+    criterion = visibility_filter(principal)
+    if criterion is not None:
+        query = query.filter(criterion)
+    row = query.filter(DBVoiceProfile.id == name_or_id).first()
     if row is not None:
         return row
-    return (
-        db.query(DBVoiceProfile)
-        .filter(func.lower(DBVoiceProfile.name) == name_or_id.lower())
-        .first()
-    )
+    return query.filter(func.lower(DBVoiceProfile.name) == name_or_id.lower()).first()
 
 
 async def get_profile_samples(
@@ -316,17 +445,22 @@ async def get_profile_samples(
     return [ProfileSampleResponse.model_validate(s) for s in samples]
 
 
-async def list_profiles(db: Session) -> list[VoiceProfileResponse]:
+async def list_profiles(db: Session, principal=None) -> list[VoiceProfileResponse]:
     """
-    List all voice profiles with generation and sample counts.
+    List voice profiles with generation and sample counts.
 
     Args:
         db: Database session
+        principal: When given, profiles owned by another key are left out
 
     Returns:
         List of profiles
     """
-    profiles = db.query(DBVoiceProfile).order_by(DBVoiceProfile.created_at.desc()).all()
+    query = db.query(DBVoiceProfile)
+    criterion = visibility_filter(principal)
+    if criterion is not None:
+        query = query.filter(criterion)
+    profiles = query.order_by(DBVoiceProfile.created_at.desc()).all()
 
     if not profiles:
         return []

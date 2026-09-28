@@ -133,13 +133,16 @@ async def prepare_engine(
     db,
     *,
     on_loading: Callable[[], Awaitable[None]] | None = None,
+    voice_prompt: dict | None = None,
 ) -> EnginePrep:
     """Load the engine, build the profile's voice prompt and pick its post-processing.
 
     Shared by every generation path so model loading and voice-prompt
     creation always happen inside the queued job, serialized with all other
     GPU work.  *on_loading* is awaited before a model that is not resident
-    yet gets loaded (the async path reports ``loading_model`` there).
+    yet gets loaded (the async path reports ``loading_model`` there).  A
+    ready *voice_prompt* (a preset voice used without a profile row) skips
+    the profile lookup.
     """
     from ..backends import (
         engine_needs_trim,
@@ -160,12 +163,13 @@ async def prepare_engine(
     if not was_loaded:
         metrics.MODEL_LOAD_SECONDS.labels(f"{engine}:{model_size or 'default'}").observe(perf_counter() - load_started)
 
-    voice_prompt = await profiles.create_voice_prompt_for_profile(
-        profile_id,
-        db,
-        use_cache=True,
-        engine=engine,
-    )
+    if voice_prompt is None:
+        voice_prompt = await profiles.create_voice_prompt_for_profile(
+            profile_id,
+            db,
+            use_cache=True,
+            engine=engine,
+        )
 
     retries_runaway = engine_retries_runaway(engine)
     return EnginePrep(
@@ -335,6 +339,7 @@ async def run_generation_stream(
     max_chunk_chars: int,
     crossfade_ms: int,
     first_chunk_chars: int | None,
+    voice_prompt: dict | None = None,
 ) -> None:
     """Queued job behind ``POST /generate/stream``.
 
@@ -354,7 +359,7 @@ async def run_generation_stream(
     try:
         bg_db = next(get_db())
         try:
-            prep = await prepare_engine(engine, model_size, profile_id, bg_db)
+            prep = await prepare_engine(engine, model_size, profile_id, bg_db, voice_prompt=voice_prompt)
         finally:
             bg_db.close()
 
@@ -515,7 +520,13 @@ def abandon_stream(session: StreamSession) -> None:
     cancel_generation(session.job_id)
 
 
-async def open_stream(data: models.StreamGenerationRequest, db, principal: Principal) -> OpenedStream:
+async def open_stream(
+    data: models.StreamGenerationRequest,
+    db,
+    principal: Principal,
+    *,
+    voice: profiles.PresetVoice | None = None,
+) -> OpenedStream:
     """Validate a streamed request, queue its job and wait for the first chunk.
 
     Shared by ``POST /generate/stream`` and ``POST /v1/audio/speech``: caps and
@@ -523,6 +534,8 @@ async def open_stream(data: models.StreamGenerationRequest, db, principal: Princ
     disk, and the first chunk (or the failure) arrives before any response
     headers are sent, so early errors keep a real status code.  Raises
     ``GenerationRefused`` for anything the caller must answer with an error.
+    A *voice* (built-in preset) replaces the profile lookup; otherwise the
+    profile must exist and be visible to *principal*.
     """
     from fastapi import HTTPException
 
@@ -535,9 +548,14 @@ async def open_stream(data: models.StreamGenerationRequest, db, principal: Princ
         raise _refused_queue(e) from e
     charge("tts_chars", len(data.text))
 
-    profile = await profiles.get_profile(data.profile_id, db)
-    if not profile:
-        raise GenerationRefused(404, "Profile not found")
+    voice_prompt: dict | None = None
+    if voice is not None:
+        profile = voice
+        voice_prompt = voice.voice_prompt()
+    else:
+        profile = await profiles.get_profile(data.profile_id, db)
+        if not profile or not profiles.is_visible(profile, principal):
+            raise GenerationRefused(404, "Profile not found")
 
     engine = resolve_engine(data, profile)
     try:
@@ -582,6 +600,7 @@ async def open_stream(data: models.StreamGenerationRequest, db, principal: Princ
                 max_chunk_chars=data.max_chunk_chars,
                 crossfade_ms=data.crossfade_ms,
                 first_chunk_chars=first_chunk_chars,
+                voice_prompt=voice_prompt,
             ),
             owner=principal.key_id,
             max_pending=principal.limits.max_pending_jobs,

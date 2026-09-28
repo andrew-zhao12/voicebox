@@ -78,7 +78,7 @@ async def fake_backend(monkeypatch, tmp_path):
     async def get_profile(profile_id, db):
         return profile if profile_id == "p1" else None
 
-    async def prepare_engine(engine, model_size, profile_id, db, *, on_loading=None):
+    async def prepare_engine(engine, model_size, profile_id, db, *, on_loading=None, voice_prompt=None):
         return generation_service.EnginePrep(
             backend=backend,
             voice_prompt={},

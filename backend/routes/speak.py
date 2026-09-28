@@ -14,10 +14,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..auth import get_principal
 from ..database import MCPClientBinding, get_db
 from ..mcp_server import events as mcp_events
 from ..mcp_server.resolve import resolve_profile
-
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ async def speak(
     ``GET /generate/{id}/status``.
     """
     client_id = request.headers.get("X-Voicebox-Client-Id")
-    profile = resolve_profile(data.profile, client_id, db)
+    profile = resolve_profile(data.profile, client_id, db, principal=get_principal())
     if profile is None:
         if data.profile:
             raise HTTPException(

@@ -50,7 +50,15 @@ async def transcribe_upload(file: UploadFile, language: str | None, model: str |
         while chunk := await file.read(UPLOAD_CHUNK_SIZE):
             tmp.write(chunk)
         tmp_path = tmp.name
+    try:
+        return await transcribe_file(tmp_path, language, model)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
+
+async def transcribe_file(tmp_path: str, language: str | None, model: str | None) -> tuple[str, float]:
+    """Run Whisper on an audio file already on disk (see ``transcribe_upload`` for the errors)."""
+    file_suffix = Path(tmp_path).suffix.lower()
     stt_path = tmp_path
     try:
         from ..backends import WHISPER_HF_REPOS
@@ -125,6 +133,5 @@ async def transcribe_upload(file: UploadFile, language: str | None, model: str |
         logger.exception("Transcription failed")
         raise HTTPException(status_code=500, detail="Transcription failed") from e
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
         if stt_path != tmp_path:
             Path(stt_path).unlink(missing_ok=True)

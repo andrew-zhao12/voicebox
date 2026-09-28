@@ -48,6 +48,7 @@ class VoiceProfileResponse(BaseModel):
     design_prompt: Optional[str] = None
     default_engine: Optional[str] = None
     personality: Optional[str] = None
+    owner_key_id: Optional[str] = None
     generation_count: int = 0
     sample_count: int = 0
     created_at: datetime

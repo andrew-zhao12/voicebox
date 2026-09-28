@@ -42,8 +42,10 @@ def api(tmp_path, monkeypatch):
     previous_data_dir = config.get_data_dir()
     config.set_data_dir(tmp_path)
     database.init_db()
+    seen_prompts: list[tuple[str, dict | None]] = []
 
-    async def prepare_engine(engine, model_size, profile_id, db, *, on_loading=None):
+    async def prepare_engine(engine, model_size, profile_id, db, *, on_loading=None, voice_prompt=None):
+        seen_prompts.append((profile_id, voice_prompt))
         return generation_service.EnginePrep(
             backend=FakeBackend(), voice_prompt={}, trim_fn=None, runaway_detector=None, runaway_cut_fn=None
         )
@@ -86,7 +88,14 @@ def api(tmp_path, monkeypatch):
             headers=bearer(admin_key),
         )
         assert created.status_code == 200, created.text
-        yield SimpleNamespace(client=client, admin=admin_key, key=client_key, profile_id=created.json()["id"])
+        yield SimpleNamespace(
+            client=client,
+            admin=admin_key,
+            key=client_key,
+            profile_id=created.json()["id"],
+            runtime=runtime,
+            prompts=seen_prompts,
+        )
     lifecycle.reset()
     config.set_data_dir(previous_data_dir)
 
@@ -217,9 +226,10 @@ def test_models_and_voices_lists(api):
     response = api.client.get("/v1/voices", headers=bearer(api.key))
     assert response.status_code == 200
     voices = response.json()["data"]
-    assert [voice["name"] for voice in voices] == ["Smoke Voice"]
+    assert [voice["name"] for voice in voices if voice["kind"] == "profile"] == ["Smoke Voice"]
     assert voices[0]["id"] == api.profile_id
     assert voices[0]["engine"] == "kokoro"
+    assert len(voices) > 50  # the built-in preset voices follow the profiles
 
 
 def test_transcriptions_json_text_and_errors(api, monkeypatch):
@@ -260,3 +270,172 @@ def test_transcriptions_json_text_and_errors(api, monkeypatch):
     )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "model_not_found"
+
+
+def sample_wav(seconds: float = 2.5) -> bytes:
+    t = np.arange(int(SR * seconds)) / SR
+    audio = (0.3 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    buffer = io.BytesIO()
+    sf.write(buffer, audio, SR, format="WAV", subtype="PCM_16")
+    return buffer.getvalue()
+
+
+def test_preset_voices_work_without_a_profile(api):
+    response = api.client.post(
+        "/v1/audio/speech",
+        json={"model": "kokoro", "input": TEXT, "voice": "af_heart", "response_format": "pcm"},
+        headers=bearer(api.key),
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-voicebox-engine"] == "kokoro"
+    assert response.headers["x-voicebox-voice"] == "kokoro:af_heart"
+    assert len(response.content) == len(TEXT) * 2
+    assert api.prompts[-1] == (
+        "kokoro:af_heart",
+        {"voice_type": "preset", "preset_engine": "kokoro", "preset_voice_id": "af_heart"},
+    )
+
+    # Qualified and case-insensitive ids, with the alias model picking the preset's engine.
+    response = api.client.post(
+        "/v1/audio/speech",
+        json={"model": "tts-1", "input": TEXT, "voice": "Kokoro:AF_HEART", "response_format": "pcm"},
+        headers=bearer(api.key),
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-voicebox-engine"] == "kokoro"
+
+    # A preset of one engine requested with another engine is a clear 400, not an unknown voice.
+    response = api.client.post(
+        "/v1/audio/speech", json={"model": "kokoro", "input": TEXT, "voice": "Ryan"}, headers=bearer(api.key)
+    )
+    assert response.status_code == 400
+    assert "qwen_custom_voice" in response.json()["error"]["message"]
+
+    # Profiles take precedence over presets and stock names; the profile row's prompt path is used.
+    response = api.client.post(
+        "/v1/audio/speech",
+        json={"model": "kokoro", "input": TEXT, "voice": "smoke voice", "response_format": "pcm"},
+        headers=bearer(api.key),
+    )
+    assert response.status_code == 200
+    assert api.prompts[-1] == (api.profile_id, None)
+
+
+def test_voices_list_has_profiles_and_presets(api):
+    response = api.client.get("/v1/voices", headers=bearer(api.key))
+    assert response.status_code == 200
+    data = response.json()["data"]
+    kinds = {entry["kind"] for entry in data}
+    assert kinds == {"profile", "preset"}
+    profile = next(entry for entry in data if entry["kind"] == "profile")
+    assert profile["name"] == "Smoke Voice"
+    assert profile["shared"] is True
+    presets = {entry["id"]: entry for entry in data if entry["kind"] == "preset"}
+    assert presets["af_heart"]["engine"] == "kokoro"
+    assert presets["af_heart"]["gender"] == "female"
+    assert presets["Ryan"]["engine"] == "qwen_custom_voice"
+
+
+def test_client_owned_voices_are_private_and_deletable_by_their_key(api, monkeypatch):
+    async def fake_transcribe(path, language, model):
+        return "transcribed automatically", 2.5
+
+    monkeypatch.setattr("backend.routes.openai_compat.transcribe_file", fake_transcribe)
+    _other_record, other_key = api.runtime.keystore.create("other", "client", None)
+
+    files = [("file", ("one.wav", sample_wav(), "audio/wav")), ("file", ("two.wav", sample_wav(), "audio/wav"))]
+    response = api.client.post(
+        "/v1/voices",
+        data={"name": "My App Voice", "text": ["First sample."], "engine": "qwen", "language": "en"},
+        files=files,
+        headers=bearer(api.key),
+    )
+    assert response.status_code == 201, response.text
+    voice = response.json()
+    assert voice["owner"] == "app"
+    assert voice["shared"] is False
+    assert voice["engine"] == "qwen"
+
+    samples = api.client.get(f"/profiles/{voice['id']}/samples", headers=bearer(api.admin)).json()
+    assert [s["reference_text"] for s in samples] == ["First sample.", "transcribed automatically"]
+
+    # Visible to its owner and to admins, invisible to another client key.
+    assert "My App Voice" in {v["name"] for v in api.client.get("/v1/voices", headers=bearer(api.key)).json()["data"]}
+    assert "My App Voice" in {v["name"] for v in api.client.get("/profiles", headers=bearer(api.admin)).json()}
+    other_names = {v["name"] for v in api.client.get("/v1/voices", headers=bearer(other_key)).json()["data"]}
+    assert "My App Voice" not in other_names
+    assert api.client.get(f"/profiles/{voice['id']}", headers=bearer(other_key)).status_code == 404
+    hidden = api.client.post(
+        "/v1/audio/speech", json={"input": TEXT, "voice": "My App Voice", "model": "qwen"}, headers=bearer(other_key)
+    )
+    assert hidden.status_code == 404
+    assert hidden.json()["error"]["code"] == "voice_not_found"
+    assert (
+        api.client.post(
+            "/generate/stream",
+            json={"profile_id": voice["id"], "text": TEXT, "engine": "qwen"},
+            headers=bearer(other_key),
+        ).status_code
+        == 404
+    )
+
+    # The owner streams with it (fake backend), a duplicate name is 409, a shared voice cannot be deleted by a client.
+    response = api.client.post(
+        "/v1/audio/speech",
+        json={"input": TEXT, "voice": "My App Voice", "model": "qwen", "response_format": "pcm"},
+        headers=bearer(api.key),
+    )
+    assert response.status_code == 200, response.text
+    duplicate = api.client.post(
+        "/v1/voices", data={"name": "My App Voice", "text": ["x"]}, files=files[:1], headers=bearer(api.key)
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error"]["code"] == "voice_exists"
+    shared = api.client.delete("/v1/voices/Smoke Voice", headers=bearer(api.key))
+    assert shared.status_code == 403
+    assert shared.json()["error"]["code"] == "voice_not_owned"
+    assert api.client.delete("/v1/voices/My App Voice", headers=bearer(other_key)).status_code == 404
+    assert api.client.delete("/v1/voices/af_heart", headers=bearer(api.key)).status_code == 404
+
+    deleted = api.client.delete(f"/v1/voices/{voice['id']}", headers=bearer(api.key))
+    assert deleted.status_code == 200
+    assert deleted.json() == {"id": voice["id"], "object": "voice", "deleted": True}
+    assert api.client.get(f"/profiles/{voice['id']}", headers=bearer(api.admin)).status_code == 404
+
+
+def test_voice_creation_limits_and_validation(api, monkeypatch):
+    _record, capped_key = api.runtime.keystore.create("capped", "client", {"max_voices": 1})
+    files = [("file", ("one.wav", sample_wav(), "audio/wav"))]
+    first = api.client.post(
+        "/v1/voices", data={"name": "Only One", "text": ["Hi."]}, files=files, headers=bearer(capped_key)
+    )
+    assert first.status_code == 201, first.text
+    second = api.client.post(
+        "/v1/voices", data={"name": "Two", "text": ["Hi."]}, files=files, headers=bearer(capped_key)
+    )
+    assert second.status_code == 403
+    assert second.json()["error"]["code"] == "voice_limit_reached"
+
+    bad_engine = api.client.post(
+        "/v1/voices",
+        data={"name": "Preset?", "text": ["Hi."], "engine": "kokoro"},
+        files=files,
+        headers=bearer(api.key),
+    )
+    assert bad_engine.status_code == 400
+    assert bad_engine.json()["error"]["param"] == "engine"
+
+    too_short = [("file", ("short.wav", sample_wav(0.5), "audio/wav"))]
+    short = api.client.post(
+        "/v1/voices", data={"name": "Short", "text": ["Hi."]}, files=too_short, headers=bearer(api.key)
+    )
+    assert short.status_code == 400
+    assert "too short" in short.json()["error"]["message"]
+    assert "Short" not in {v["name"] for v in api.client.get("/profiles", headers=bearer(api.admin)).json()}
+
+    # Admin keys are unlimited and may delete any voice through /v1 as well.
+    admin_made = api.client.post(
+        "/v1/voices", data={"name": "Admin Voice", "text": ["Hi."]}, files=files, headers=bearer(api.admin)
+    )
+    assert admin_made.status_code == 201
+    assert api.client.delete("/v1/voices/Only One", headers=bearer(api.admin)).status_code == 200

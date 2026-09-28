@@ -94,7 +94,7 @@ async def generate_speech(
     charge("tts_chars", len(data.text))
 
     profile = await profiles.get_profile(data.profile_id, db)
-    if not profile:
+    if not profile or not profiles.is_visible(profile, principal):
         raise HTTPException(status_code=404, detail="Profile not found")
 
     from ..backends import engine_has_model_sizes, ensure_model_cached_or_raise

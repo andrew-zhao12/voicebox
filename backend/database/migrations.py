@@ -159,6 +159,9 @@ def _migrate_profiles(engine, inspector, tables: set[str]) -> None:
         _add_column(engine, "profiles", "default_engine VARCHAR", "default_engine")
     if "personality" not in columns:
         _add_column(engine, "profiles", "personality TEXT", "personality")
+    # Per-key voice ownership (/v1/voices) — v0.6
+    if "owner_key_id" not in columns:
+        _add_column(engine, "profiles", "owner_key_id VARCHAR", "owner_key_id")
 
 
 def _migrate_generations(engine, inspector, tables: set[str]) -> None:

@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from .. import config, models
+from ..auth import get_principal
 from ..database import VoiceProfile as DBVoiceProfile, get_db
 from ..services import channels, export_import, personality, profiles
 from ..services.inference_slots import InferenceBusyError, llm_slot
@@ -39,8 +40,8 @@ async def create_profile(
 
 @router.get("/profiles", response_model=list[models.VoiceProfileResponse])
 async def list_profiles(db: Session = Depends(get_db)):
-    """List all voice profiles."""
-    return await profiles.list_profiles(db)
+    """List voice profiles (client keys see shared profiles and their own)."""
+    return await profiles.list_profiles(db, principal=get_principal())
 
 
 @router.post("/profiles/import", response_model=models.VoiceProfileResponse)
@@ -119,7 +120,7 @@ async def get_profile(
 ):
     """Get a voice profile by ID."""
     profile = await profiles.get_profile(profile_id, db)
-    if not profile:
+    if not profile or not profiles.is_visible(profile, get_principal()):
         raise HTTPException(status_code=404, detail="Profile not found")
     return profile
 

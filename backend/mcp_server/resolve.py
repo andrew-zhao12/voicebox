@@ -18,10 +18,16 @@ def resolve_profile(
     explicit: str | None,
     client_id: str | None,
     db: Session,
+    *,
+    principal=None,
 ) -> DBVoiceProfile | None:
-    """Apply the full precedence chain and return the profile ORM row (or None)."""
+    """Apply the full precedence chain and return the profile ORM row (or None).
+
+    With a *principal*, profiles another key created through ``/v1/voices``
+    are invisible at every step.
+    """
     if explicit:
-        profile = _lookup_profile(explicit, db)
+        profile = _lookup_profile(explicit, db, principal)
         if profile is not None:
             return profile
         # Explicit but not found — return None so the caller can report it.
@@ -38,14 +44,14 @@ def resolve_profile(
             .first()
         )
         if binding and binding.profile_id:
-            profile = _lookup_profile(binding.profile_id, db)
+            profile = _lookup_profile(binding.profile_id, db, principal)
             if profile is not None:
                 return profile
 
     # Global default from capture settings.
     settings = db.query(CaptureSettings).filter(CaptureSettings.id == 1).first()
     if settings and settings.default_playback_voice_id:
-        profile = _lookup_profile(settings.default_playback_voice_id, db)
+        profile = _lookup_profile(settings.default_playback_voice_id, db, principal)
         if profile is not None:
             return profile
 

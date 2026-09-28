@@ -49,7 +49,10 @@ class ApiKeyCreate(BaseModel):
     role: Literal["admin", "client"] = "client"
     limits: dict[str, int | None] | None = Field(
         default=None,
-        description="Per-minute overrides: requests, inference, uploads_bytes, tts_chars, max_pending_jobs (null = unlimited).",
+        description=(
+            "Overrides: requests, inference, uploads_bytes, tts_chars (per minute), "
+            "max_pending_jobs, max_voices (counts); null = unlimited."
+        ),
     )
 
 
