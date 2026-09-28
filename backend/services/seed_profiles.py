@@ -84,15 +84,19 @@ def read_bundle(path: Path) -> bytes:
     return buffer.getvalue()
 
 
-async def apply(directory: Path, db, *, on_conflict: str = "skip") -> SeedReport:
-    """Import every bundle in *directory* into *db*; never raises for a single bad bundle."""
-    from .export_import import import_profile_bundle  # lazy: pulls in librosa through the profile service
+async def apply(directory: Path, db, *, on_conflict: str = "skip", importer=None) -> SeedReport:
+    """Import every bundle in *directory* into *db*; never raises for a single bad bundle.
+
+    *importer* defaults to ``export_import.import_profile_bundle`` (tests pass a fake).
+    """
+    if importer is None:
+        from .export_import import import_profile_bundle as importer  # lazy: pulls in librosa via the profile service
 
     report = SeedReport()
     for path in bundle_paths(directory):
         try:
             data = await asyncio.to_thread(read_bundle, path)
-            result = await import_profile_bundle(data, db, on_conflict=on_conflict)  # type: ignore[arg-type]  # validated inside
+            result = await importer(data, db, on_conflict=on_conflict)
         except Exception as e:
             db.rollback()
             report.failed[path.name] = str(e)

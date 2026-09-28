@@ -129,6 +129,22 @@ def find_preset_voice(voice: str, engine: str | None = None) -> PresetVoice | No
     return None
 
 
+def _free_profile_id(preferred: str | None, db: Session) -> str:
+    """*preferred* in canonical UUID form when it is valid and unused, else a new UUID.
+
+    The id names the profile's directory under ``profiles/``, so anything
+    that is not a UUID (for example ``../x`` from a crafted bundle) is ignored.
+    """
+    if preferred:
+        try:
+            candidate = str(uuid.UUID(str(preferred)))
+        except ValueError:
+            candidate = None
+        if candidate and db.query(DBVoiceProfile).filter_by(id=candidate).first() is None:
+            return candidate
+    return str(uuid.uuid4())
+
+
 def is_visible(profile, principal) -> bool:
     """Whether *principal* may see *profile*: shared profiles always, owned ones only by their key."""
     if principal is None or getattr(principal, "is_admin", False):
@@ -263,6 +279,7 @@ async def create_profile(
     db: Session,
     *,
     owner_key_id: str | None = None,
+    profile_id: str | None = None,
 ) -> VoiceProfileResponse:
     """
     Create a new voice profile.
@@ -271,6 +288,8 @@ async def create_profile(
         data: Profile creation data
         db: Database session
         owner_key_id: The API key that owns the profile (``None`` = shared)
+        profile_id: Preferred id (a bundle's original id); used when it is a
+            UUID no other profile has, otherwise a fresh one is generated
 
     Returns:
         Created profile
@@ -299,7 +318,7 @@ async def create_profile(
         raise ValueError(validation_error)
 
     db_profile = DBVoiceProfile(
-        id=str(uuid.uuid4()),
+        id=_free_profile_id(profile_id, db),
         name=data.name,
         description=data.description,
         language=data.language,

@@ -51,7 +51,7 @@ def data_dir(tmp_path):
     config.set_data_dir(previous)
 
 
-async def test_apply_reports_per_bundle_and_never_raises(data_dir, monkeypatch):
+async def test_apply_reports_per_bundle_and_never_raises(data_dir):
     seed = data_dir / "seed"
     seed.mkdir()
     for name in ("one.zip", "two.zip", "bad.zip"):
@@ -64,8 +64,7 @@ async def test_apply_reports_per_bundle_and_never_raises(data_dir, monkeypatch):
         outcome = "skipped" if data == b"two.zip" else "created"
         return SimpleNamespace(outcome=outcome, name=data.decode().removesuffix(".zip"), profile=None)
 
-    monkeypatch.setattr("backend.services.export_import.import_profile_bundle", fake_import)
-    report = await seed_profiles.apply(seed, SimpleNamespace(rollback=lambda: None))
+    report = await seed_profiles.apply(seed, SimpleNamespace(rollback=lambda: None), importer=fake_import)
     assert report.created == ["one"]
     assert report.skipped == ["two"]
     assert report.failed == {"bad.zip": "manifest missing"}

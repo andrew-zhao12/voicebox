@@ -97,7 +97,7 @@ async def test_round_trip_keeps_every_field_of_a_preset_profile(db):
     assert imported.description == "Warm narrator"
     assert imported.personality == "Speaks warmly."
     assert [e.type for e in imported.effects_chain] == ["reverb"]
-    assert imported.id != created.id
+    assert imported.id == created.id  # the id travels with the bundle when it is free
 
 
 async def test_round_trip_of_cloned_and_designed_profiles(db, tmp_path):
@@ -151,12 +151,16 @@ async def test_conflict_modes_skip_rename_and_replace(db, tmp_path):
     renamed = await export_import.import_profile_bundle(data, db, on_conflict="rename")
     assert renamed.outcome == "created"
     assert renamed.name == "Twin (1)"
+    assert renamed.profile.id != original.id  # the bundle's id is taken, so a new one is issued
 
+    original_samples = {s.id for s in db.query(ProfileSample).filter_by(profile_id=original.id).all()}
     replaced = await export_import.import_profile_bundle(data, db, on_conflict="replace")
     assert replaced.outcome == "replaced"
     assert replaced.profile.name == "Twin"
-    assert replaced.profile.id != original.id
-    assert db.query(VoiceProfile).filter_by(id=original.id).first() is None
+    assert replaced.profile.id == original.id  # recreated under the same id
+    new_samples = {s.id for s in db.query(ProfileSample).filter_by(profile_id=original.id).all()}
+    assert new_samples
+    assert not new_samples & original_samples
     assert {p.name for p in db.query(VoiceProfile).all()} == {"Twin", "Twin (1)"}
 
     with pytest.raises(ValueError, match="on_conflict"):
@@ -180,3 +184,16 @@ async def test_a_bad_sample_leaves_no_profile_behind(db):
 
     with pytest.raises(ValueError, match="Invalid ZIP"):
         await export_import.import_profile_bundle(b"not a zip", db)
+
+
+async def test_bundle_ids_must_be_uuids(db):
+    evil = bundle({"id": "../../escape", "name": "Evil", "language": "en"}, {"a.wav": wav_bytes()}, {"a.wav": "Hi."})
+    result = await export_import.import_profile_bundle(evil, db)
+    assert result.profile.id != "../../escape"
+    assert config.resolve_storage_path(
+        db.query(ProfileSample).filter_by(profile_id=result.profile.id).first().audio_path
+    ).is_relative_to(config.get_profiles_dir())
+
+    fixed = "0b7c7f64-5d1e-4c1a-9b83-2f7d9f6a1e20"
+    ok = bundle({"id": fixed.upper(), "name": "Fixed", "language": "en"}, {"a.wav": wav_bytes()}, {"a.wav": "Hi."})
+    assert (await export_import.import_profile_bundle(ok, db)).profile.id == fixed

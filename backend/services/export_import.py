@@ -7,7 +7,8 @@ bundle always imported as a cloned profile.  Manifest 1.1 adds the voice
 type and everything that makes preset, designed and cloned profiles behave
 the same on another server: ``voice_type``, ``preset_engine``,
 ``preset_voice_id``, ``design_prompt``, ``default_engine``, ``effects_chain``
-and ``personality``.  ``import_profile_bundle`` reads both versions,
+and ``personality``, plus the profile ``id``, which an import keeps when no
+other profile has it.  ``import_profile_bundle`` reads both versions,
 validates every sample before it writes a row, and lets the caller decide
 what a name clash means (``rename`` for the UI, ``skip`` for boot-time
 seeding, ``replace`` to update a catalog in place).
@@ -102,6 +103,7 @@ def export_profile_to_zip(profile_id: str, db: Session) -> bytes:
                 zip_file.write(avatar_path, f"avatar{avatar_path.suffix}")
 
         profile_data = {
+            "id": profile.id,
             "name": profile.name,
             "description": profile.description,
             "language": profile.language,
@@ -237,7 +239,9 @@ async def import_profile_bundle(file_bytes: bytes, db: Session, *, on_conflict: 
             else:
                 name = _get_unique_profile_name(original_name, db)
 
-        profile = await create_profile(_profile_create_from(profile_data, name), db)
+        # Keeping the bundle's id (when free) gives every replica seeded from
+        # the same bundles the same ids, so a voice id works on any of them.
+        profile = await create_profile(_profile_create_from(profile_data, name), db, profile_id=profile_data.get("id"))
         try:
             if effects_json is not None:
                 row = db.query(DBVoiceProfile).filter_by(id=profile.id).first()
