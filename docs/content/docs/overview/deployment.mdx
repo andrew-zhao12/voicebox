@@ -3,7 +3,7 @@ title: Deployment Checklist
 description: "Run Voicebox as a service: image variants, probes, warm-up, graceful stop, retention, backups and keys"
 ---
 
-This page is for operators putting the backend in front of applications, as a container on one host. It complements [Docker Deployment](/overview/docker) (how to run the container) and [API Keys](/overview/api-keys) (who may call what).
+This page is for operators putting the backend in front of applications, as a container on one host. It complements [Docker Deployment](/overview/docker) (how to run the container) and [API Keys](/overview/api-keys) (who may call what); [Scaling](/overview/scaling) continues with several replicas.
 
 ## 1. Pick an image variant
 
@@ -66,6 +66,8 @@ Models load on first use and stay resident. On a server, load them at boot inste
 
 On `SIGTERM` the server stops accepting connections, finishes streams and SSE responses that are already open (up to 40 s), then drains its generation queue: new jobs are refused with `503` and `Retry-After`, `/health/ready` turns `503`, and queued and running generations get up to `VOICEBOX_DRAIN_TIMEOUT_S` (default 30) to finish before they are cancelled and the models unload. The compose file sets `stop_grace_period: 45s` to match; give your orchestrator a termination grace period of at least that.
 
+Behind a load balancer, set `VOICEBOX_SHUTDOWN_DELAY_S` (10 is a good start): the first `SIGTERM` then only turns `/health/ready` to `503` while the server keeps accepting and serving requests for that many seconds, so the balancer stops routing to it before the listener closes and no request lands on a closing replica. A second signal skips the rest of the delay. Add the delay to the grace period (90 s covers 10 + 40 + 30). The default is 0, so the desktop app quits at once.
+
 ## 6. Retention
 
 Generated audio and captures stay forever by default. With `VOICEBOX_RETENTION_DAYS=N`, a daily sweep deletes generations older than N days that are not favourited and not placed in a story, captures older than N days, and audio files that no database row references. `POST /maintenance/prune` (admin key; optional body `{"days": N}`) runs the same sweep on demand and returns what it removed. `0` keeps nothing older than today.
@@ -90,7 +92,7 @@ One process serves one request at a time per lane. By default there is one lane,
 
 Everything lives in the data directory (`/app/data` in the container, the `voicebox-data` volume): `voicebox.db`, `profiles/`, `generations/`, `captures/`, `api_key` and `api_keys.json`. The database runs in WAL mode, so a file copy must include `voicebox.db-wal` and `voicebox.db-shm`, or use `sqlite3 /app/data/voicebox.db ".backup /backup/voicebox.db"` for a consistent snapshot. Keep the data directory on a local disk: SQLite's WAL is not safe on NFS.
 
-Models are cached separately (`huggingface-cache` volume or `VOICEBOX_MODELS_DIR`); they are redownloadable and need no backup.
+Models are cached separately (`huggingface-cache` volume or `VOICEBOX_MODELS_DIR`); they are redownloadable and need no backup. Neither does a replica whose voices come from a seed directory and whose keys come from a mounted file (section 12): everything else it holds is disposable.
 
 ## 10. Transport and limits
 
@@ -101,3 +103,15 @@ Models are cached separately (`huggingface-cache` volume or `VOICEBOX_MODELS_DIR
 ## 11. Upgrading
 
 Pull the new image (or rebuild), then `docker compose up -d`. Schema migrations run at startup and are idempotent. Stop the old container gracefully first (see above) so in-flight generations finish, and take a backup before a major version.
+
+## 12. Voices as configuration
+
+A voice profile travels as a `.voicebox.zip` bundle: the Export button in the UI, `GET /profiles/{id}/export` and `python -m backend.voices export ./seed` all write the same file, and it now carries everything a preset, designed or cloned profile needs (voice type, preset voice, default engine, effects chain, personality, samples). Three ways to get voices onto a server:
+
+- **Seed at boot.** `VOICEBOX_SEED_PROFILES=/seed` imports every bundle in that directory when the server starts. A name that already exists is skipped, so restarts and rolling updates are idempotent; `GET /health/ready` answers `503` until the seed is applied and stays `503` when a bundle is invalid, which is how a broken catalog is caught during a rollout rather than by an application. `python -m backend.voices import ./seed --on-conflict replace` applies a changed bundle in place.
+- **Presets need nothing.** `POST /v1/audio/speech` accepts a built-in voice id directly (`af_heart`, `kokoro:af_heart`, `Ryan`), and `GET /v1/voices` lists them next to the profiles.
+- **Applications create their own.** `POST /v1/voices` (multipart `name`, `file`, optional `text` transcripts) clones a voice owned by the calling key; it is invisible to other client keys, `DELETE /v1/voices/{voice}` removes it, and the key's `max_voices` limit (default 50) caps the count. Admin keys see and may delete everything. Such voices live in one replica's database, so in a fleet they belong to that replica; catalog voices belong in the seed.
+
+## 13. More than one replica
+
+The speech and transcription routes keep no state between requests, so the way to grow is more identical containers behind the platform's load balancer. A replica needs three inputs: the seed directory above, the hashed keys file (`VOICEBOX_API_KEYS_JSON` pointing at a mounted secret; `VOICEBOX_API_KEY` for the admin key; `VOICEBOX_MEDIA_TOKEN_SECRET` when the browser UI is served through the balancer) and the models on disk (`VOICEBOX_BAKE_MODELS` at build time, or a shared volume filled by `python -m backend.preload` and `HF_HUB_OFFLINE=1`). Probe `/health/ready`, give the platform 90 s to stop a replica, target two concurrent requests per replica and set `VOICEBOX_MAX_QUEUE_DEPTH` a little above that. The [Scaling](/overview/scaling) page has the per-platform settings and `deploy/` in the repository the manifests; `docker-compose.fleet.yml` runs the smallest fleet locally and `scripts/fleet-check.sh` verifies any of them.

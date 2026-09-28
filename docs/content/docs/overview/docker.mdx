@@ -114,14 +114,21 @@ ports:
 | `VOICEBOX_PRELOAD_MODELS` | (unset) | Comma-separated model names (`python -m backend.preload --list`) to download and load at boot. `/health/ready` answers `503` until they are resident. |
 | `VOICEBOX_RETENTION_DAYS` | (unset) | Delete generations and captures older than this many days, daily. Unset keeps everything. |
 | `VOICEBOX_DRAIN_TIMEOUT_S` | `30` | How long a stop waits for queued generations before cancelling them. |
+| `VOICEBOX_SHUTDOWN_DELAY_S` | `0` | Seconds after `SIGTERM` during which `/health/ready` answers `503` but requests are still served, so a load balancer stops routing first. Raise `stop_grace_period` by the same amount. |
 | `VOICEBOX_DATA_DIR` | `/app/data` | Data directory (database, profiles, generated audio, keys). |
 | `LOG_LEVEL` / `VOICEBOX_LOG_LEVEL` | `info` | Log level of the application loggers (`debug`, `info`, `warning`, `error`). |
 | `VOICEBOX_LOG_FORMAT` | (plain) | `json` for one JSON object per log line with the request id and key id. |
 | `VOICEBOX_METRICS_PORT` | (unset) | Serve Prometheus metrics on this extra port without a key (the authenticated `GET /metrics` is always on). |
 | `VOICEBOX_GENERATION_WORKERS` | `1` | `2` runs a CPU engine and a GPU engine at the same time (separate lanes); jobs of one lane still run one at a time. Ignored on Apple Silicon. |
 | `VOICEBOX_MODEL_IDLE_UNLOAD_S` | (unset) | Unload models unused for this many seconds (minimum 30); preloaded models stay. |
+| `VOICEBOX_SEED_PROFILES` | (unset) | Directory of `.voicebox.zip` voice bundles imported at boot (skipped when the name exists); `/health/ready` waits for it. |
+| `VOICEBOX_API_KEYS_JSON` | `/app/data/api_keys.json` | Path of the hashed client-key file, for example a mounted secret shared by every replica. |
+| `VOICEBOX_MAX_QUEUE_DEPTH` | `32` | Jobs the queue holds before answering `429`/`503`; a few units above the load balancer's per-replica target in a fleet. |
+| `VOICEBOX_MEDIA_TOKEN_SECRET` | (per process) | Any string of 32+ characters; replicas sharing it verify each other's browser media tokens. |
+| `VOICEBOX_REQUIRE_GPU` | (unset) | `1` keeps `/health/ready` at `503` when no CUDA/ROCm device is visible. |
+| `HF_HUB_OFFLINE` | (unset) | `1` forbids model downloads at runtime (fleet replicas with baked or mounted models). |
 
-`VOICEBOX_API_KEY`, `VOICEBOX_DISABLE_DOCS`, `VOICEBOX_CORS_ORIGINS`, `VOICEBOX_PRELOAD_MODELS`, `VOICEBOX_RETENTION_DAYS` and `VOICEBOX_DRAIN_TIMEOUT_S` are forwarded from the shell you run `docker compose` in. Set the others under `environment:` in a `docker-compose.override.yml`. The [Deployment Checklist](/overview/deployment) explains how they fit together.
+Every `VOICEBOX_*` variable in the table (and `HF_HUB_OFFLINE`) is forwarded from the shell you run `docker compose` in when set. Set `VOICEBOX_LOG_LEVEL` and the rest under `environment:` in a `docker-compose.override.yml`. The [Deployment Checklist](/overview/deployment) explains how they fit together, and [Scaling](/overview/scaling) covers several replicas.
 
 ### Resource Limits
 
@@ -170,7 +177,8 @@ The default configuration runs on CPU. This works fine but generation will be sl
 
 - **Liveness**: `GET /health` answers without a key as soon as the port is open. The image's `HEALTHCHECK` uses it.
 - **Readiness**: `GET /health/ready` answers `200` once every model in `VOICEBOX_PRELOAD_MODELS` is resident and the queue worker runs, and `503` while loading, after a load failed, or once the server is draining. Point load balancers and orchestrators at it.
-- **Warm-up**: set `VOICEBOX_PRELOAD_MODELS=kokoro,whisper-turbo` (names from `python -m backend.preload --list`) so the first request does not wait for a multi-gigabyte download. To bake weights into an image or an init container, run `python -m backend.preload <names>` with the same model cache.
+- **Warm-up**: set `VOICEBOX_PRELOAD_MODELS=kokoro,whisper-turbo` (names from `python -m backend.preload --list`) so the first request does not wait for a multi-gigabyte download. To bake weights into the image, build with `--build-arg VOICEBOX_BAKE_MODELS=kokoro,whisper-turbo` (they land in `/models` and the entrypoint sets `VOICEBOX_MODELS_DIR` accordingly); for an init container or a shared volume, run `python -m backend.preload <names>` with the same model cache.
+- **Voices**: `VOICEBOX_SEED_PROFILES=/seed` imports every `.voicebox.zip` bundle in that directory at boot (exported from the UI or with `python -m backend.voices export`), so a fresh container starts with your catalog.
 - **Stop**: on `SIGTERM` the server finishes open streams (up to 40 s), then drains its queue: new jobs get `503` with `Retry-After`, running generations get `VOICEBOX_DRAIN_TIMEOUT_S` (default 30) to finish. The compose file's `stop_grace_period: 45s` covers both.
 
 ## Retention

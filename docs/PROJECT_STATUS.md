@@ -1,6 +1,6 @@
 # Voicebox Project Status & Roadmap
 
-> Last updated: 2026-07-02 | Current version: **v0.5.0** | 402 open issues | 88 open PRs | 1.3M downloads · 34.8k stars
+> Last updated: 2026-09-27 | Current version: **v0.5.0** | 402 open issues | 88 open PRs | 1.3M downloads · 34.8k stars
 
 ---
 
@@ -115,6 +115,18 @@ POST /generate
 **Other trust/security signals:** macOS malware-flag reports continue (#369); a DNS-rebinding / Host-header exposure on the local API+MCP server was reported with fixes attached (#778).
 
 ---
+
+### Server-ops track (2026-09-24 → 2026-09-27, on `main`)
+
+Headless deployments got everything an operator and an application developer need from one box, without touching the desktop flows:
+
+- **Security**: bearer keys on every route with `admin`/`client` roles, per-key rate limits, queue caps, media tokens, `python -m backend.keys` (`backend/auth/`).
+- **Deployable**: Docker on `python:3.12-slim` with a uv lock, `PYTORCH_VARIANT=cpu|cu*|rocm`, published `ghcr.io` images (`docker.yml`, CPU smoke test in CI), `/health/ready`, `VOICEBOX_PRELOAD_MODELS`, graceful drain on SIGTERM, retention, WAL SQLite, `VOICEBOX_DATA_DIR`.
+- **App-facing API**: OpenAI-compatible `/v1/audio/speech` (mp3/opus/aac/flac/wav/pcm, streamed), `/v1/audio/transcriptions`, `/v1/models`, `/v1/voices` with preset voices addressable by id and app-owned cloned voices (`POST`/`DELETE /v1/voices`, `owner_key_id`, `max_voices`).
+- **Observability and throughput**: `X-Request-Id`, JSON logs, Prometheus metrics (`/metrics`, `VOICEBOX_METRICS_PORT`), `scripts/load_test.py`, cpu/gpu queue lanes, idle unload.
+- **Fleet**: portable voice bundles (manifest 1.1, ids preserved) and boot-time seeding (`VOICEBOX_SEED_PROFILES`), `VOICEBOX_MEDIA_TOKEN_SECRET`, `VOICEBOX_REQUIRE_GPU`, `VOICEBOX_SHUTDOWN_DELAY_S` (scale-in without dropped requests), `VOICEBOX_BAKE_MODELS`, `docker-compose.fleet.yml`, `scripts/fleet-check.sh`, and recipes for Kubernetes, Cloud Run, Azure Container Apps and ECS under `deploy/` (`docs/overview/scaling.mdx`).
+
+Still open on this track: validation on a real NVIDIA host (the `cu128` image has only been built, not run), per-engine throughput and VRAM tables, same-engine concurrency (`ModelConfig.max_concurrency`, gated on those measurements), and the shared-state phase (Postgres, object storage, a shared queue) that would make `/generate` history and the admin UI work across replicas.
 
 ### What's Shipped (v0.5.0 — the Capture release)
 
@@ -238,7 +250,7 @@ Shipped 2026-04-25 (PR #544). Voicebox went from a voice-cloning studio to a ful
 | Platform support tiers | PR #465, issue #420 | Defining tier-1 (supported) vs tier-2 (community) platforms |
 | Engine sprawl cleanup | issue #419 | First-class vs experimental TTS backends distinction |
 | Frontend tech-debt burn-down | issue #421 | Biome + a11y debt before gating CI |
-| Docker registry auto-publish | PR #463, issue #453 | ghcr.io image on tag push |
+| Docker registry auto-publish | `docker.yml` | **Shipped**: `ghcr.io/<owner>/voicebox:{version,latest,main}-cpu` on `main` and tags, `-cu128` on tags (PR #463 / issue #453 superseded) |
 | New model research | `voicebox-new-models` branch | Evaluating Fish Speech, XTTS-v2, Pocket TTS, VibeVoice, Fish Audio S2, index-tts2. **2026-06-27 sweep** added dots.tts, LongCat-AudioDiT, SoproTTS, NeuTTS, Nemotron/Cohere STT — see Landscape → New Candidate Sweep |
 
 ### TTS Engine Comparison
@@ -559,7 +571,7 @@ Notable:
 | `EXTERNAL_PROVIDERS.md` | v0.2.0 | **Not started** | Remote server support |
 | `MLX_AUDIO.md` | — | **Shipped** | MLX backend is live |
 | `DOCKER_DEPLOYMENT.md` | v0.2.0 | **Shipped** (PR #161) | Docker + web deployment |
-| `OPENAI_SUPPORT.md` | v0.2.0 | **Not started** | OpenAI-compatible API layer |
+| `OPENAI_SUPPORT.md` | v0.2.0 | **Shipped** (`routes/openai_compat.py`, 2026-09) | Voices resolve by profile name/id and preset id rather than the plan's mapping; see `docs/overview/api-reference.mdx` |
 | `PR33_CUDA_PROVIDER_REVIEW.md` | — | **Reference** | Analysis of the original provider approach |
 
 ---
@@ -705,7 +717,7 @@ The two-month gap means the highest-leverage work isn't new code — it's review
 | 4 | **MCP dotted tool names** (#790) — breaks Claude Desktop; scrambled audio #780 | Flagship integration broken for some clients | Low–Medium |
 | 5 | **Blackwell / sm_120 diagnostic** — review PR #653; stale-binary re-download path | Largest GPU bug cluster | Medium |
 | 6 | **Drain the i18n batch** (#528, #571, #599–601, #569, #798–801, #802, #776) | ~12 finished PRs, large user segment | Low (review-bound) |
-| 7 | **Review the @neuron-tech-ai hardening batch** — start with #662, #657 (platform gating), #656 (OpenAI API), #654 (CI) | Security + perf + bottleneck #6 in one sweep | Medium (review-bound) |
+| 7 | **Review the @neuron-tech-ai hardening batch** — start with #662, #657 (platform gating); #656 (OpenAI API), #654 (CI) and the SQLite WAL change now overlap with the server-ops track on `main`, so review those as diffs against it | Security + perf + bottleneck #6 in one sweep | Medium (review-bound) |
 | 8 | **Remove 50k char limit** (#464) — merge PR #786; tune chunk boundaries | Long-standing regression | Low |
 | 9 | Housekeeping — dedupe MiniMax #331/#430, re-evaluate CosyVoice #777, close spam/empty issues (#805, #775) | Triage hygiene | Low |
 
@@ -718,7 +730,7 @@ The two-month gap means the highest-leverage work isn't new code — it's review
 | 3 | **#154** — Audiobook tab | Long-form users. Chunking + queue shipped. | Medium |
 | 4 | **UI i18n** (#411 PR offer, #392, #261) | Chinese UI + general localization | Medium |
 | 5 | **#225** — Custom HuggingFace models | User-supplied models. Needs rework. | High |
-| 6 | OpenAI-compatible API (plan doc exists) — see also #448 (API for non-Qwen) | Low effort once API is stable | Low |
+| 6 | ~~OpenAI-compatible API~~ — see also #448 (API for non-Qwen) | Shipped: `/v1/audio/*`, `/v1/models`, `/v1/voices` (server-ops track) | Done |
 | 7 | LoRA fine-tuning (PR #195) | Complex, needs rework for multi-engine | Very High |
 | 8 | ~~Streaming for non-MLX engines~~ | Shipped: sentence-level streaming for all engines via `/generate/stream`; sub-sentence streaming needs upstream engine APIs | Done |
 | 9 | Voice-to-voice / RVC (#407, #347) | New modality — different arch shape | High |
