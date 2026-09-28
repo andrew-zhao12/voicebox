@@ -253,7 +253,7 @@
     "/profiles": {
       "get": {
         "summary": "List Profiles",
-        "description": "List all voice profiles.",
+        "description": "List voice profiles (client keys see shared profiles and their own).",
         "operationId": "list_profiles_profiles_get",
         "responses": {
           "200": {
@@ -313,17 +313,32 @@
     "/profiles/import": {
       "post": {
         "summary": "Import Profile",
-        "description": "Import a voice profile from a ZIP archive.",
+        "description": "Import a voice profile bundle (``.voicebox.zip``).",
         "operationId": "import_profile_profiles_import_post",
+        "parameters": [
+          {
+            "name": "on_conflict",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(rename|skip|replace)$",
+              "description": "When a profile with the bundle's name exists: rename the import, skip it, or replace the profile.",
+              "default": "rename",
+              "title": "On Conflict"
+            },
+            "description": "When a profile with the bundle's name exists: rename the import, skip it, or replace the profile."
+          }
+        ],
         "requestBody": {
+          "required": true,
           "content": {
             "multipart/form-data": {
               "schema": {
                 "$ref": "#/components/schemas/Body_import_profile_profiles_import_post"
               }
             }
-          },
-          "required": true
+          }
         },
         "responses": {
           "200": {
@@ -4531,6 +4546,23 @@
         }
       }
     },
+    "/metrics": {
+      "get": {
+        "summary": "Prometheus Metrics",
+        "description": "Prometheus exposition of the server's counters (admin key; see VOICEBOX_METRICS_PORT for scrapers).",
+        "operationId": "prometheus_metrics_metrics_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/maintenance/prune": {
       "post": {
         "summary": "Prune Now",
@@ -4583,7 +4615,7 @@
           "OpenAI compatible"
         ],
         "summary": "Create Speech",
-        "description": "Synthesize ``input`` in ``voice`` and stream it as ``response_format``.\n\n``voice`` is a Voicebox profile name or id (OpenAI's stock names select the\nconfigured default voice); ``model`` is ``tts-1`` for the profile's default\nengine, or a model or engine name from ``GET /v1/models``.  ``wav`` and\n``pcm`` stream chunk by chunk; the compressed formats stream when ffmpeg is\ninstalled and are otherwise sent once the clip is complete.",
+        "description": "Synthesize ``input`` in ``voice`` and stream it as ``response_format``.\n\n``voice`` is a profile name or id, a built-in preset voice id, or one of\nOpenAI's stock names (the configured default voice); ``model`` is\n``tts-1`` for the voice's default engine, or a model or engine name from\n``GET /v1/models``.  ``wav`` and ``pcm`` stream chunk by chunk; the\ncompressed formats stream when ffmpeg is installed and are otherwise\nsent once the clip is complete.",
         "operationId": "create_speech_v1_audio_speech_post",
         "requestBody": {
           "content": {
@@ -4683,7 +4715,7 @@
           "OpenAI compatible"
         ],
         "summary": "List Voices",
-        "description": "Voice profiles by name, for the ``voice`` field of ``/v1/audio/speech``.",
+        "description": "Everything ``voice`` accepts: the caller's visible profiles (``kind: profile``) and the built-in presets.",
         "operationId": "list_voices_v1_voices_get",
         "responses": {
           "200": {
@@ -4691,6 +4723,85 @@
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "OpenAI compatible"
+        ],
+        "summary": "Create Voice",
+        "description": "Create a cloned voice owned by the calling key from one or more reference recordings.\n\nThe voice is private to the key that created it (admins see everything);\n``max_voices`` in the key's limits caps how many a key may hold.",
+        "operationId": "create_voice_v1_voices_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_create_voice_v1_voices_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/voices/{voice}": {
+      "delete": {
+        "tags": [
+          "OpenAI compatible"
+        ],
+        "summary": "Delete Voice",
+        "description": "Delete a voice this key created (admins may delete any profile); built-in presets cannot be deleted.",
+        "operationId": "delete_voice_v1_voices__voice__delete",
+        "parameters": [
+          {
+            "name": "voice",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Voice"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
               }
             }
           }
@@ -4873,7 +4984,7 @@
               }
             ],
             "title": "Limits",
-            "description": "Per-minute overrides: requests, inference, uploads_bytes, tts_chars, max_pending_jobs (null = unlimited)."
+            "description": "Overrides: requests, inference, uploads_bytes, tts_chars (per minute), max_pending_jobs, max_voices (counts); null = unlimited."
           }
         },
         "type": "object",
@@ -5274,6 +5385,69 @@
           "file"
         ],
         "title": "Body_create_transcription_v1_audio_transcriptions_post"
+      },
+      "Body_create_voice_v1_voices_post": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Name"
+          },
+          "file": {
+            "items": {
+              "type": "string",
+              "contentMediaType": "application/octet-stream"
+            },
+            "type": "array",
+            "title": "File",
+            "description": "1-10 reference recordings, 2-30 s each"
+          },
+          "text": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Text",
+            "description": "transcript per file, in order; missing ones are transcribed with Whisper",
+            "default": []
+          },
+          "language": {
+            "type": "string",
+            "title": "Language",
+            "default": "en"
+          },
+          "engine": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine",
+            "description": "default cloning engine (qwen, luxtts, chatterbox, chatterbox_turbo, tada)"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 500
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "file"
+        ],
+        "title": "Body_create_voice_v1_voices_post"
       },
       "Body_import_audio_generate_import_post": {
         "properties": {
@@ -8581,6 +8755,17 @@
               }
             ],
             "title": "Personality"
+          },
+          "owner_key_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Key Id"
           },
           "generation_count": {
             "type": "integer",

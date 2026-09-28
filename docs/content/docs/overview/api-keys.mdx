@@ -241,13 +241,14 @@ Limits are token buckets per key, refilled continuously (a limit of 300 per minu
 | Upload bytes per minute | 2 GiB | 256 MiB | Request bodies, from `Content-Length` or counted as they arrive |
 | TTS characters per minute | 600,000 | 60,000 | The `text` of each `/generate`, `/generate/stream` and `/speak` call |
 | Pending queued jobs | unlimited | 4 | Generations waiting in or running through the queue at once |
+| Voices per key | unlimited | 50 | Cloned voices the key created through `POST /v1/voices` (a count, not a rate) |
 | Global queue depth | 32 | 32 | Whole server, all keys together; `VOICEBOX_MAX_QUEUE_DEPTH` |
 | Failed authentications per minute | 30 per IP | 30 per IP | Bad keys and `403`s; a valid key keeps working regardless |
 | Anonymous requests per minute | 300 per IP | 300 per IP | The public endpoints above |
 
 Every limited response carries `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset`; a rejected request gets `429` with `Retry-After`. A full queue also answers `429`.
 
-Per-key overrides live in the `limits` object of each entry in `api_keys.json`, which is what the `--limit` flags of `backend.keys create` and the `limits` field of `POST /auth/keys` write. The fields are `requests`, `inference`, `uploads_bytes`, `tts_chars` and `max_pending_jobs`; `null` means unlimited.
+Per-key overrides live in the `limits` object of each entry in `api_keys.json`, which is what the `--limit` flags of `backend.keys create` and the `limits` field of `POST /auth/keys` write. The fields are `requests`, `inference`, `uploads_bytes`, `tts_chars`, `max_pending_jobs` and `max_voices`; `null` means unlimited.
 
 ```json
 {
@@ -266,8 +267,8 @@ Bodies above the cap are rejected with `413`:
 | Route | Cap |
 |-------|-----|
 | JSON routes | 2 MiB |
-| `/transcribe`, `/captures` | 200 MiB |
-| `/profiles/import` | 100 MiB |
+| `/transcribe`, `/captures`, `/v1/audio/transcriptions` | 200 MiB |
+| `/profiles/import`, `/v1/voices` | 100 MiB |
 | `/profiles/{id}/samples`, `/history/import` | 50 MiB |
 | `/profiles/{id}/avatar` | 10 MiB |
 | `/mcp` (base64 audio for `voicebox.transcribe`) | 64 MiB |

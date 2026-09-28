@@ -23,14 +23,14 @@ Every request carries `Authorization: Bearer <key>`. Give each application its o
 
 | Field | Meaning |
 |-------|---------|
-| `voice` | A voice profile **name or id** (see `GET /v1/voices`). OpenAI's stock names (`alloy`, `nova`, ...) select the configured default voice: the per-client binding, else the default playback voice from Settings → MCP. |
-| `model` | `tts-1`, `tts-1-hd` or `gpt-4o-mini-tts` use the profile's default engine. Otherwise a model or engine name from `GET /v1/models`: `kokoro`, `qwen-tts-1.7B`, `qwen-tts-0.6B`, `chatterbox-turbo`, `luxtts`, `tada-1b`, ... |
+| `voice` | Resolved in this order: a voice profile **id**, a profile **name**, a built-in **preset voice id** (`af_heart`, `Ryan`, or qualified as `kokoro:af_heart`), then OpenAI's stock names (`alloy`, `nova`, ...), which select the configured default voice (the per-client binding, else the default playback voice from Settings → MCP). `GET /v1/voices` lists every value. Voices another client key created are not visible. |
+| `model` | `tts-1`, `tts-1-hd` or `gpt-4o-mini-tts` use the voice's default engine. Otherwise a model or engine name from `GET /v1/models`: `kokoro`, `qwen-tts-1.7B`, `qwen-tts-0.6B`, `chatterbox-turbo`, `luxtts`, `tada-1b`, ... A preset voice only works with its own engine. |
 | `response_format` | `mp3` (default), `opus`, `aac`, `flac`, `wav`, `pcm` (signed 16-bit little-endian mono). |
 | `instructions` | Style hint, passed as the engine's `instruct` where the engine supports it (Qwen CustomVoice). |
 | `language` | Voicebox extension: language code of the input. Defaults to the profile's language. |
 | `speed` | Only `1.0` is accepted. |
 
-The response is always chunked. `wav` and `pcm` leave the server sentence by sentence as synthesis proceeds; the compressed formats stream too when ffmpeg is installed (it is in the Docker image) and are otherwise sent once the clip is complete. `X-Voicebox-Sample-Rate` carries the engine's sample rate (24 kHz for most engines, 48 kHz for LuxTTS) and `X-Voicebox-Engine` the engine used. Nothing is written to the generation history.
+The response is always chunked. `wav` and `pcm` leave the server sentence by sentence as synthesis proceeds; the compressed formats stream too when ffmpeg is installed (it is in the Docker image) and are otherwise sent once the clip is complete. `X-Voicebox-Sample-Rate` carries the engine's sample rate (24 kHz for most engines, 48 kHz for LuxTTS), `X-Voicebox-Engine` the engine used and `X-Voicebox-Voice` the resolved voice (a profile id, or `engine:voice_id` for a preset). Nothing is written to the generation history.
 
 **Python (OpenAI SDK)**
 
@@ -89,7 +89,46 @@ print(result.text)
 
 ## Discovery: `GET /v1/models` and `GET /v1/voices`
 
-`/v1/models` lists every TTS and STT model with `engine`, `kind` (`tts`/`stt`), `languages`, `supports_instruct`, `downloaded` and `loaded`, plus a top-level `formats` array with the `response_format` values this server can produce. `/v1/voices` lists the voice profiles with their `id`, `name`, `language`, `voice_type` and `engine`.
+`/v1/models` lists every TTS and STT model with `engine`, `kind` (`tts`/`stt`), `languages`, `supports_instruct`, `downloaded` and `loaded`, plus a top-level `formats` array with the `response_format` values this server can produce.
+
+`/v1/voices` lists everything the `voice` field accepts: the profiles visible to the caller (`kind: "profile"`, with `id`, `name`, `language`, `voice_type`, `engine`, `owner` and `shared`) followed by the built-in preset voices (`kind: "preset"`, with the preset id as `id`, plus `engine`, `language` and `gender`).
+
+## Voices: `POST /v1/voices` and `DELETE /v1/voices/{voice}`
+
+An application can clone voices of its own without the admin UI. `POST /v1/voices` is a multipart form:
+
+| Field | Meaning |
+|-------|---------|
+| `name` | Unique profile name (1–100 characters); also usable as the `voice` value. |
+| `file` | One to ten reference recordings (wav, mp3, m4a, ogg, flac, aac, webm, opus), 2–30 seconds each, 50 MB per file, 100 MB per request. |
+| `text` | Optional transcript per file, in order. Files without one are transcribed with Whisper (the model must be downloaded; otherwise `409`). |
+| `language` | Language code, default `en`. |
+| `engine` | Default cloning engine (`qwen`, `luxtts`, `chatterbox`, `chatterbox_turbo`, `tada`); `qwen` when omitted. |
+| `description` | Free text. |
+
+The response (`201`) is the voice entry as `GET /v1/voices` lists it. A voice created this way belongs to the key that created it: other client keys neither see nor use it, admin keys see everything. Each key may hold `max_voices` of them (default 50, adjustable per key). `DELETE /v1/voices/{voice}` (id or name) removes a voice the key owns and answers `{"id": ..., "deleted": true}`; shared voices created by an admin answer `403`, presets `404`.
+
+```bash
+curl https://voice.example.com/v1/voices \
+  -H "Authorization: Bearer $VOICEBOX_API_KEY" \
+  -F name="Support Bot" -F engine=qwen \
+  -F file=@sample1.wav -F text="First sentence of the first sample." \
+  -F file=@sample2.wav
+```
+
+```python
+import httpx
+
+with open("sample1.wav", "rb") as sample:
+    voice = httpx.post(
+        "https://voice.example.com/v1/voices",
+        headers={"Authorization": "Bearer vbx_..."},
+        data={"name": "Support Bot", "engine": "qwen", "text": "First sentence of the sample."},
+        files={"file": sample},
+        timeout=120,
+    ).json()
+# then: client.audio.speech.create(model="tts-1", voice=voice["name"], input=...)
+```
 
 ## Errors
 
@@ -103,9 +142,10 @@ Under `/v1`, errors use OpenAI's envelope, so SDK exceptions carry the message:
 |--------|--------|------|
 | 400 | `invalid_request_error` | Bad body (`invalid_value`), unsupported `speed` or `response_format`, engine and profile mismatch |
 | 401 | `authentication_error` | Missing or invalid key |
-| 403 | `permission_error` | A client key on an admin route |
+| 403 | `permission_error` | A client key on an admin route; `voice_not_owned` (deleting a shared voice), `voice_limit_reached` |
 | 404 | `invalid_request_error` | `voice_not_found`, `model_not_found` |
-| 409 | `invalid_request_error` | The model is not downloaded (client keys) |
+| 409 | `invalid_request_error` | The model is not downloaded (client keys); `voice_exists` |
+| 413 | `invalid_request_error` | A sample or request body above its cap |
 | 429 | `rate_limit_error` | Per-key limits or a full queue; honour `Retry-After` |
 | 503 | `server_error` | The server is draining before a restart; retry after `Retry-After` |
 
@@ -119,7 +159,7 @@ Responses also carry `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Res
 | `POST /generate` then `GET /generate/{id}/status` | Queue a generation that is saved to history; progress over SSE, audio at `GET /audio/{id}`. |
 | `POST /speak` | Speak through the profile bound to an `X-Voicebox-Client-Id` (agents). |
 | `POST /transcribe` | Transcription with `{"text", "duration"}`. |
-| `GET /profiles`, `GET /profiles/{id}` | Voice profiles (client keys read only). |
+| `GET /profiles`, `GET /profiles/{id}` | Voice profiles (client keys see shared ones and their own). |
 | `GET /health/ready` | Readiness probe, no key needed. |
 
-Creating and editing profiles, uploading samples and managing models are admin operations: do them in the UI, or with the admin key against the routes in `/docs`.
+Editing profiles, uploading samples to shared voices and managing models are admin operations: do them in the UI, or with the admin key against the routes in `/docs`. Applications clone their own voices through `POST /v1/voices` above.
