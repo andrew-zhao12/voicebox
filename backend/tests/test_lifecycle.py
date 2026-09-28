@@ -110,6 +110,27 @@ def test_readiness_follows_preloads_worker_and_drain():
     assert body["draining"]
 
 
+def test_readiness_waits_for_startup_steps():
+    lifecycle.reset()
+    lifecycle.step_begin("seed_profiles", "importing")
+    ready, body = lifecycle.readiness(True)
+    assert not ready
+    assert body["startup"]["pending"] == {"seed_profiles": "importing"}
+
+    lifecycle.step_failed("seed_profiles", "bad bundle")
+    ready, body = lifecycle.readiness(True)
+    assert not ready
+    assert body["startup"]["failed"] == ["seed_profiles"]
+    assert "bad bundle" not in str(body)  # the body is public
+
+    lifecycle.step_done("seed_profiles")
+    ready, body = lifecycle.readiness(True)
+    assert ready
+    assert body["startup"] == {"done": ["seed_profiles"], "pending": {}, "failed": []}
+    lifecycle.reset()
+    assert lifecycle.readiness(True)[1]["startup"]["done"] == []
+
+
 def test_readiness_route_is_public_and_reflects_draining(tmp_path):
     app, _runtime = build_test_app(tmp_path)
     with TestClient(app) as client:
@@ -125,6 +146,7 @@ def test_readiness_route_is_public_and_reflects_draining(tmp_path):
             "draining": True,
             "worker": True,
             "models": {"ready": [], "pending": {}, "failed": []},
+            "startup": {"done": [], "pending": {}, "failed": []},
         }
 
 

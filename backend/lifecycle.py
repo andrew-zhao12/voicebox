@@ -10,9 +10,10 @@ the handlers uvicorn installed) or when the lifespan exits.  While draining,
 jobs and the SSE loops end, so uvicorn's graceful shutdown finishes quickly
 and the lifespan exit can wait for the jobs that are already running.
 
-Readiness tracks the models named in ``VOICEBOX_PRELOAD_MODELS``: the server
-is ready once every one of them is resident, the queue worker is alive and
-no drain has started.
+Readiness tracks the models named in ``VOICEBOX_PRELOAD_MODELS`` and the
+startup steps registered with ``step_begin`` (the voice seed, the GPU check):
+the server is ready once every model is resident, every step finished, the
+queue worker is alive and no drain has started.
 """
 
 from __future__ import annotations
@@ -37,6 +38,11 @@ _hooked_signals: dict[int, tuple[Callable, Callable]] = {}
 _preload_pending: dict[str, str] = {}
 _preload_failed: dict[str, str] = {}
 _preload_ready: list[str] = []
+
+# Startup steps other than model loads (seeded voices, the GPU check).
+_step_pending: dict[str, str] = {}
+_step_failed: dict[str, str] = {}
+_step_done: list[str] = []
 
 
 def drain_timeout_s(environ: Mapping[str, str] = os.environ) -> float:
@@ -153,13 +159,44 @@ def preload_state() -> dict:
     }
 
 
+def step_begin(name: str, phase: str = "running") -> None:
+    """Register a startup step that must finish before the server reports ready."""
+    _step_failed.pop(name, None)
+    if name in _step_done:
+        _step_done.remove(name)
+    _step_pending[name] = phase
+
+
+def step_done(name: str) -> None:
+    _step_pending.pop(name, None)
+    _step_failed.pop(name, None)
+    if name not in _step_done:
+        _step_done.append(name)
+
+
+def step_failed(name: str, error: str) -> None:
+    _step_pending.pop(name, None)
+    _step_failed[name] = error
+
+
+def steps_state() -> dict:
+    return {"done": list(_step_done), "pending": dict(_step_pending), "failed": dict(_step_failed)}
+
+
 def readiness(worker_alive: bool) -> tuple[bool, dict]:
     """``(ready, body)`` for ``GET /health/ready``.
 
-    The body is public, so failed preloads are listed by name only; the
-    error text is in the server log.
+    The body is public, so failed preloads and steps are listed by name
+    only; the error text is in the server log.
     """
-    ready = worker_alive and not _draining and not _preload_pending and not _preload_failed
+    ready = (
+        worker_alive
+        and not _draining
+        and not _preload_pending
+        and not _preload_failed
+        and not _step_pending
+        and not _step_failed
+    )
     body = {
         "ready": ready,
         "draining": _draining,
@@ -168,6 +205,11 @@ def readiness(worker_alive: bool) -> tuple[bool, dict]:
             "ready": list(_preload_ready),
             "pending": dict(_preload_pending),
             "failed": sorted(_preload_failed),
+        },
+        "startup": {
+            "done": list(_step_done),
+            "pending": dict(_step_pending),
+            "failed": sorted(_step_failed),
         },
     }
     return ready, body
@@ -182,3 +224,6 @@ def reset() -> None:
     _preload_pending.clear()
     _preload_failed.clear()
     _preload_ready.clear()
+    _step_pending.clear()
+    _step_failed.clear()
+    _step_done.clear()

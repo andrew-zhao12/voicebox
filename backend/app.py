@@ -120,7 +120,7 @@ from .auth.settings import SecuritySettings
 from .database import get_db
 from .observability import logs as observability_logs, metrics
 from .routes import register_routers
-from .services import idle_unload, llm, preload, retention, task_queue, transcribe, tts
+from .services import idle_unload, llm, preload, retention, seed_profiles, task_queue, transcribe, tts
 from .services.task_queue import create_background_task, init_queue
 from .utils.http import safe_content_disposition  # noqa: F401 -- re-export; routes import utils.http directly
 from .utils.platform_detect import get_backend_type
@@ -365,6 +365,12 @@ async def _run_startup(application: FastAPI) -> None:
         logger.info("Model cache: %s", cache_dir)
     except Exception as e:
         logger.warning("Could not create HuggingFace cache directory: %s", e)
+
+    seed_dir = seed_profiles.configured_dir()
+    if seed_dir is not None:
+        logger.info("Seeding voice profiles from %s", seed_dir)
+        lifecycle.step_begin(seed_profiles.STEP_NAME, "importing")
+        create_background_task(seed_profiles.run(seed_dir))
 
     preload_names = preload.configured_models()
     if preload_names:

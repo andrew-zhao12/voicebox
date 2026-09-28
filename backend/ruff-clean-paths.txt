@@ -12,10 +12,12 @@ backend/preload.py
 backend/routes/maintenance.py
 backend/routes/openai_compat.py
 backend/routes/transcription.py
+backend/services/export_import.py
 backend/services/idle_unload.py
 backend/services/inference_slots.py
 backend/services/preload.py
 backend/services/retention.py
+backend/services/seed_profiles.py
 backend/services/task_queue.py
 backend/tests/security_testapp.py
 backend/tests/test_auth_keystore.py
@@ -25,6 +27,7 @@ backend/tests/test_auth_tokens.py
 backend/tests/test_chunked_tts_stream.py
 backend/tests/test_cors.py
 backend/tests/test_encode.py
+backend/tests/test_export_import.py
 backend/tests/test_idle_unload.py
 backend/tests/test_inference_slots.py
 backend/tests/test_keys_cli.py
@@ -35,6 +38,7 @@ backend/tests/test_preload.py
 backend/tests/test_ratelimit.py
 backend/tests/test_retention.py
 backend/tests/test_route_classification.py
+backend/tests/test_seed_profiles.py
 backend/tests/test_stream_route.py
 backend/tests/test_task_queue_cancellation.py
 backend/tests/test_task_queue_caps.py
@@ -44,3 +48,4 @@ backend/utils/chunked_tts.py
 backend/utils/encode.py
 backend/utils/http.py
 backend/utils/wav_stream.py
+backend/voices.py

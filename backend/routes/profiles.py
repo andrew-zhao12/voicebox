@@ -7,7 +7,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -46,9 +46,14 @@ async def list_profiles(db: Session = Depends(get_db)):
 @router.post("/profiles/import", response_model=models.VoiceProfileResponse)
 async def import_profile(
     file: UploadFile = File(...),
+    on_conflict: str = Query(
+        "rename",
+        pattern="^(rename|skip|replace)$",
+        description="When a profile with the bundle's name exists: rename the import, skip it, or replace the profile.",
+    ),
     db: Session = Depends(get_db),
 ):
-    """Import a voice profile from a ZIP archive."""
+    """Import a voice profile bundle (``.voicebox.zip``)."""
     MAX_FILE_SIZE = 100 * 1024 * 1024
 
     content = await file.read()
@@ -59,8 +64,8 @@ async def import_profile(
         )
 
     try:
-        profile = await export_import.import_profile_from_zip(content, db)
-        return profile
+        result = await export_import.import_profile_bundle(content, db, on_conflict=on_conflict)
+        return result.profile
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
