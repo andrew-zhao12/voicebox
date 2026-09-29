@@ -115,28 +115,11 @@ The desktop app can be the server for other devices. In **Settings → General**
 
 ## Cloud Deployment
 
-### AWS EC2
+On any rented GPU machine (EC2, Vast.ai, RunPod, a bare host), run the Docker image rather than a checkout: [Docker Deployment](/overview/docker) covers the CUDA and ROCm variants and the TLS overlay, the [Deployment Checklist](/overview/deployment) the probes, warm-up, drain and retention settings, and [Scaling](/overview/scaling) the managed platforms (Kubernetes, Cloud Run, Azure Container Apps, ECS) with ready-made manifests under `deploy/` in the repository.
 
 ```bash
-# Launch a GPU instance (e.g., g4dn.xlarge)
-# Install dependencies
-# Export VOICEBOX_API_KEY, then start the server with --host 0.0.0.0
-```
-
-### Vast.ai
-
-```bash
-# Rent a GPU instance
-# SSH in and clone repo
-# Export VOICEBOX_API_KEY, then start the server
-```
-
-### RunPod
-
-```bash
-# Deploy a pod with CUDA support
-# Install Voicebox backend
-# Export VOICEBOX_API_KEY, expose port 17493
+export VOICEBOX_API_KEY="$(openssl rand -base64 32)" VOICEBOX_PRELOAD_MODELS=kokoro,qwen-tts-1.7B
+docker compose -f docker-compose.yml -f docker-compose.cuda.yml up -d
 ```
 
 ## Security Considerations
@@ -169,18 +152,13 @@ voice.example.com {
 
 ## Performance
 
-Expected performance on various GPUs:
+Throughput depends on the engine far more than on the GPU: Kokoro on an Apple M-series CPU streams the first audio after about a second and produces roughly six seconds of speech per wall second per request, while the Qwen3-TTS and Chatterbox engines want a GPU with at least 8 GB of VRAM (16 GB for the 1.7B Qwen model next to Whisper). Measure your own server before choosing rate limits and replica sizes:
 
-| GPU | Generation Speed |
-|-----|------------------|
-| RTX 4090 | ~2-3s per 10 words |
-| RTX 3090 | ~3-4s per 10 words |
-| RTX 3060 | ~5-7s per 10 words |
-| CPU (12-core) | ~20-30s per 10 words |
+```bash
+scripts/load_test.py --url https://voice.example.com --key "$CLIENT_KEY" --voice af_heart --model kokoro --concurrency 4 --requests 20
+```
 
-<Callout type="info">
-  A GPU with 8GB+ VRAM is recommended for best performance.
-</Callout>
+The script streams through `/v1/audio/speech` and prints time to first byte, total time, realtime factor and the number of `429`s; run it once per engine you plan to serve.
 
 ## Troubleshooting
 
