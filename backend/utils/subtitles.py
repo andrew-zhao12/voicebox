@@ -8,6 +8,7 @@ with transformers) and the routes render it.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 
@@ -40,6 +41,19 @@ def _clean(text: str) -> str:
     return " ".join(text.split())
 
 
+def _finite(value, default: float = 0.0) -> float:
+    """``value`` as a finite float; ``None``, junk, NaN and infinities become *default*.
+
+    MLX Whisper reports ``nan`` scores for some segments, and ``JSONResponse``
+    refuses NaN, so every score goes through here.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
 def segments_from_dicts(items: Iterable[Mapping], *, duration: float | None = None) -> tuple[TranscriptSegment, ...]:
     """Segments from openai-whisper-shaped dictionaries (``start``, ``end``, ``text``, ...), as MLX Whisper returns.
 
@@ -55,13 +69,13 @@ def segments_from_dicts(items: Iterable[Mapping], *, duration: float | None = No
         text = _clean(str(item.get("text", "")))
         if not text or not any(ch.isalnum() for ch in text):
             continue
-        if float(item.get("no_speech_prob") or 0.0) > 0.6 and float(item.get("avg_logprob") or 0.0) < -1.0:
+        if _finite(item.get("no_speech_prob")) > 0.6 and _finite(item.get("avg_logprob")) < -1.0:
             continue
-        start = float(item.get("start") or 0.0)
+        start = _finite(item.get("start"))
         if duration is not None and start >= duration:
             continue
         end_raw = item.get("end")
-        end = float(end_raw) if end_raw is not None else (duration if duration is not None else start)
+        end = _finite(end_raw, default=start) if end_raw is not None else (duration if duration is not None else start)
         if duration is not None:
             end = min(end, duration)
         tokens = item.get("tokens") or ()
@@ -73,10 +87,10 @@ def segments_from_dicts(items: Iterable[Mapping], *, duration: float | None = No
                 text=text,
                 tokens=tuple(int(t) for t in tokens),
                 seek=int(item.get("seek") or 0),
-                temperature=float(item.get("temperature") or 0.0),
-                avg_logprob=float(item.get("avg_logprob") or 0.0),
-                compression_ratio=float(item.get("compression_ratio") or 0.0),
-                no_speech_prob=float(item.get("no_speech_prob") or 0.0),
+                temperature=_finite(item.get("temperature")),
+                avg_logprob=_finite(item.get("avg_logprob")),
+                compression_ratio=_finite(item.get("compression_ratio")),
+                no_speech_prob=_finite(item.get("no_speech_prob")),
             )
         )
     return tuple(segments)
@@ -138,14 +152,19 @@ def to_verbose_json(transcript: Transcript, *, task: str = "transcribe") -> dict
     return {
         "task": task,
         "language": transcript.language or "unknown",
-        "duration": round(float(transcript.duration), 3),
+        "duration": round(_finite(transcript.duration), 3),
         "text": transcript.text,
         "segments": [
             {
                 **asdict(segment),
                 "tokens": list(segment.tokens),
-                "start": round(segment.start, 3),
-                "end": round(segment.end, 3),
+                "start": round(_finite(segment.start), 3),
+                "end": round(_finite(segment.end), 3),
+                # A backend may hand over NaN scores; JSON (and JSONResponse) refuse them.
+                "temperature": _finite(segment.temperature),
+                "avg_logprob": _finite(segment.avg_logprob),
+                "compression_ratio": _finite(segment.compression_ratio),
+                "no_speech_prob": _finite(segment.no_speech_prob),
             }
             for segment in transcript.segments
         ],

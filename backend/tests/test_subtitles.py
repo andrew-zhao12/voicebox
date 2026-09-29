@@ -1,5 +1,7 @@
 """Transcript segments and their SRT, WebVTT and verbose_json renderings (torch-free)."""
 
+import json
+
 from backend.utils import subtitles
 from backend.utils.subtitles import Transcript, TranscriptSegment
 
@@ -94,3 +96,35 @@ def test_padding_hallucinations_are_dropped_and_ends_clamped():
     assert [s.text for s in segments] == ["The quick brown fox.", "Then it runs home.", "quiet but real"]
     assert segments[1].end == 5.1
     assert subtitles.text_of(segments) == "The quick brown fox. Then it runs home. quiet but real"
+
+
+def test_non_finite_scores_become_neutral_defaults_and_serialize():
+    nan, inf = float("nan"), float("inf")
+    segments = subtitles.segments_from_dicts(
+        [
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "text": "Fine.",
+                "avg_logprob": nan,
+                "no_speech_prob": inf,
+                "compression_ratio": None,
+            },
+            {"start": nan, "end": nan, "text": "Odd timestamps.", "temperature": "x"},
+        ],
+        duration=3.0,
+    )
+    assert (segments[0].avg_logprob, segments[0].no_speech_prob, segments[0].compression_ratio) == (0.0, 0.0, 0.0)
+    assert (segments[1].start, segments[1].end, segments[1].temperature) == (0.0, 0.0, 0.0)
+    transcript = Transcript(
+        text="Fine.",
+        segments=(TranscriptSegment(id=0, start=0.0, end=1.0, text="Fine.", avg_logprob=nan, no_speech_prob=nan),),
+        duration=nan,
+    )
+    verbose = subtitles.to_verbose_json(transcript)
+    assert (verbose["duration"], verbose["segments"][0]["avg_logprob"], verbose["segments"][0]["no_speech_prob"]) == (
+        0.0,
+        0.0,
+        0.0,
+    )
+    json.dumps(verbose, allow_nan=False)  # what JSONResponse does; NaN would raise
