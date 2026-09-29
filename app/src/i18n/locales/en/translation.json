@@ -396,6 +396,8 @@
     "card": {
       "noDescription": "No description",
       "designed": "designed",
+      "owner": "key: {{key}}",
+      "ownerTooltip": "Created through the API by the key \"{{key}}\". Only that key and admin keys can see or use this voice.",
       "export": "Export profile",
       "edit": "Edit profile",
       "delete": "Delete profile",

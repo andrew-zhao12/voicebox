@@ -123,6 +123,15 @@ export function ProfileCard({ profile, disabled }: ProfileCardProps) {
                 {t('profiles.card.designed')}
               </Badge>
             )}
+            {profile.owner_key_id && (
+              <Badge
+                variant="outline"
+                className="text-xs h-5 px-1.5 text-muted-foreground"
+                title={t('profiles.card.ownerTooltip', { key: profile.owner_key_id })}
+              >
+                {t('profiles.card.owner', { key: profile.owner_key_id })}
+              </Badge>
+            )}
             {profile.effects_chain && profile.effects_chain.length > 0 && (
               <Sparkles className="h-3.5 w-3.5 text-accent fill-accent" />
             )}

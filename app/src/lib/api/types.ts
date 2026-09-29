@@ -29,6 +29,8 @@ export interface VoiceProfileResponse {
   design_prompt?: string;
   default_engine?: string;
   personality?: string | null;
+  /** API key that created the voice through `POST /v1/voices`; absent or null = shared (admin-created). */
+  owner_key_id?: string | null;
   generation_count: number;
   sample_count: number;
   created_at: string;
