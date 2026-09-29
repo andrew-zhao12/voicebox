@@ -7,9 +7,11 @@ One container on one host (the [Deployment Checklist](/overview/deployment)) ser
 
 ## What scales, and what does not
 
-`POST /v1/audio/speech`, `POST /v1/audio/transcriptions`, `POST /generate/stream`, `POST /speak` and the MCP `speak` and `transcribe` tools write nothing a later request needs: the audio streams back in the response and no history row is created. A replica that has the same **voices**, the same **keys** and the same **models** as the others answers those calls identically, so any number of them can sit behind one address.
+`POST /v1/audio/speech`, `POST /v1/audio/transcriptions`, `POST /generate/stream` and the MCP `transcribe` tool write nothing a later request needs: the audio or text comes back in the response and no history row is created. A replica that has the same **voices**, the same **keys** and the same **models** as the others answers those calls identically, so any number of them can sit behind one address. MCP itself needs `VOICEBOX_MCP_STATELESS=1` in a fleet, so that every tool call is a self-contained request instead of part of a session pinned to one replica.
 
-`POST /generate` with `GET /generate/{id}/status` and `GET /audio/{id}`, the history, stories and the admin UI read state in one replica's SQLite. Keep those on a single replica (a separate one-replica service with the same image, or session affinity) or on the desktop app. Sharing that state across replicas (Postgres, object storage, a shared queue) is a later phase that only pays off once the stateless API is what your traffic is made of.
+`POST /generate` with `GET /generate/{id}/status` and `GET /audio/{id}`, `POST /speak` and the MCP `speak` tool (both queue a generation and return an id to poll), the history, stories and the admin UI read state in one replica's SQLite. Keep those on a single replica (a separate one-replica service with the same image, or session affinity) or on the desktop app. Sharing that state across replicas (Postgres, object storage, a shared queue) is a later phase that only pays off once the stateless API is what your traffic is made of.
+
+Rate limits and queue caps are counted **per replica**: a client key limited to 30 inference requests per minute gets that on each replica it is routed to, so a fleet of three allows about 90. Divide a key's limits by the maximum replica count when a hard fleet-wide budget matters; the per-key `max_pending_jobs` and `VOICEBOX_MAX_QUEUE_DEPTH` are per replica by design.
 
 ## The three inputs of a replica
 

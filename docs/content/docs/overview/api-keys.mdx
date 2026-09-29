@@ -248,6 +248,8 @@ Limits are token buckets per key, refilled continuously (a limit of 300 per minu
 
 Every limited response carries `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset`; a rejected request gets `429` with `Retry-After`. A full queue also answers `429`.
 
+The buckets live in the server process. With several replicas behind a load balancer (see [Scaling](/overview/scaling)) each replica counts on its own, so a key's effective budget is its limit times the number of replicas it is routed to.
+
 Per-key overrides live in the `limits` object of each entry in `api_keys.json`, which is what the `--limit` flags of `backend.keys create` and the `limits` field of `POST /auth/keys` write. The fields are `requests`, `inference`, `uploads_bytes`, `tts_chars`, `max_pending_jobs` and `max_voices`; `null` means unlimited.
 
 ```json

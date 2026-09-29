@@ -54,6 +54,8 @@ properties:
             value: "1"
           - name: VOICEBOX_SHUTDOWN_DELAY_S
             value: "10"
+          - name: VOICEBOX_MCP_STATELESS
+            value: "1"
           - name: VOICEBOX_LOG_FORMAT
             value: json
           - name: VOICEBOX_DISABLE_DOCS

@@ -26,6 +26,7 @@
         { "name": "VOICEBOX_MAX_QUEUE_DEPTH", "value": "4" },
         { "name": "VOICEBOX_RETENTION_DAYS", "value": "1" },
         { "name": "VOICEBOX_SHUTDOWN_DELAY_S", "value": "15" },
+        { "name": "VOICEBOX_MCP_STATELESS", "value": "1" },
         { "name": "VOICEBOX_LOG_FORMAT", "value": "json" },
         { "name": "VOICEBOX_DISABLE_DOCS", "value": "1" },
         { "name": "VOICEBOX_METRICS_PORT", "value": "9464" },

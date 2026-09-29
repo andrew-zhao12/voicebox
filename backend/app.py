@@ -133,13 +133,13 @@ from .utils.progress import get_progress_manager
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     from .mcp_server.context import ClientIdMiddleware
-    from .mcp_server.server import build_mcp_server, compose_lifespan
+    from .mcp_server.server import build_mcp_app, build_mcp_server, compose_lifespan
 
     # Build the MCP app up-front so we can wire its lifespan into FastAPI's —
     # FastMCP's Streamable HTTP transport only works if its session manager
     # runs inside the parent ASGI lifespan.
     mcp = build_mcp_server()
-    mcp_app = mcp.http_app(path="/", transport="http")
+    mcp_app = build_mcp_app(mcp)
 
     @asynccontextmanager
     async def voicebox_lifespan(app: FastAPI):

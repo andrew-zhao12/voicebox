@@ -49,16 +49,23 @@ two replicas behind Caddy with the same inputs, checked by
 | `VOICEBOX_LOG_FORMAT` | `json` | `request_id` and `key_id` on every line |
 | `VOICEBOX_METRICS_PORT` | 9464 | scraped by a sidecar or the platform agent; never exposed publicly |
 | `VOICEBOX_REQUIRE_GPU` | `1` on GPU platforms | a replica scheduled without a GPU never becomes ready |
+| `VOICEBOX_MCP_STATELESS` | `1` | MCP tool calls carry no session, so any replica can answer them |
 | `FORWARDED_ALLOW_IPS` | `*` behind the platform's load balancer | per-IP limits see the real client |
 
 ## What stays single-replica
 
 `POST /generate` with `GET /generate/{id}/status` and `GET /audio/{id}`,
-history, stories and the admin UI read state that lives in one replica's
-SQLite. Route those to one replica (session affinity, or a separate
-single-replica service with the same image) or keep them for the desktop
-app. The `/v1` API, `/generate/stream`, `/speak` and MCP `speak` and
-`transcribe` are stateless and scale.
+`POST /speak` and the MCP `speak` tool (they queue a generation and return
+an id to poll), history, stories and the admin UI read state that lives in
+one replica's SQLite. Route those to one replica (session affinity, or a
+separate single-replica service with the same image) or keep them for the
+desktop app. The `/v1` API, `/generate/stream` and the MCP `transcribe`
+tool are stateless and scale; run MCP with `VOICEBOX_MCP_STATELESS=1` so
+tool calls do not depend on a session held by one replica.
+
+Rate limits and queue caps are per replica: a key's budget is multiplied by
+the number of replicas it reaches. Set per-key limits with the maximum
+replica count in mind when a fleet-wide budget matters.
 
 ## Verifying a deployment
 

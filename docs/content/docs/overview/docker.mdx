@@ -127,6 +127,7 @@ ports:
 | `VOICEBOX_MEDIA_TOKEN_SECRET` | (per process) | Any string of 32+ characters; replicas sharing it verify each other's browser media tokens. |
 | `VOICEBOX_REQUIRE_GPU` | (unset) | `1` keeps `/health/ready` at `503` when no CUDA/ROCm device is visible. |
 | `HF_HUB_OFFLINE` | (unset) | `1` forbids model downloads at runtime (fleet replicas with baked or mounted models). |
+| `VOICEBOX_MCP_STATELESS` | (unset) | `1` makes every MCP tool call self-contained (no session id), required behind a load balancer. |
 
 Every `VOICEBOX_*` variable in the table (and `HF_HUB_OFFLINE`) is forwarded from the shell you run `docker compose` in when set. Set `VOICEBOX_LOG_LEVEL` and the rest under `environment:` in a `docker-compose.override.yml`. The [Deployment Checklist](/overview/deployment) explains how they fit together, and [Scaling](/overview/scaling) covers several replicas.
 

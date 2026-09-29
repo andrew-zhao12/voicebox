@@ -6,6 +6,7 @@ backend/auth
 backend/config.py
 backend/keys.py
 backend/lifecycle.py
+backend/mcp_server/server.py
 backend/mcp_shim
 backend/observability
 backend/preload.py
@@ -33,9 +34,12 @@ backend/tests/test_idle_unload.py
 backend/tests/test_inference_slots.py
 backend/tests/test_keys_cli.py
 backend/tests/test_lifecycle.py
+backend/tests/test_mcp_stateless.py
 backend/tests/test_observability.py
 backend/tests/test_openai_compat.py
 backend/tests/test_preload.py
+backend/tests/test_profile_duplicate_names.py
+backend/tests/test_progress.py
 backend/tests/test_ratelimit.py
 backend/tests/test_retention.py
 backend/tests/test_route_classification.py

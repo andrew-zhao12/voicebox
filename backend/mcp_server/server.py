@@ -9,7 +9,8 @@ binary bundled with the desktop app.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI
@@ -19,6 +20,8 @@ from .context import ClientIdMiddleware
 from .tools import register_tools
 
 logger = logging.getLogger(__name__)
+
+STATELESS_ENV = "VOICEBOX_MCP_STATELESS"
 
 
 def build_mcp_server() -> FastMCP:
@@ -39,6 +42,25 @@ def build_mcp_server() -> FastMCP:
     return mcp
 
 
+def mcp_stateless(environ: Mapping[str, str] = os.environ) -> bool:
+    """``VOICEBOX_MCP_STATELESS=1``: every request is self-contained (no ``Mcp-Session-Id``).
+
+    Stateful Streamable HTTP sessions live in one process, so a fleet behind a
+    load balancer must run stateless; single-server and desktop deployments
+    keep sessions (the default), which stdio shims and older clients expect.
+    """
+    return environ.get(STATELESS_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def build_mcp_app(mcp: FastMCP, *, stateless: bool | None = None):
+    """The ASGI app for ``/mcp`` (Streamable HTTP), stateless when configured."""
+    if stateless is None:
+        stateless = mcp_stateless()
+    if stateless:
+        logger.info("MCP: stateless HTTP transport (VOICEBOX_MCP_STATELESS)")
+    return mcp.http_app(path="/", transport="http", stateless_http=stateless)
+
+
 def mount_into(
     app: FastAPI,
     *,
@@ -51,7 +73,7 @@ def mount_into(
     bodies while also driving FastMCP's session manager.
     """
     mcp = build_mcp_server()
-    mcp_app = mcp.http_app(path="/", transport="http")
+    mcp_app = build_mcp_app(mcp)
 
     # ClientIdMiddleware must run before FastMCP so the ContextVar is set
     # by the time tool handlers execute. Starlette composes middlewares
