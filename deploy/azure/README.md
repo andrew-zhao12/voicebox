@@ -68,6 +68,10 @@ the GPU quota. For a queue-depth signal instead, replace the rule with a
 KEDA `prometheus` rule against Azure Monitor managed Prometheus scraping
 port 9464 (`query: sum(voicebox_queue_pending_jobs)`, `threshold: "2"`).
 
+WebSockets: the ingress supports them; the 240 s request timeout applies to
+the whole session, so set `VOICEBOX_REALTIME_MAX_SESSION_S=230` and let the
+client reconnect between turns.
+
 ## 4. Verify
 
 ```bash

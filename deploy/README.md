@@ -43,6 +43,7 @@ two replicas behind Caddy with the same inputs, checked by
 | Scaling target | 2 concurrent requests per replica (4 with `VOICEBOX_GENERATION_WORKERS=2`) | one job runs, one waits per lane |
 | `VOICEBOX_MAX_QUEUE_DEPTH` | scaling target + 2 | the replica answers 503 + `Retry-After` only when the platform overshoots; OpenAI SDKs retry 503 |
 | Request timeout at the load balancer | at least 600 s where configurable | long generations stream for minutes; Azure's fixed 240 s means capping `tts_chars` per key |
+| WebSockets (`/v1/realtime/transcription`) | enabled, with the connection timeout at or above `VOICEBOX_REALTIME_MAX_SESSION_S` | every platform below proxies WebSockets; the timeout that applies to a request applies to the whole session |
 | Minimum replicas | 1 | cold start = image pull + model load; 0 only when that latency is acceptable |
 | Maximum replicas | your GPU quota | Cloud Run gives 3 L4 per region by default |
 | `VOICEBOX_RETENTION_DAYS` | 1 | replicas keep nothing worth backing up |

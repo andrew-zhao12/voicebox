@@ -12,11 +12,13 @@ backend/observability
 backend/preload.py
 backend/routes/maintenance.py
 backend/routes/openai_compat.py
+backend/routes/realtime.py
 backend/routes/transcription.py
 backend/services/export_import.py
 backend/services/idle_unload.py
 backend/services/inference_slots.py
 backend/services/preload.py
+backend/services/realtime_stt.py
 backend/services/retention.py
 backend/services/seed_profiles.py
 backend/services/task_queue.py
@@ -42,6 +44,8 @@ backend/tests/test_preload.py
 backend/tests/test_profile_duplicate_names.py
 backend/tests/test_progress.py
 backend/tests/test_ratelimit.py
+backend/tests/test_realtime_route.py
+backend/tests/test_realtime_stt.py
 backend/tests/test_retention.py
 backend/tests/test_route_classification.py
 backend/tests/test_seed_profiles.py
@@ -59,3 +63,4 @@ backend/utils/http.py
 backend/utils/subtitles.py
 backend/utils/wav_stream.py
 backend/voices.py
+scripts/realtime_client.py

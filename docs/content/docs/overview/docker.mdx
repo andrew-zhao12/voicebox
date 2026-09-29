@@ -129,6 +129,7 @@ ports:
 | `VOICEBOX_REQUIRE_GPU` | (unset) | `1` keeps `/health/ready` at `503` when no CUDA/ROCm device is visible. |
 | `HF_HUB_OFFLINE` | (unset) | `1` forbids model downloads at runtime (fleet replicas with baked or mounted models). |
 | `VOICEBOX_MCP_STATELESS` | (unset) | `1` makes every MCP tool call self-contained (no session id), required behind a load balancer. |
+| `VOICEBOX_REALTIME_MAX_SESSIONS` / `VOICEBOX_REALTIME_MAX_SESSION_S` | `4` / `1800` | Open live-transcription WebSockets per server, and the longest a session may last. |
 | `VOICEBOX_ALLOWED_HOSTS` | (unset) | Comma-separated host names the server answers for (`voice.example.com`, `*.internal.example.com`); other `Host` headers get `400`. Loopback names and the probe paths always pass. |
 
 Every `VOICEBOX_*` variable in the table (and `HF_HUB_OFFLINE`) is forwarded from the shell you run `docker compose` in when set. Set `VOICEBOX_LOG_LEVEL` and the rest under `environment:` in a `docker-compose.override.yml`. The [Deployment Checklist](/overview/deployment) explains how they fit together, and [Scaling](/overview/scaling) covers several replicas.

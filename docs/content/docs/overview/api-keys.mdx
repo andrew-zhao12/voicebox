@@ -30,7 +30,7 @@ Each key has one of two roles.
 | Role | Who uses it | What it can do |
 |------|-------------|----------------|
 | `admin` | Desktop app, web UI, operators | Everything: settings, history, captures, model downloads, key management, `/shutdown` |
-| `client` | Your own apps, scripts and agents | Generate and stream speech, `/speak`, transcribe, cancel and follow generations, read profiles, presets, model status and the effects list, fetch generation audio and metadata |
+| `client` | Your own apps, scripts and agents | Generate and stream speech, `/speak`, transcribe (uploads and the live WebSocket), cancel and follow generations, read profiles, presets, model status and the effects list, fetch generation audio and metadata |
 
 The full list of routes a client key may call:
 
@@ -242,6 +242,7 @@ Limits are token buckets per key, refilled continuously (a limit of 300 per minu
 | TTS characters per minute | 600,000 | 60,000 | The `text` of each `/generate`, `/generate/stream` and `/speak` call |
 | Pending queued jobs | unlimited | 4 | Generations waiting in or running through the queue at once |
 | Voices per key | unlimited | 50 | Cloned voices the key created through `POST /v1/voices` (a count, not a rate) |
+| Live transcription sessions | unlimited | 2 | Open `/v1/realtime/transcription` sockets at once (a count); `VOICEBOX_REALTIME_MAX_SESSIONS` caps the whole server |
 | Global queue depth | 32 | 32 | Whole server, all keys together; `VOICEBOX_MAX_QUEUE_DEPTH` |
 | Failed authentications per minute | 30 per IP | 30 per IP | Bad keys and `403`s; a valid key keeps working regardless |
 | Anonymous requests per minute | 300 per IP | 300 per IP | The public endpoints above |
@@ -250,7 +251,7 @@ Every limited response carries `RateLimit-Limit`, `RateLimit-Remaining` and `Rat
 
 The buckets live in the server process. With several replicas behind a load balancer (see [Scaling](/overview/scaling)) each replica counts on its own, so a key's effective budget is its limit times the number of replicas it is routed to.
 
-Per-key overrides live in the `limits` object of each entry in `api_keys.json`, which is what the `--limit` flags of `backend.keys create` and the `limits` field of `POST /auth/keys` write. The fields are `requests`, `inference`, `uploads_bytes`, `tts_chars`, `max_pending_jobs` and `max_voices`; `null` means unlimited.
+Per-key overrides live in the `limits` object of each entry in `api_keys.json`, which is what the `--limit` flags of `backend.keys create` and the `limits` field of `POST /auth/keys` write. The fields are `requests`, `inference`, `uploads_bytes`, `tts_chars`, `max_pending_jobs`, `max_voices` and `max_realtime_sessions`; `null` means unlimited.
 
 ```json
 {

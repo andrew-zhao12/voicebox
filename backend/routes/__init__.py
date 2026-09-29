@@ -27,6 +27,7 @@ def register_routers(app: FastAPI) -> None:
     from .cloud import router as cloud_router
     from .maintenance import router as maintenance_router
     from .openai_compat import install_openai_compat, router as openai_router
+    from .realtime import router as realtime_router
 
     app.include_router(health_router)
     app.include_router(profiles_router)
@@ -50,4 +51,5 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(cloud_router)
     app.include_router(maintenance_router)
     app.include_router(openai_router)
+    app.include_router(realtime_router)
     install_openai_compat(app)

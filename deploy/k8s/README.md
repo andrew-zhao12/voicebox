@@ -57,6 +57,10 @@ kubectl -n voicebox port-forward svc/voicebox 17493:80 &
 scripts/fleet-check.sh http://127.0.0.1:17493 "$CLIENT_KEY" --rounds 6
 ```
 
+Live transcription uses a WebSocket; `ingress.yaml` already sets the 900 s
+read and send timeouts ingress-nginx needs, and a cloud-managed ingress
+needs its backend timeout raised the same way.
+
 Rolling updates keep traffic on ready pods only: the new pod becomes ready
 after its models load and its seed is applied, the old pod drains for up to
 90 s. Nothing in a replica needs a backup.

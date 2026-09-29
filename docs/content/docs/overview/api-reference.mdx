@@ -92,6 +92,42 @@ for segment in detailed.segments:
     print(f"{segment.start:6.2f}-{segment.end:6.2f}  {segment.text}")
 ```
 
+## Live transcription: `WS /v1/realtime/transcription`
+
+For conversation features, stream microphone audio over a WebSocket and receive partial text while the user speaks and a final transcript per utterance. The events use the names of the OpenAI Realtime transcription API so client code ports easily; Voicebox does not promise SDK compatibility, and Whisper is not a streaming model, so "live" means utterances are cut by a server-side voice activity detector (or by your commits) and each one is transcribed as it ends, with partial passes every second in between.
+
+- **Connect** with `Authorization: Bearer <client key>`; browsers, which cannot set WebSocket headers, pass a media token instead: `wss://host/v1/realtime/transcription?token=<POST /auth/media-token>`.
+- **Configure** with `transcription_session.update` (alias `session.update`): `input_audio_format` must be `pcm16` (signed 16-bit little-endian mono); `input_sample_rate` 8000, 16000, 22050, 24000 (default) or 48000; `input_audio_transcription: {model, language}`; `turn_detection: {type: "server_vad", threshold, prefix_padding_ms, silence_duration_ms}` or `null` for manual turns; `partial_interval_ms` (300–10000, default 1000).
+- **Send audio** as `input_audio_buffer.append {audio: <base64 PCM16>}`, or as raw binary frames. `input_audio_buffer.commit` ends the current utterance now (required with `turn_detection: null`), `input_audio_buffer.clear` discards it.
+- **Receive** `transcription_session.created` / `.updated`, `input_audio_buffer.speech_started` / `.speech_stopped` / `.committed` / `.cleared`, `conversation.item.input_audio_transcription.delta {item_id, delta}`, `...completed {item_id, transcript}`, `...failed` and `error {error: {type, code, message}}`. Deltas are append-only: only the words two consecutive passes agree on are sent, and `completed` is the authoritative text (it may revise earlier deltas).
+- **Limits**: messages up to 1 MiB, utterances are cut at 30 s (one Whisper window), sessions end after 60 s without a message or `VOICEBOX_REALTIME_MAX_SESSION_S` (default 1800), at most `VOICEBOX_REALTIME_MAX_SESSIONS` (default 4) sessions per server and `max_realtime_sessions` per key (default 2). Every session costs one `inference` request and the audio counts against `uploads_bytes`. Close codes: `1008` policy (bad key, missing model, oversize message), `1013` try later (session cap, rate limit), `1012` the server is restarting.
+
+```python
+import asyncio, base64, json, websockets
+
+async def main():
+    async with websockets.connect(
+        "wss://voice.example.com/v1/realtime/transcription",
+        additional_headers={"Authorization": "Bearer vbx_..."},
+    ) as ws:
+        await ws.send(json.dumps({"type": "transcription_session.update", "session": {
+            "input_sample_rate": 16000, "input_audio_transcription": {"model": "whisper-turbo", "language": "en"}}}))
+        async def send_audio():
+            async for pcm16_chunk in microphone():  # your capture loop, 16 kHz mono PCM16
+                await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm16_chunk).decode()}))
+        asyncio.create_task(send_audio())
+        async for message in ws:
+            event = json.loads(message)
+            if event["type"].endswith("transcription.delta"):
+                print(event["delta"], end="", flush=True)
+            elif event["type"].endswith("transcription.completed"):
+                print("\n=>", event["transcript"])
+
+asyncio.run(main())
+```
+
+`scripts/realtime_client.py` in the repository streams a WAV file at real-time pace and prints the events, which is the quickest way to try a server.
+
 ## Discovery: `GET /v1/models` and `GET /v1/voices`
 
 `/v1/models` lists every TTS and STT model with `engine`, `kind` (`tts`/`stt`), `languages`, `supports_instruct`, `downloaded` and `loaded`, plus a top-level `formats` array with the `response_format` values this server can produce.
@@ -151,7 +187,7 @@ Under `/v1`, errors use OpenAI's envelope, so SDK exceptions carry the message:
 | 404 | `invalid_request_error` | `voice_not_found`, `model_not_found` |
 | 409 | `invalid_request_error` | The model is not downloaded (client keys); `voice_exists` |
 | 413 | `invalid_request_error` | A sample or request body above its cap |
-| 429 | `rate_limit_error` | Per-key limits or a full queue; honour `Retry-After` |
+| 429 | `rate_limit_error` | Per-key limits or a full queue; honour `Retry-After` (a WebSocket session gets an `error` event and close code `1013`) |
 | 503 | `server_error` | The server is draining before a restart; retry after `Retry-After` |
 
 Responses also carry `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset` (see [API Keys → Rate limits](/overview/api-keys#rate-limits)).

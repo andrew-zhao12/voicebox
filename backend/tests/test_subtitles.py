@@ -87,8 +87,10 @@ def test_padding_hallucinations_are_dropped_and_ends_clamped():
         {"start": 4.92, "end": 5.92, "text": "."},
         {"start": 5.92, "end": 6.92, "text": " ..."},
         {"start": 9.92, "end": 10.92, "text": " Real words after the clip ended"},
+        {"start": 4.5, "end": 5.0, "text": " Thank you for watching!", "no_speech_prob": 0.9, "avg_logprob": -1.4},
+        {"start": 4.6, "end": 5.0, "text": " quiet but real", "no_speech_prob": 0.9, "avg_logprob": -0.3},
     ]
     segments = subtitles.segments_from_dicts(dicts, duration=5.1)
-    assert [s.text for s in segments] == ["The quick brown fox.", "Then it runs home."]
-    assert segments[-1].end == 5.1
-    assert subtitles.text_of(segments) == "The quick brown fox. Then it runs home."
+    assert [s.text for s in segments] == ["The quick brown fox.", "Then it runs home.", "quiet but real"]
+    assert segments[1].end == 5.1
+    assert subtitles.text_of(segments) == "The quick brown fox. Then it runs home. quiet but real"

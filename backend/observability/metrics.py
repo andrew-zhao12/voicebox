@@ -84,6 +84,8 @@ MODEL_LOAD_SECONDS = _histogram(
     buckets=(1, 5, 15, 30, 60, 120, 300, 600, 1800),
 )
 RATE_LIMITED = _counter("voicebox_rate_limited_total", "Requests refused by a limit", ("dimension",))
+REALTIME_SESSIONS = _gauge("voicebox_realtime_sessions", "Live transcription sessions open")
+REALTIME_UTTERANCES = _counter("voicebox_realtime_utterances_total", "Utterances transcribed over live sessions")
 
 
 def observe_http(method: str, route: str, status: int, seconds: float) -> None:

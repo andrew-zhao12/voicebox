@@ -73,6 +73,10 @@ proxy only if you want Google IAM in front as well.
   scrape `GET /metrics` with the admin key from outside. JSON logs land in
   Cloud Logging with `request_id` and `key_id` as fields.
 
+WebSockets: Cloud Run proxies them; a live-transcription session is one
+request, so `timeoutSeconds` (900 in the recipe) is also the longest session
+and `VOICEBOX_REALTIME_MAX_SESSION_S` should stay below it.
+
 ## 4. Verify
 
 ```bash

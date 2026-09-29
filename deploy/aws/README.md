@@ -94,6 +94,10 @@ than its `VOICEBOX_MAX_QUEUE_DEPTH`. A custom CloudWatch metric from the
 CloudWatch agent or ADOT sidecar scraping port 9464
 (`voicebox_queue_pending_jobs`) gives a more direct signal.
 
+WebSockets: the ALB proxies them; its idle timeout (300 s here) closes a
+session that sends nothing for that long, which the route's own 60 s idle
+timeout already ends earlier.
+
 ## 5. CPU-only variant (Fargate)
 
 Kokoro, LuxTTS and Whisper turbo run on CPU: use the `-cpu` image, set

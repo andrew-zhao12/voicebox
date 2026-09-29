@@ -43,15 +43,19 @@ def _clean(text: str) -> str:
 def segments_from_dicts(items: Iterable[Mapping], *, duration: float | None = None) -> tuple[TranscriptSegment, ...]:
     """Segments from openai-whisper-shaped dictionaries (``start``, ``end``, ``text``, ...), as MLX Whisper returns.
 
-    Whisper pads a clip to 30 s and tends to hallucinate punctuation-only
-    segments over the padding, so segments without a letter or digit and
-    segments that start after the clip ends are dropped, and the last end is
-    clamped to the clip *duration* when it is known.
+    Whisper pads a clip to 30 s and tends to hallucinate over the padding,
+    so segments without a letter or digit, segments that start after the
+    clip ends, and segments Whisper itself rates as probable non-speech
+    (``no_speech_prob`` above 0.6 with a mean log-probability below -1, its
+    own decoding rule) are dropped, and the last end is clamped to the clip
+    *duration* when it is known.
     """
     segments: list[TranscriptSegment] = []
     for item in items:
         text = _clean(str(item.get("text", "")))
         if not text or not any(ch.isalnum() for ch in text):
+            continue
+        if float(item.get("no_speech_prob") or 0.0) > 0.6 and float(item.get("avg_logprob") or 0.0) < -1.0:
             continue
         start = float(item.get("start") or 0.0)
         if duration is not None and start >= duration:
