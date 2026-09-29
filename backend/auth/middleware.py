@@ -101,9 +101,10 @@ class AuthMiddleware:
         if scope["type"] == "lifespan":
             await self.app(scope, receive, send)
             return
+        if scope["type"] == "websocket":
+            await self._websocket(scope, receive, send)
+            return
         if scope["type"] != "http":
-            if scope["type"] == "websocket":
-                await send({"type": "websocket.close", "code": 1008})
             return
 
         method = str(scope.get("method", "GET")).upper()
@@ -121,6 +122,24 @@ class AuthMiddleware:
             await _json(scope, 403, "Admin key required")(scope, receive, send)
             return
 
+        await self._run_as(principal, scope, receive, send)
+
+    async def _websocket(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """WebSocket handshakes: a bearer header or a media token, then the same policy as ``GET``.
+
+        A rejection closes the socket before it is accepted, which uvicorn
+        turns into an HTTP 403 handshake response; there are no public or
+        anonymous websocket routes.
+        """
+        path = str(scope.get("path", "/"))
+        headers = Headers(scope=scope)
+        principal, failure = self._authenticate("GET", path, headers, scope)
+        docs_enabled = not self.runtime.settings.disable_docs
+        if principal is None or not policy.allows(principal.role, "GET", path, docs_enabled=docs_enabled):
+            if failure in ("invalid", "token") or principal is not None:
+                self.runtime.limiter.note_auth_failure(client_ip(scope))
+            await send({"type": "websocket.close", "code": 1008})
+            return
         await self._run_as(principal, scope, receive, send)
 
     async def _run_as(self, principal: Principal, scope: Scope, receive: Receive, send: Send) -> None:

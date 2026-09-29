@@ -7,7 +7,7 @@ import pytest
 
 pytest.importorskip("torch")
 
-from fastapi.routing import iter_route_contexts  # after the torch skip guard
+from fastapi.routing import APIWebSocketRoute, iter_route_contexts  # after the torch skip guard
 from starlette.routing import Mount  # after the torch skip guard
 
 from backend.app import app  # after the torch skip guard
@@ -29,6 +29,10 @@ def _registered() -> set[tuple[str, str]]:
         if isinstance(original, Mount):
             found.add(("GET", original.path))
             found.add(("POST", original.path))
+            continue
+        if isinstance(original, APIWebSocketRoute):
+            # Websocket scopes have no method; the auth middleware classifies them as GET.
+            found.add(("GET", original.path))
             continue
         if context.path is None:
             continue

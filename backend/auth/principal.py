@@ -16,7 +16,15 @@ Via = Literal["header", "token", "none"]
 MIB = 1024 * 1024
 GIB = 1024 * MIB
 
-LIMIT_FIELDS = ("requests", "inference", "uploads_bytes", "tts_chars", "max_pending_jobs", "max_voices")
+LIMIT_FIELDS = (
+    "requests",
+    "inference",
+    "uploads_bytes",
+    "tts_chars",
+    "max_pending_jobs",
+    "max_voices",
+    "max_realtime_sessions",
+)
 
 
 @dataclass(frozen=True)
@@ -29,6 +37,7 @@ class KeyLimits:
     tts_chars: int | None
     max_pending_jobs: int | None
     max_voices: int | None = None
+    max_realtime_sessions: int | None = None
 
     @classmethod
     def defaults_for(cls, role: str) -> KeyLimits:
@@ -40,12 +49,27 @@ class KeyLimits:
                 tts_chars=600_000,
                 max_pending_jobs=None,
                 max_voices=None,
+                max_realtime_sessions=None,
             )
         if role == "client":
             return cls(
-                requests=300, inference=30, uploads_bytes=256 * MIB, tts_chars=60_000, max_pending_jobs=4, max_voices=50
+                requests=300,
+                inference=30,
+                uploads_bytes=256 * MIB,
+                tts_chars=60_000,
+                max_pending_jobs=4,
+                max_voices=50,
+                max_realtime_sessions=2,
             )
-        return cls(requests=0, inference=0, uploads_bytes=0, tts_chars=0, max_pending_jobs=0, max_voices=0)
+        return cls(
+            requests=0,
+            inference=0,
+            uploads_bytes=0,
+            tts_chars=0,
+            max_pending_jobs=0,
+            max_voices=0,
+            max_realtime_sessions=0,
+        )
 
     def merged(self, overrides: Mapping[str, int | None] | None) -> KeyLimits:
         if not overrides:

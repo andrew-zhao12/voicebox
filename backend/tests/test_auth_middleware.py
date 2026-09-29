@@ -142,9 +142,38 @@ def test_bearer_failures_lock_the_ip_out_but_not_a_valid_key(harness):
     assert client.get("/audio/x").status_code == 401
 
 
-def test_websocket_scopes_are_closed(harness):
-    _, client, _ = harness
-    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/ws"):
+def test_websockets_need_a_key_and_follow_the_policy(harness):
+    runtime, client, key = harness
+    with pytest.raises(WebSocketDisconnect) as no_key, client.websocket_connect("/v1/realtime/transcription"):
+        pass
+    assert no_key.value.code == 1008
+    with (
+        pytest.raises(WebSocketDisconnect) as bad_key,
+        client.websocket_connect("/v1/realtime/transcription", headers=bearer("vbx_wrong")),
+    ):
+        pass
+    assert bad_key.value.code == 1008
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/ws", headers=bearer(key)):
+        pass  # no such route: unclassified means admin-only, then the router finds nothing
+
+    with client.websocket_connect("/v1/realtime/transcription", headers=bearer(key)) as socket:
+        assert socket.receive_json() == {"key_id": "local", "role": "admin", "via": "header"}
+
+    _record, client_key = runtime.keystore.create("app", "client", None)
+    with client.websocket_connect("/v1/realtime/transcription", headers=bearer(client_key)) as socket:
+        assert socket.receive_json()["role"] == "client"
+    with (
+        pytest.raises(WebSocketDisconnect) as forbidden,
+        client.websocket_connect("/ws-admin-only", headers=bearer(client_key)),
+    ):
+        pass
+    assert forbidden.value.code == 1008
+
+    # Browsers cannot set headers: a media token in the query string works on the realtime path only.
+    token = client.post("/auth/media-token", headers=bearer(client_key)).json()["token"]
+    with client.websocket_connect(f"/v1/realtime/transcription?token={token}") as socket:
+        assert socket.receive_json() == {"key_id": "app", "role": "client", "via": "token"}
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect(f"/ws-admin-only?token={token}"):
         pass
 
 

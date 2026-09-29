@@ -10,7 +10,7 @@ import asyncio
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Request, UploadFile, WebSocket
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
@@ -75,6 +75,19 @@ def build_test_app(
     async def transcribe(file: UploadFile = File(...)):
         data = await file.read()
         return {"bytes": len(data)}
+
+    @app.websocket("/v1/realtime/transcription")
+    async def realtime_stub(websocket: WebSocket):
+        await websocket.accept()
+        principal = current_principal(websocket)
+        await websocket.send_json({"key_id": principal.key_id, "role": principal.role, "via": principal.via})
+        await websocket.close()
+
+    @app.websocket("/ws-admin-only")
+    async def admin_stub(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_json({"ok": True})
+        await websocket.close()
 
     @app.get("/cloud/callback")
     async def cloud_callback():

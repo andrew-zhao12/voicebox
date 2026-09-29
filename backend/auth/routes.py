@@ -51,7 +51,7 @@ class ApiKeyCreate(BaseModel):
         default=None,
         description=(
             "Overrides: requests, inference, uploads_bytes, tts_chars (per minute), "
-            "max_pending_jobs, max_voices (counts); null = unlimited."
+            "max_pending_jobs, max_voices, max_realtime_sessions (counts); null = unlimited."
         ),
     )
 
