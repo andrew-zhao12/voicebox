@@ -180,6 +180,7 @@ async def _lane_worker(lane: _Lane):
             task = asyncio.create_task(job.coro)
             _running_generation_tasks[job.generation_id] = task
             _queued_generation_ids.discard(job.generation_id)
+            metrics.QUEUE_RUNNING.labels(lane.name).set(1)
             try:
                 await task
             except asyncio.CancelledError:
@@ -196,6 +197,7 @@ async def _lane_worker(lane: _Lane):
                 "Worker exited without writing terminal status",
             )
         finally:
+            metrics.QUEUE_RUNNING.labels(lane.name).set(0)
             if entered and _gate is not None:
                 await _gate.leave(job.exclusive)
             _running_generation_tasks.pop(job.generation_id, None)
@@ -406,6 +408,8 @@ def init_queue(force: bool = False, *, max_depth: int | None = None, workers: in
     names = [LANE_ALL] if workers <= 1 else [LANE_GPU, LANE_CPU]
     _lanes = {name: _Lane(name=name, queue=asyncio.Queue()) for name in names}
     _gate = _ExclusiveGate() if len(names) > 1 else None
+    for name in names:
+        metrics.QUEUE_RUNNING.labels(name).set(0)
     _queued_generation_ids = set()
     _running_generation_tasks = {}
     _cancelled_generation_ids = set()

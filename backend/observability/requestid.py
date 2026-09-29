@@ -55,6 +55,7 @@ class RequestIdMiddleware:
         token = request_id_var.set(request_id)
         status = 500
         started = perf_counter()
+        metrics.HTTP_IN_FLIGHT.inc()
 
         async def send_with_id(message: Message) -> None:
             nonlocal status
@@ -67,4 +68,5 @@ class RequestIdMiddleware:
             await self.app(scope, receive, send_with_id)
         finally:
             request_id_var.reset(token)
+            metrics.HTTP_IN_FLIGHT.dec()
             metrics.observe_http(str(scope.get("method", "GET")), route_label(scope), status, perf_counter() - started)

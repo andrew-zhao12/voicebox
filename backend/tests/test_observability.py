@@ -118,6 +118,36 @@ def test_http_metrics_are_recorded_and_rendered(harness):
     assert 'voicebox_http_requests_total{method="GET",route="unrouted",status="401"}' in text
     assert "voicebox_http_request_seconds_bucket" in text
     assert "voicebox_queue_pending_jobs" in text
+    assert "voicebox_http_requests_in_flight 0.0" in text  # back to zero once the responses are sent
+
+
+@pytest.mark.skipif(not metrics.ENABLED, reason="prometheus_client not installed")
+async def test_running_jobs_gauge_follows_the_lane_worker():
+    import asyncio
+
+    from backend.services import task_queue
+
+    task_queue.init_queue(force=True, workers=2)
+    release = asyncio.Event()
+
+    async def blocker():
+        await release.wait()
+
+    def gauge(lane: str) -> float:
+        for line in metrics.render()[0].decode().splitlines():
+            if line.startswith(f'voicebox_queue_running_jobs{{lane="{lane}"}}'):
+                return float(line.rsplit(" ", 1)[1])
+        raise AssertionError(f"no gauge for lane {lane}")
+
+    assert gauge("cpu") == 0.0
+    assert gauge("gpu") == 0.0
+    task_queue.enqueue_generation("job-1", blocker(), lane="gpu")
+    await asyncio.sleep(0.05)
+    assert gauge("gpu") == 1.0
+    assert gauge("cpu") == 0.0
+    release.set()
+    await asyncio.sleep(0.05)
+    assert gauge("gpu") == 0.0
 
 
 @pytest.mark.skipif(not metrics.ENABLED, reason="prometheus_client not installed")

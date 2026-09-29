@@ -43,6 +43,9 @@ class _Noop:
     def set(self, *_args, **_kwargs) -> None:
         pass
 
+    def dec(self, *_args, **_kwargs) -> None:
+        pass
+
 
 _SECONDS = (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300)
 
@@ -64,6 +67,8 @@ HTTP_REQUESTS = _counter(
 )
 HTTP_SECONDS = _histogram("voicebox_http_request_seconds", "HTTP request duration", ("method", "route"))
 QUEUE_PENDING = _gauge("voicebox_queue_pending_jobs", "Generation jobs queued or running")
+QUEUE_RUNNING = _gauge("voicebox_queue_running_jobs", "Generation jobs running right now", ("lane",))
+HTTP_IN_FLIGHT = _gauge("voicebox_http_requests_in_flight", "HTTP requests being served right now")
 QUEUE_WAIT_SECONDS = _histogram("voicebox_queue_wait_seconds", "Time a job waited in the queue before starting")
 GENERATION_SECONDS = _histogram("voicebox_generation_seconds", "Synthesis job duration", ("engine", "kind"))
 GENERATIONS = _counter("voicebox_generations_total", "Synthesis jobs by outcome", ("engine", "kind", "status"))
