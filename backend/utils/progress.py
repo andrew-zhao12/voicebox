@@ -11,7 +11,7 @@ from datetime import datetime
 
 
 # Absolute on purpose: tests/test_progress.py imports this module as top-level ``utils.progress``.
-from backend import lifecycle
+from .. import lifecycle
 
 
 class ProgressManager:
