@@ -17,6 +17,7 @@ backend/tests/test_preload.py
 backend/tests/test_ratelimit.py
 backend/tests/test_retention.py
 backend/tests/test_seed_profiles.py
+backend/tests/test_subtitles.py
 backend/tests/test_task_queue_cancellation.py
 backend/tests/test_task_queue_caps.py
 backend/tests/test_task_queue_lanes.py

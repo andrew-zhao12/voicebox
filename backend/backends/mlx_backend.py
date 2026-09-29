@@ -400,26 +400,56 @@ class MLXSTTBackend:
 
         def _transcribe_sync():
             """Run synchronous transcription in thread pool."""
-            # MLX Whisper transcription using generate method
-            # The generate method accepts audio path directly
-            decode_options = {}
-            if language:
-                decode_options["language"] = language
-
-            # Inference runs with the process's default HF_HUB_OFFLINE
-            # state — see the comment in MLXTTSBackend.generate for the
-            # regression this revert fixes (issue #462).
-            result = self.model.generate(str(audio_path), **decode_options)
-
-            # Extract text from result
-            if isinstance(result, str):
-                return result.strip()
-            elif isinstance(result, dict):
-                return result.get("text", "").strip()
-            elif hasattr(result, "text"):
-                return result.text.strip()
-            else:
-                return str(result).strip()
+            return _result_text(self._generate_sync(audio_path, language))
 
         # Run blocking transcription in thread pool
         return await asyncio.to_thread(_transcribe_sync)
+
+    def _generate_sync(self, audio_path: str, language: Optional[str]):
+        """MLX Whisper's ``generate`` on a file path (an ``STTOutput`` with text and segments)."""
+        decode_options = {}
+        if language:
+            decode_options["language"] = language
+
+        # Inference runs with the process's default HF_HUB_OFFLINE
+        # state — see the comment in MLXTTSBackend.generate for the
+        # regression this revert fixes (issue #462).
+        return self.model.generate(str(audio_path), **decode_options)
+
+    async def transcribe_detailed(
+        self,
+        audio_path: str,
+        language: Optional[str] = None,
+        model_size: Optional[str] = None,
+    ):
+        """Transcribe with segment timestamps (``utils.subtitles.Transcript``)."""
+        from ..utils.audio import load_audio
+        from ..utils.subtitles import Transcript, segments_from_dicts
+
+        await self.load_model_async(model_size)
+
+        def _transcribe_sync():
+            audio, sr = load_audio(str(audio_path))
+            duration = len(audio) / sr
+            result = self._generate_sync(audio_path, language)
+            raw_segments = getattr(result, "segments", None) or (result.get("segments") if isinstance(result, dict) else None)
+            detected = getattr(result, "language", None) or (result.get("language") if isinstance(result, dict) else None)
+            return Transcript(
+                text=_result_text(result),
+                segments=segments_from_dicts(raw_segments or (), duration=duration),
+                language=language or detected,
+                duration=duration,
+            )
+
+        return await asyncio.to_thread(_transcribe_sync)
+
+
+def _result_text(result) -> str:
+    """The transcript text of whatever ``mlx_audio.stt`` returned (string, dict or ``STTOutput``)."""
+    if isinstance(result, str):
+        return result.strip()
+    if isinstance(result, dict):
+        return str(result.get("text", "")).strip()
+    if hasattr(result, "text"):
+        return str(result.text).strip()
+    return str(result).strip()

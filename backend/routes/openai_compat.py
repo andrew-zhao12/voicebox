@@ -37,8 +37,14 @@ from ..auth.principal import Principal
 from ..database import VoiceProfile as DBVoiceProfile, get_db
 from ..mcp_server.resolve import resolve_profile
 from ..services import generation as generation_service, profiles
-from ..utils import encode
-from .transcription import ALLOWED_AUDIO_EXTS, UPLOAD_CHUNK_SIZE, transcribe_file, transcribe_upload
+from ..utils import encode, subtitles
+from .transcription import (
+    ALLOWED_AUDIO_EXTS,
+    UPLOAD_CHUNK_SIZE,
+    transcribe_file,
+    transcribe_upload,
+    transcribe_upload_detailed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -180,30 +186,53 @@ def _whisper_size(model: str) -> str | None:
     )
 
 
+TRANSCRIPTION_FORMATS = ("json", "text", "verbose_json", "srt", "vtt")
+
+
 @router.post("/audio/transcriptions")
 async def create_transcription(
     file: UploadFile = File(...),
     model: str = Form("whisper-1"),
     language: str | None = Form(None),
     response_format: str = Form("json"),
+    timestamp_granularities: list[str] = Form([], alias="timestamp_granularities[]"),
 ):
-    """Transcribe an uploaded file with Whisper (``json`` or ``text``).
+    """Transcribe an uploaded file with Whisper.
 
     ``whisper-1`` uses the server's current Whisper size; ``whisper-turbo``,
     ``whisper-large`` and the other registry sizes pick one explicitly.
-    Timestamped formats (``srt``, ``vtt``, ``verbose_json``) are not available.
+    ``response_format`` is ``json`` (default), ``text``, ``verbose_json``
+    (segments with timestamps), ``srt`` or ``vtt``; only segment timestamps
+    exist, so ``timestamp_granularities[]=word`` is refused.
     """
-    if response_format not in ("json", "text"):
+    if response_format not in TRANSCRIPTION_FORMATS:
         raise fail(
             400,
-            f"response_format '{response_format}' is not supported; use json or text",
+            f"response_format '{response_format}' is not supported; use one of {', '.join(TRANSCRIPTION_FORMATS)}",
             code="unsupported_format",
             param="response_format",
         )
-    text, _duration = await transcribe_upload(file, language, _whisper_size(model))
-    if response_format == "text":
-        return PlainTextResponse(text)
-    return {"text": text}
+    unsupported = [g for g in timestamp_granularities if g != "segment"]
+    if unsupported:
+        raise fail(
+            400,
+            f"timestamp_granularities '{unsupported[0]}' is not available; only segment timestamps are",
+            code="unsupported_value",
+            param="timestamp_granularities",
+        )
+    size = _whisper_size(model)
+    if response_format in ("json", "text"):
+        text, _duration = await transcribe_upload(file, language, size)
+        if response_format == "text":
+            return PlainTextResponse(text)
+        return {"text": text}
+
+    transcript = await transcribe_upload_detailed(file, language, size)
+    if response_format == "srt":
+        return PlainTextResponse(subtitles.to_srt(transcript))
+    if response_format == "vtt":
+        return PlainTextResponse(subtitles.to_vtt(transcript))
+    return subtitles.to_verbose_json(transcript)
 
 
 @router.get("/models")

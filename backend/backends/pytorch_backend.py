@@ -318,6 +318,44 @@ class PyTorchSTTBackend:
 
             logger.info("Whisper model unloaded")
 
+    def _features(self, audio_path: str):
+        """``(inputs, long_form, duration_s)``: the spectrogram on the device, in one 30 s window or all of them."""
+        audio, _sr = load_audio(audio_path, sample_rate=16000)
+        duration = len(audio) / 16000
+        # Whisper's feature extractor pads or truncates to one 30 s window
+        # by default, which silently dropped everything after 30 s.  For
+        # longer audio keep the full spectrogram and pass the attention
+        # mask so ``generate`` decodes it window by window (transformers
+        # >= 4.37).  Short clips keep the padded single window the encoder
+        # expects.
+        long_form = len(audio) > WHISPER_WINDOW_SAMPLES
+        processor_kwargs = {}
+        if long_form:
+            processor_kwargs = {
+                "truncation": False,
+                "padding": "longest",
+                "return_attention_mask": True,
+            }
+        inputs = self.processor(
+            audio,
+            sampling_rate=16000,
+            return_tensors="pt",
+            **processor_kwargs,
+        )
+        return inputs.to(self.device), long_form, duration
+
+    @staticmethod
+    def _generate_kwargs(language: Optional[str], long_form: bool, inputs) -> dict:
+        # If language is provided, force it; otherwise let Whisper auto-detect.
+        generate_kwargs = {}
+        if language:
+            generate_kwargs["language"] = language
+            generate_kwargs["task"] = "transcribe"
+        if long_form:
+            generate_kwargs["attention_mask"] = inputs["attention_mask"]
+            generate_kwargs["return_timestamps"] = True
+        return generate_kwargs
+
     async def transcribe(
         self,
         audio_path: str,
@@ -339,44 +377,11 @@ class PyTorchSTTBackend:
 
         def _transcribe_sync():
             """Run synchronous transcription in thread pool."""
-            # Load audio
-            audio, _sr = load_audio(audio_path, sample_rate=16000)
-
             # Inference runs with the process's default HF_HUB_OFFLINE
             # state — forcing offline here (issue #462) broke online users
             # whose tokenizer calls issue legitimate metadata lookups.
-            #
-            # Whisper's feature extractor pads or truncates to one 30 s window
-            # by default, which silently dropped everything after 30 s.  For
-            # longer audio keep the full spectrogram and pass the attention
-            # mask so ``generate`` decodes it window by window (transformers
-            # >= 4.37).  Short clips keep the padded single window the encoder
-            # expects.
-            long_form = len(audio) > WHISPER_WINDOW_SAMPLES
-            processor_kwargs = {}
-            if long_form:
-                processor_kwargs = {
-                    "truncation": False,
-                    "padding": "longest",
-                    "return_attention_mask": True,
-                }
-            inputs = self.processor(
-                audio,
-                sampling_rate=16000,
-                return_tensors="pt",
-                **processor_kwargs,
-            )
-            inputs = inputs.to(self.device)
-
-            # Generate transcription
-            # If language is provided, force it; otherwise let Whisper auto-detect
-            generate_kwargs = {}
-            if language:
-                generate_kwargs["language"] = language
-                generate_kwargs["task"] = "transcribe"
-            if long_form:
-                generate_kwargs["attention_mask"] = inputs["attention_mask"]
-                generate_kwargs["return_timestamps"] = True
+            inputs, long_form, _duration = self._features(audio_path)
+            generate_kwargs = self._generate_kwargs(language, long_form, inputs)
 
             with torch.no_grad():
                 predicted_ids = self.model.generate(
@@ -384,13 +389,57 @@ class PyTorchSTTBackend:
                     **generate_kwargs,
                 )
 
-            # Decode
             transcription = self.processor.batch_decode(
                 predicted_ids,
                 skip_special_tokens=True,
             )[0]
-
             return transcription.strip()
 
         # Run blocking transcription in thread pool
+        return await asyncio.to_thread(_transcribe_sync)
+
+    async def transcribe_detailed(
+        self,
+        audio_path: str,
+        language: Optional[str] = None,
+        model_size: Optional[str] = None,
+    ):
+        """Transcribe with segment timestamps (``utils.subtitles.Transcript``).
+
+        Short clips decode with timestamp tokens and the tokenizer's offsets;
+        long-form audio asks ``generate`` for its per-window segments.
+        """
+        from ..utils.subtitles import Transcript, segments_from_dicts, segments_from_offsets
+
+        await self.load_model_async(model_size)
+
+        def _transcribe_sync():
+            inputs, long_form, duration = self._features(audio_path)
+            generate_kwargs = self._generate_kwargs(language, long_form, inputs)
+            generate_kwargs["return_timestamps"] = True
+            tokenizer = self.processor.tokenizer
+
+            with torch.no_grad():
+                if long_form:
+                    generate_kwargs["return_segments"] = True
+                    output = self.model.generate(inputs["input_features"], **generate_kwargs)
+                    text = self.processor.batch_decode(output["sequences"], skip_special_tokens=True)[0]
+                    items = [
+                        {
+                            "start": float(segment["start"]),
+                            "end": float(segment["end"]),
+                            "text": tokenizer.decode(segment["tokens"], skip_special_tokens=True),
+                            "tokens": [int(t) for t in segment["tokens"].tolist()],
+                        }
+                        for segment in output["segments"][0]
+                    ]
+                    segments = segments_from_dicts(items, duration=duration)
+                else:
+                    predicted_ids = self.model.generate(inputs["input_features"], **generate_kwargs)
+                    decoded = tokenizer.decode(predicted_ids[0], output_offsets=True, skip_special_tokens=True)
+                    text = decoded["text"]
+                    segments = segments_from_offsets(decoded["offsets"], duration=duration)
+
+            return Transcript(text=text.strip(), segments=segments, language=language, duration=duration)
+
         return await asyncio.to_thread(_transcribe_sync)

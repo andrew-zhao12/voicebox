@@ -162,6 +162,15 @@ class STTBackend(Protocol):
         """
         ...
 
+    async def transcribe_detailed(
+        self,
+        audio_path: str,
+        language: Optional[str] = None,
+        model_size: Optional[str] = None,
+    ):
+        """Transcribe with segment timestamps; returns a ``utils.subtitles.Transcript``."""
+        ...
+
     def unload_model(self) -> None:
         """Unload model to free memory."""
         ...

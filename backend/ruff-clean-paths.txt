@@ -45,6 +45,7 @@ backend/tests/test_retention.py
 backend/tests/test_route_classification.py
 backend/tests/test_seed_profiles.py
 backend/tests/test_stream_route.py
+backend/tests/test_subtitles.py
 backend/tests/test_task_queue_cancellation.py
 backend/tests/test_task_queue_caps.py
 backend/tests/test_task_queue_lanes.py
@@ -53,5 +54,6 @@ backend/utils/chunked_tts.py
 backend/utils/clock.py
 backend/utils/encode.py
 backend/utils/http.py
+backend/utils/subtitles.py
 backend/utils/wav_stream.py
 backend/voices.py

@@ -261,7 +261,7 @@ def test_transcriptions_json_text_and_errors(api, monkeypatch):
     assert calls[-1] == ("clip.wav", "en", "turbo")
 
     response = api.client.post(
-        "/v1/audio/transcriptions", files=files, data={"response_format": "srt"}, headers=bearer(api.key)
+        "/v1/audio/transcriptions", files=files, data={"response_format": "diarized"}, headers=bearer(api.key)
     )
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "unsupported_format"
@@ -505,3 +505,58 @@ def test_time_stretch_changes_duration_and_keeps_mono_float32():
     assert abs(len(faster) - SR / 2) < SR * 0.05
     assert abs(len(slower) - SR * 2) < SR * 0.1
     assert np.abs(faster).max() < 1.0
+
+
+def test_timestamped_transcription_formats(api, monkeypatch):
+    from backend.utils.subtitles import Transcript, TranscriptSegment
+
+    detailed_calls = []
+
+    async def fake_detailed(file, language, model):
+        detailed_calls.append((file.filename, language, model))
+        return Transcript(
+            text="Hello world. Second part.",
+            segments=(
+                TranscriptSegment(id=0, start=0.0, end=1.2, text="Hello world."),
+                TranscriptSegment(id=1, start=1.2, end=2.8, text="Second part."),
+            ),
+            language="en",
+            duration=2.8,
+        )
+
+    monkeypatch.setattr("backend.routes.openai_compat.transcribe_upload_detailed", fake_detailed)
+    files = {"file": ("clip.wav", b"RIFF....WAVEfmt ", "audio/wav")}
+
+    response = api.client.post(
+        "/v1/audio/transcriptions",
+        files=files,
+        data={"model": "whisper-turbo", "response_format": "verbose_json", "timestamp_granularities[]": "segment"},
+        headers=bearer(api.key),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["task"] == "transcribe"
+    assert body["duration"] == 2.8
+    assert [s["text"] for s in body["segments"]] == ["Hello world.", "Second part."]
+    assert body["segments"][1]["start"] == 1.2
+    assert detailed_calls[-1] == ("clip.wav", None, "turbo")
+
+    srt = api.client.post(
+        "/v1/audio/transcriptions", files=files, data={"response_format": "srt"}, headers=bearer(api.key)
+    )
+    assert srt.status_code == 200
+    assert srt.text.startswith("1\n00:00:00,000 --> 00:00:01,200\nHello world.")
+    vtt = api.client.post(
+        "/v1/audio/transcriptions", files=files, data={"response_format": "vtt"}, headers=bearer(api.key)
+    )
+    assert vtt.status_code == 200
+    assert vtt.text.startswith("WEBVTT\n\n00:00:00.000 --> 00:00:01.200")
+
+    words = api.client.post(
+        "/v1/audio/transcriptions",
+        files=files,
+        data={"response_format": "verbose_json", "timestamp_granularities[]": "word"},
+        headers=bearer(api.key),
+    )
+    assert words.status_code == 400
+    assert words.json()["error"]["param"] == "timestamp_granularities"

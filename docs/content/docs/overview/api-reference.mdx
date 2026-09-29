@@ -78,13 +78,18 @@ curl -N https://voice.example.com/v1/audio/speech \
 Multipart form with `file` (wav, mp3, m4a, ogg, flac, aac, webm, opus; 200 MB cap), `model` and optional `language` and `response_format`.
 
 - `model`: `whisper-1` uses the server's current Whisper size; `whisper-turbo`, `whisper-large`, `whisper-medium`, `whisper-small` or `whisper-base` pick one explicitly.
-- `response_format`: `json` (default, `{"text": "..."}`) or `text`. `srt`, `vtt` and `verbose_json` are not available (no word timestamps).
+- `response_format`: `json` (default, `{"text": "..."}`), `text`, `verbose_json` (OpenAI's shape with `duration`, `language` and `segments[]` carrying `start`, `end` and `text`), `srt` or `vtt` (subtitle cues, one per Whisper segment). `timestamp_granularities[]=segment` is accepted; `word` is refused with `400`, word timestamps do not exist.
 - The model must already be downloaded; client keys get a `409` otherwise (preload it with `VOICEBOX_PRELOAD_MODELS=whisper-turbo`).
 
 ```python
 with open("meeting.m4a", "rb") as audio:
     result = client.audio.transcriptions.create(model="whisper-turbo", file=audio, language="en")
 print(result.text)
+
+with open("meeting.m4a", "rb") as audio:
+    detailed = client.audio.transcriptions.create(model="whisper-turbo", file=audio, response_format="verbose_json")
+for segment in detailed.segments:
+    print(f"{segment.start:6.2f}-{segment.end:6.2f}  {segment.text}")
 ```
 
 ## Discovery: `GET /v1/models` and `GET /v1/voices`

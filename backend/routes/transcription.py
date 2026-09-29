@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -36,6 +37,16 @@ async def transcribe_audio(
     return models.TranscriptionResponse(text=text, duration=duration)
 
 
+async def _save_upload(file: UploadFile) -> str:
+    """Write the upload to a temp file that keeps its extension (librosa picks the decoder from it)."""
+    uploaded_ext = Path(file.filename or "").suffix.lower()
+    file_suffix = uploaded_ext if uploaded_ext in ALLOWED_AUDIO_EXTS else ".wav"
+    with tempfile.NamedTemporaryFile(suffix=file_suffix, delete=False) as tmp:
+        while chunk := await file.read(UPLOAD_CHUNK_SIZE):
+            tmp.write(chunk)
+        return tmp.name
+
+
 async def transcribe_upload(file: UploadFile, language: str | None, model: str | None) -> tuple[str, float]:
     """Decode an upload, run Whisper and return ``(text, duration_seconds)``.
 
@@ -43,21 +54,33 @@ async def transcribe_upload(file: UploadFile, language: str | None, model: str |
     raises ``HTTPException`` for bad model names, missing models (409 for
     client keys, 202 while an admin's download runs) and decoder failures.
     """
-    uploaded_ext = Path(file.filename or "").suffix.lower()
-    file_suffix = uploaded_ext if uploaded_ext in ALLOWED_AUDIO_EXTS else ".wav"
-
-    with tempfile.NamedTemporaryFile(suffix=file_suffix, delete=False) as tmp:
-        while chunk := await file.read(UPLOAD_CHUNK_SIZE):
-            tmp.write(chunk)
-        tmp_path = tmp.name
+    tmp_path = await _save_upload(file)
     try:
         return await transcribe_file(tmp_path, language, model)
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
 
+async def transcribe_upload_detailed(file: UploadFile, language: str | None, model: str | None):
+    """Like ``transcribe_upload`` but returns a ``utils.subtitles.Transcript`` with segment timestamps."""
+    tmp_path = await _save_upload(file)
+    try:
+        return await transcribe_file_detailed(tmp_path, language, model)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
 async def transcribe_file(tmp_path: str, language: str | None, model: str | None) -> tuple[str, float]:
     """Run Whisper on an audio file already on disk (see ``transcribe_upload`` for the errors)."""
+    return await _run_whisper(tmp_path, language, model, detailed=False)
+
+
+async def transcribe_file_detailed(tmp_path: str, language: str | None, model: str | None):
+    """Run Whisper on a file and return a ``Transcript`` with segments (errors as ``transcribe_upload``)."""
+    return await _run_whisper(tmp_path, language, model, detailed=True)
+
+
+async def _run_whisper(tmp_path: str, language: str | None, model: str | None, *, detailed: bool):
     file_suffix = Path(tmp_path).suffix.lower()
     stt_path = tmp_path
     try:
@@ -120,6 +143,11 @@ async def transcribe_file(tmp_path: str, language: str | None, model: str | None
 
         try:
             async with whisper_slot.acquire():
+                if detailed:
+                    transcript = await whisper_model.transcribe_detailed(stt_path, language, model_size)
+                    if transcript.duration <= 0:
+                        transcript = replace(transcript, duration=duration)
+                    return transcript
                 text = await whisper_model.transcribe(stt_path, language, model_size)
         except InferenceBusyError as e:
             raise HTTPException(status_code=429, detail=str(e), headers={"Retry-After": str(e.retry_after_s)}) from e
