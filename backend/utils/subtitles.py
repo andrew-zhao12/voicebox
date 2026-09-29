@@ -41,15 +41,25 @@ def _clean(text: str) -> str:
 
 
 def segments_from_dicts(items: Iterable[Mapping], *, duration: float | None = None) -> tuple[TranscriptSegment, ...]:
-    """Segments from openai-whisper-shaped dictionaries (``start``, ``end``, ``text``, ...), as MLX Whisper returns."""
+    """Segments from openai-whisper-shaped dictionaries (``start``, ``end``, ``text``, ...), as MLX Whisper returns.
+
+    Whisper pads a clip to 30 s and tends to hallucinate punctuation-only
+    segments over the padding, so segments without a letter or digit and
+    segments that start after the clip ends are dropped, and the last end is
+    clamped to the clip *duration* when it is known.
+    """
     segments: list[TranscriptSegment] = []
-    for index, item in enumerate(items):
+    for item in items:
         text = _clean(str(item.get("text", "")))
-        if not text:
+        if not text or not any(ch.isalnum() for ch in text):
             continue
         start = float(item.get("start") or 0.0)
+        if duration is not None and start >= duration:
+            continue
         end_raw = item.get("end")
         end = float(end_raw) if end_raw is not None else (duration if duration is not None else start)
+        if duration is not None:
+            end = min(end, duration)
         tokens = item.get("tokens") or ()
         segments.append(
             TranscriptSegment(
@@ -65,8 +75,12 @@ def segments_from_dicts(items: Iterable[Mapping], *, duration: float | None = No
                 no_speech_prob=float(item.get("no_speech_prob") or 0.0),
             )
         )
-        del index
     return tuple(segments)
+
+
+def text_of(segments: Iterable[TranscriptSegment]) -> str:
+    """The transcript text as the segments spell it (what remains after filtering)."""
+    return " ".join(segment.text for segment in segments)
 
 
 def segments_from_offsets(

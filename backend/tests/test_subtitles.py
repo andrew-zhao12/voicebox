@@ -78,3 +78,17 @@ def test_a_transcript_without_segments_becomes_one_cue():
     assert subtitles.to_srt(transcript) == "1\n00:00:00,000 --> 00:00:04,000\nJust text.\n"
     assert subtitles.to_vtt(Transcript(text="")) == "WEBVTT\n"
     assert subtitles.to_verbose_json(transcript)["segments"] == []
+
+
+def test_padding_hallucinations_are_dropped_and_ends_clamped():
+    dicts = [
+        {"start": 0.0, "end": 2.9, "text": " The quick brown fox."},
+        {"start": 2.9, "end": 5.4, "text": " Then it runs home."},  # end past the 5.1 s clip
+        {"start": 4.92, "end": 5.92, "text": "."},
+        {"start": 5.92, "end": 6.92, "text": " ..."},
+        {"start": 9.92, "end": 10.92, "text": " Real words after the clip ended"},
+    ]
+    segments = subtitles.segments_from_dicts(dicts, duration=5.1)
+    assert [s.text for s in segments] == ["The quick brown fox.", "Then it runs home."]
+    assert segments[-1].end == 5.1
+    assert subtitles.text_of(segments) == "The quick brown fox. Then it runs home."

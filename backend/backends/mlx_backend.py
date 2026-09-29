@@ -424,7 +424,7 @@ class MLXSTTBackend:
     ):
         """Transcribe with segment timestamps (``utils.subtitles.Transcript``)."""
         from ..utils.audio import load_audio
-        from ..utils.subtitles import Transcript, segments_from_dicts
+        from ..utils.subtitles import Transcript, segments_from_dicts, text_of
 
         await self.load_model_async(model_size)
 
@@ -434,12 +434,10 @@ class MLXSTTBackend:
             result = self._generate_sync(audio_path, language)
             raw_segments = getattr(result, "segments", None) or (result.get("segments") if isinstance(result, dict) else None)
             detected = getattr(result, "language", None) or (result.get("language") if isinstance(result, dict) else None)
-            return Transcript(
-                text=_result_text(result),
-                segments=segments_from_dicts(raw_segments or (), duration=duration),
-                language=language or detected,
-                duration=duration,
-            )
+            segments = segments_from_dicts(raw_segments or (), duration=duration)
+            # Rebuilding the text from the kept segments drops the padding hallucinations too.
+            text = text_of(segments) if segments else _result_text(result)
+            return Transcript(text=text, segments=segments, language=language or detected, duration=duration)
 
         return await asyncio.to_thread(_transcribe_sync)
 

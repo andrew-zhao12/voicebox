@@ -409,7 +409,7 @@ class PyTorchSTTBackend:
         Short clips decode with timestamp tokens and the tokenizer's offsets;
         long-form audio asks ``generate`` for its per-window segments.
         """
-        from ..utils.subtitles import Transcript, segments_from_dicts, segments_from_offsets
+        from ..utils.subtitles import Transcript, segments_from_dicts, segments_from_offsets, text_of
 
         await self.load_model_async(model_size)
 
@@ -440,6 +440,8 @@ class PyTorchSTTBackend:
                     text = decoded["text"]
                     segments = segments_from_offsets(decoded["offsets"], duration=duration)
 
+            if segments:
+                text = text_of(segments)
             return Transcript(text=text.strip(), segments=segments, language=language, duration=duration)
 
         return await asyncio.to_thread(_transcribe_sync)
