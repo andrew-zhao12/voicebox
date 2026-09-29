@@ -140,6 +140,7 @@ pooch==1.9.0              # via librosa
 pre-commit==4.6.2         # via s3tokenizer
 preshed==3.0.13           # via spacy, thinc
 proces==0.1.7             # via cn2an
+prometheus-client==0.26.0  # via -r backend/requirements.txt
 protobuf==7.36.2          # via onnx, onnxruntime, tensorboard
 psutil==7.2.2             # via accelerate
 py-key-value-aio==0.4.6   # via fastmcp-slim
