@@ -1,6 +1,6 @@
 """ORM model definitions for the voicebox SQLite database."""
 
-from datetime import datetime
+from ..utils.clock import utcnow
 import uuid
 
 from sqlalchemy import Column, String, Integer, Float, DateTime, Text, ForeignKey, Boolean, JSON
@@ -47,8 +47,8 @@ class VoiceProfile(Base):
     # (created by an admin), visible to every key.
     owner_key_id = Column(String, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class ProfileSample(Base):
@@ -85,7 +85,7 @@ class Generation(Base):
     # profile's personality LLM before TTS. Future sources (bulk import,
     # agent replies, etc.) can extend this.
     source = Column(String, nullable=False, default="manual")
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
 
 class Story(Base):
@@ -96,8 +96,8 @@ class Story(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     name = Column(String, nullable=False)
     description = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class StoryItem(Base):
@@ -114,7 +114,7 @@ class StoryItem(Base):
     trim_start_ms = Column(Integer, nullable=False, default=0)
     trim_end_ms = Column(Integer, nullable=False, default=0)
     volume = Column(Float, nullable=False, default=1.0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
 
 class Project(Base):
@@ -125,8 +125,8 @@ class Project(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     name = Column(String, nullable=False)
     data = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class GenerationVersion(Base):
@@ -141,7 +141,7 @@ class GenerationVersion(Base):
     effects_chain = Column(Text, nullable=True)
     source_version_id = Column(String, ForeignKey("generation_versions.id"), nullable=True)
     is_default = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
 
 class EffectPreset(Base):
@@ -155,7 +155,7 @@ class EffectPreset(Base):
     effects_chain = Column(Text, nullable=False)
     is_builtin = Column(Boolean, default=False)
     sort_order = Column(Integer, default=100)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
 
 class AudioChannel(Base):
@@ -166,7 +166,7 @@ class AudioChannel(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     name = Column(String, nullable=False)
     is_default = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
 
 class ChannelDeviceMapping(Base):
@@ -221,7 +221,7 @@ class CaptureSettings(Base):
     chord_toggle_to_talk_keys = Column(
         JSON, nullable=False, default=default_toggle_to_talk_chord
     )
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class GenerationSettings(Base):
@@ -234,7 +234,7 @@ class GenerationSettings(Base):
     crossfade_ms = Column(Integer, nullable=False, default=50)
     normalize_audio = Column(Boolean, nullable=False, default=True)
     autoplay_on_generate = Column(Boolean, nullable=False, default=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class CloudSettings(Base):
@@ -256,7 +256,7 @@ class CloudSettings(Base):
     device_name = Column(String, nullable=True)
     account_user_id = Column(String, nullable=True)
     connected_at = Column(DateTime, nullable=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class MCPClientBinding(Base):
@@ -279,8 +279,8 @@ class MCPClientBinding(Base):
     # (rewrite) before TTS by default. Callers can still override per call.
     default_personality = Column(Boolean, nullable=False, default=False)
     last_seen_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class Capture(Base):
@@ -303,4 +303,4 @@ class Capture(Base):
     stt_model = Column(String, nullable=True)
     llm_model = Column(String, nullable=True)
     refinement_flags = Column(Text, nullable=True)  # JSON blob
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)

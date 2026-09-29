@@ -29,6 +29,7 @@ from ..database import (
     StoryItem as DBStoryItem,
     get_db,
 )
+from ..utils.clock import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +108,7 @@ async def prune(db: Session, *, days: int, now: datetime | None = None) -> Prune
     """Run one sweep and report what was removed."""
     from . import history
 
-    now = now or datetime.utcnow()
+    now = now or utcnow()
     cutoff = now - timedelta(days=days)
     # Unreferenced files are invisible to the app, so they go after one day
     # whatever the retention: an in-flight generation writes its file before

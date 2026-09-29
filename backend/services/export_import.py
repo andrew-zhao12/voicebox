@@ -23,7 +23,6 @@ import logging
 import tempfile
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -37,6 +36,7 @@ from ..database import (
     VoiceProfile as DBVoiceProfile,
 )
 from ..models import VoiceProfileCreate, VoiceProfileResponse
+from ..utils.clock import utcnow
 from .profiles import add_profile_sample, create_profile, delete_profile
 
 logger = logging.getLogger(__name__)
@@ -246,7 +246,7 @@ async def import_profile_bundle(file_bytes: bytes, db: Session, *, on_conflict: 
             if effects_json is not None:
                 row = db.query(DBVoiceProfile).filter_by(id=profile.id).first()
                 row.effects_chain = effects_json
-                row.updated_at = datetime.utcnow()
+                row.updated_at = utcnow()
                 db.commit()
 
             avatar_files = [f for f in zip_file.namelist() if f.startswith("avatar.")]
@@ -411,7 +411,7 @@ async def import_generation_from_zip(file_bytes: bytes, db: Session) -> dict:
                 duration=generation_data["duration"],
                 seed=generation_data.get("seed"),
                 instruct=generation_data.get("instruct"),
-                created_at=datetime.utcnow(),
+                created_at=utcnow(),
             )
             db.add(db_generation)
             db.commit()

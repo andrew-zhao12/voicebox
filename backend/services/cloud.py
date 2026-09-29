@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 
 from .. import config
 from ..database import CloudSettings as DBCloudSettings
+from ..utils.clock import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +147,7 @@ def _store_key(db: Session, *, api_key: str, device_name: str | None, account_us
     row.api_key = api_key
     row.device_name = device_name
     row.account_user_id = account_user_id
-    row.connected_at = datetime.utcnow()
+    row.connected_at = utcnow()
     db.commit()
 
 

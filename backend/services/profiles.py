@@ -5,7 +5,7 @@ import logging
 import shutil
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from ..utils.clock import utcnow
 from pathlib import Path
 
 from sqlalchemy import func, or_
@@ -329,8 +329,8 @@ async def create_profile(
         default_engine=default_engine,
         personality=data.personality,
         owner_key_id=owner_key_id,
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow(),
+        created_at=utcnow(),
+        updated_at=utcnow(),
     )
 
     db.add(db_profile)
@@ -390,7 +390,7 @@ async def add_profile_sample(
 
     db.add(db_sample)
 
-    profile.updated_at = datetime.utcnow()
+    profile.updated_at = utcnow()
 
     db.commit()
     db.refresh(db_sample)
@@ -556,7 +556,7 @@ async def update_profile(
     profile.personality = data.personality
     if data.default_engine is not None:
         profile.default_engine = data.default_engine or None  # empty string → NULL
-    profile.updated_at = datetime.utcnow()
+    profile.updated_at = utcnow()
 
     db.commit()
     db.refresh(profile)
@@ -825,7 +825,7 @@ async def upload_avatar(
     process_avatar(image_path, str(output_path))
 
     profile.avatar_path = config.to_storage_path(output_path)
-    profile.updated_at = datetime.utcnow()
+    profile.updated_at = utcnow()
 
     db.commit()
     db.refresh(profile)
@@ -856,7 +856,7 @@ async def delete_avatar(
         avatar_path.unlink()
 
     profile.avatar_path = None
-    profile.updated_at = datetime.utcnow()
+    profile.updated_at = utcnow()
 
     db.commit()
 

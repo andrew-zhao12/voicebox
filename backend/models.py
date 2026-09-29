@@ -2,7 +2,7 @@
 Pydantic models for request/response validation.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Literal, Optional, List
 from datetime import datetime
 
@@ -54,8 +54,7 @@ class VoiceProfileResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ProfileSampleCreate(BaseModel):
@@ -78,8 +77,7 @@ class ProfileSampleResponse(BaseModel):
     audio_path: str
     reference_text: str
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class GenerationRequest(BaseModel):
@@ -150,8 +148,7 @@ class GenerationResponse(BaseModel):
     versions: Optional[List["GenerationVersionResponse"]] = None
     active_version_id: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class HistoryQuery(BaseModel):
@@ -184,8 +181,7 @@ class HistoryResponse(BaseModel):
     versions: Optional[List["GenerationVersionResponse"]] = None
     active_version_id: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class HistoryListResponse(BaseModel):
@@ -232,8 +228,7 @@ class CaptureResponse(BaseModel):
     refinement_flags: Optional[RefinementFlagsModel] = None
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class CaptureListResponse(BaseModel):
@@ -292,8 +287,7 @@ class CaptureSettingsResponse(BaseModel):
         default_factory=default_toggle_to_talk_chord
     )
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class CaptureSettingsUpdate(BaseModel):
@@ -321,8 +315,7 @@ class GenerationSettingsResponse(BaseModel):
     normalize_audio: bool = True
     autoplay_on_generate: bool = True
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class GenerationSettingsUpdate(BaseModel):
@@ -351,8 +344,7 @@ class MCPClientBindingResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class MCPClientBindingUpsert(BaseModel):
@@ -575,8 +567,7 @@ class AudioChannelResponse(BaseModel):
     device_ids: List[str]
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ChannelVoiceAssignment(BaseModel):
@@ -608,8 +599,7 @@ class StoryResponse(BaseModel):
     updated_at: datetime
     item_count: int = 0
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class StoryItemDetail(BaseModel):
@@ -640,8 +630,7 @@ class StoryItemDetail(BaseModel):
     versions: Optional[List["GenerationVersionResponse"]] = None
     active_version_id: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class StoryDetailResponse(BaseModel):
@@ -654,8 +643,7 @@ class StoryDetailResponse(BaseModel):
     updated_at: datetime
     items: List[StoryItemDetail] = []
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class StoryItemCreate(BaseModel):
@@ -762,8 +750,7 @@ class EffectPresetResponse(BaseModel):
     is_builtin: bool = False
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class GenerationVersionResponse(BaseModel):
@@ -778,8 +765,7 @@ class GenerationVersionResponse(BaseModel):
     is_default: bool
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ApplyEffectsRequest(BaseModel):

@@ -19,6 +19,7 @@ from backend.database import (
     session as db_session,
 )
 from backend.services import retention
+from backend.utils.clock import utcnow
 
 
 @pytest.fixture
@@ -30,13 +31,13 @@ def data_dir(tmp_path, monkeypatch):
 
 
 def _old(days: int) -> datetime:
-    return datetime.utcnow() - timedelta(days=days)
+    return utcnow() - timedelta(days=days)
 
 
 def _touch(path, *, days_old: int, size: int = 16) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"x" * size)
-    stamp = (datetime.utcnow() - timedelta(days=days_old)).timestamp()
+    stamp = (utcnow() - timedelta(days=days_old)).timestamp()
     os.utime(path, (stamp, stamp))
 
 
