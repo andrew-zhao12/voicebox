@@ -8,6 +8,7 @@ backend/tests/test_chunked_tts_stream.py
 backend/tests/test_config_paths.py
 backend/tests/test_cors.py
 backend/tests/test_encode.py
+backend/tests/test_host_allowlist.py
 backend/tests/test_idle_unload.py
 backend/tests/test_inference_slots.py
 backend/tests/test_keys_cli.py

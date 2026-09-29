@@ -128,6 +128,7 @@ ports:
 | `VOICEBOX_REQUIRE_GPU` | (unset) | `1` keeps `/health/ready` at `503` when no CUDA/ROCm device is visible. |
 | `HF_HUB_OFFLINE` | (unset) | `1` forbids model downloads at runtime (fleet replicas with baked or mounted models). |
 | `VOICEBOX_MCP_STATELESS` | (unset) | `1` makes every MCP tool call self-contained (no session id), required behind a load balancer. |
+| `VOICEBOX_ALLOWED_HOSTS` | (unset) | Comma-separated host names the server answers for (`voice.example.com`, `*.internal.example.com`); other `Host` headers get `400`. Loopback names and the probe paths always pass. |
 
 Every `VOICEBOX_*` variable in the table (and `HF_HUB_OFFLINE`) is forwarded from the shell you run `docker compose` in when set. Set `VOICEBOX_LOG_LEVEL` and the rest under `environment:` in a `docker-compose.override.yml`. The [Deployment Checklist](/overview/deployment) explains how they fit together, and [Scaling](/overview/scaling) covers several replicas.
 
@@ -196,6 +197,7 @@ The Docker image follows security best practices:
 - **Localhost binding** -- only accessible from the host machine by default
 - **Health checks** -- automatic restart if the server hangs (the public, minimal `/health` is polled every 30s)
 - **CORS restricted** -- only local origins allowed by default
+- **Host allowlist** -- set `VOICEBOX_ALLOWED_HOSTS` to the names the server is reached by; requests for any other `Host` are refused, which defeats DNS rebinding against a server on a private network
 - **Hardened responses** -- security headers on every response; unexpected errors return an `error_id` instead of details, which you can look up in `docker compose logs voicebox`
 
 ### TLS with Caddy

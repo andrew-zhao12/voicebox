@@ -301,6 +301,62 @@ def _content_length(headers: Headers) -> int:
         return 0
 
 
+# Probes and scrapers reach a replica by its address, not by the public name.
+HOST_EXEMPT_PATHS = frozenset({"/health", "/health/ready", "/metrics"})
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def normalize_host(raw: str | None) -> str:
+    """The host name of a ``Host`` header, lowercase, without port or IPv6 brackets."""
+    host = (raw or "").strip().lower()
+    if host.startswith("["):
+        return host[1:].split("]", 1)[0]
+    if host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    return host
+
+
+def host_allowed(host: str, allowed: tuple[str, ...]) -> bool:
+    """Whether *host* is loopback or matches an entry (``*.example.com`` matches any subdomain, not the apex)."""
+    if not host:
+        return False
+    if host in LOOPBACK_HOSTS:
+        return True
+    for pattern in allowed:
+        if pattern.startswith("*."):
+            if host.endswith(pattern[1:]) and len(host) > len(pattern) - 1:
+                return True
+        elif host == pattern:
+            return True
+    return False
+
+
+class HostAllowlistMiddleware:
+    """Reject requests whose ``Host`` is not one of ``VOICEBOX_ALLOWED_HOSTS`` (DNS-rebinding hardening).
+
+    Loopback names always pass, as do the probe and metrics paths, which
+    orchestrators call by address.  Installed only when the variable is set.
+    """
+
+    def __init__(self, app: ASGIApp, *, allowed: tuple[str, ...]) -> None:
+        self.app = app
+        self.allowed = tuple(h.lower() for h in allowed)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        path = str(scope.get("path", "/"))
+        host = normalize_host(Headers(scope=scope).get("host"))
+        if path in HOST_EXEMPT_PATHS or host_allowed(host, self.allowed):
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        await _json(scope, 400, "Host not allowed")(scope, receive, send)
+
+
 class SecurityHeadersMiddleware:
     """Defensive response headers; no CSP because the desktop webview loads media cross-origin."""
 

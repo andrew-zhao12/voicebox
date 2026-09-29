@@ -12,7 +12,13 @@ from ..observability.requestid import RequestIdMiddleware
 from .errors import unhandled_exception_handler
 from .keystore import KeyStore
 from .logfilter import install_access_log_redaction
-from .middleware import AuthMiddleware, BodyLimitMiddleware, RateLimitMiddleware, SecurityHeadersMiddleware
+from .middleware import (
+    AuthMiddleware,
+    BodyLimitMiddleware,
+    HostAllowlistMiddleware,
+    RateLimitMiddleware,
+    SecurityHeadersMiddleware,
+)
 from .principal import get_principal
 from .ratelimit import RateLimiter
 from .routes import router as auth_router
@@ -60,6 +66,8 @@ class SecurityRuntime:
         logger.info("API keys: %s", self.keystore.describe())
         if not self.settings.rate_limiting:
             logger.warning("Rate limiting is disabled (VOICEBOX_RATE_LIMITING=0)")
+        if self.settings.allowed_hosts:
+            logger.info("Allowed hosts: %s (plus loopback)", ", ".join(self.settings.allowed_hosts))
 
 
 _runtime: SecurityRuntime | None = None
@@ -124,10 +132,12 @@ def install_security(app: FastAPI, settings: SecuritySettings) -> SecurityRuntim
     """Add the security middlewares, the ``/auth`` routes and the error handler.
 
     Starlette's ``add_middleware`` inserts at the outside, so after this call
-    the stack is RequestId → CORS → SecurityHeaders → Auth → RateLimit →
-    BodyLimit → the middlewares the caller added before → router.  The
-    request id sits outermost so every response, including the auth
-    middleware's own 401s and 429s, carries ``X-Request-Id``.
+    the stack is RequestId → [HostAllowlist] → CORS → SecurityHeaders →
+    Auth → RateLimit → BodyLimit → the middlewares the caller added before
+    → router.  The request id sits outermost so every response, including
+    the auth middleware's own 401s and 429s and a host rejection, carries
+    ``X-Request-Id``; the host allowlist exists only with
+    ``VOICEBOX_ALLOWED_HOSTS`` set.
     """
     global _runtime
     runtime = build_runtime(settings)
@@ -137,6 +147,8 @@ def install_security(app: FastAPI, settings: SecuritySettings) -> SecurityRuntim
     app.add_middleware(AuthMiddleware, runtime=runtime)
     app.add_middleware(SecurityHeadersMiddleware)
     add_cors(app, settings)
+    if settings.allowed_hosts:
+        app.add_middleware(HostAllowlistMiddleware, allowed=settings.allowed_hosts)
     app.add_middleware(RequestIdMiddleware)
     app.include_router(auth_router)
     app.add_exception_handler(Exception, unhandled_exception_handler)

@@ -73,6 +73,7 @@ class SecuritySettings:
     body_limit_default: int
     body_limit_multipart: int
     cors_extra_origins: tuple[str, ...]
+    allowed_hosts: tuple[str, ...]
     frontend_dir: Path | None
 
     @classmethod
@@ -98,6 +99,7 @@ class SecuritySettings:
             return config.get_data_dir() / "api_keys.json"
 
         origins = tuple(o.strip() for o in env.get("VOICEBOX_CORS_ORIGINS", "").split(",") if o.strip())
+        hosts = tuple(h.strip().lower() for h in env.get("VOICEBOX_ALLOWED_HOSTS", "").split(",") if h.strip())
         multipart_mb = _env_int(env, "VOICEBOX_MAX_BODY_MB", DEFAULT_MULTIPART_LIMIT // MIB)
         return cls(
             api_key_env=api_key,
@@ -111,5 +113,6 @@ class SecuritySettings:
             body_limit_default=DEFAULT_BODY_LIMIT,
             body_limit_multipart=max(DEFAULT_BODY_LIMIT, multipart_mb * MIB),
             cors_extra_origins=origins,
+            allowed_hosts=hosts,
             frontend_dir=frontend_dir,
         )
