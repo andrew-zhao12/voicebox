@@ -2,7 +2,9 @@ name: Docker
 
 # Builds the CPU image, boots it with a Kokoro preload and synthesizes speech
 # through a client key; on pushes to main and on v* tags the image goes to
-# ghcr.io/<owner>/voicebox:<tag>-cpu. Tags also publish the CUDA image.
+# ghcr.io/<owner>/voicebox:<tag>-cpu. Tags also publish the CUDA image, and
+# "Run workflow" (workflow_dispatch) publishes main-cu128 or main-cpu on
+# demand, so a GPU host can pull a CUDA build without cutting a release.
 
 on:
   push:
@@ -30,12 +32,19 @@ on:
       - scripts/docker-smoke.sh
       - .github/workflows/docker.yml
   workflow_dispatch:
+    inputs:
+      variant:
+        description: "Image to build and push as main-<variant>"
+        type: choice
+        options: [cu128, cpu]
+        default: cu128
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   cpu:
+    if: github.event_name != 'workflow_dispatch' || inputs.variant == 'cpu'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -63,7 +72,7 @@ jobs:
         run: scripts/docker-smoke.sh voicebox:ci
 
       - name: Log in to GHCR
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -71,7 +80,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Image tags
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -83,7 +92,7 @@ jobs:
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Push the CPU image
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -94,7 +103,7 @@ jobs:
           cache-from: type=gha,scope=cpu
 
   cuda:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.variant == 'cu128')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -123,7 +132,8 @@ jobs:
           flavor: suffix=-cu128
           tags: |
             type=semver,pattern={{version}}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push the CUDA image
         uses: docker/build-push-action@v6
