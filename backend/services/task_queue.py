@@ -254,11 +254,13 @@ async def _lane_worker(lane: _Lane):
             held = job
             try:
                 if _skip_cancelled(job):
+                    held = None
                     continue
                 limit = engine_limit(job.engine)
                 async with lane.changed:
                     await lane.changed.wait_for(partial(_can_start, lane, job, limit))
                 if _skip_cancelled(job):  # cancelled while it waited for a slot
+                    held = None
                     continue
 
                 metrics.QUEUE_WAIT_SECONDS.observe(perf_counter() - job.enqueued_at)
@@ -273,8 +275,8 @@ async def _lane_worker(lane: _Lane):
                 _running_generation_tasks[job.generation_id] = task
                 _queued_generation_ids.discard(job.generation_id)
                 metrics.QUEUE_RUNNING.labels(lane.name).set(len(lane.running))
-            finally:
                 held = None
+            finally:
                 lane.queue.task_done()
     except asyncio.CancelledError:
         # Stopping the worker (shutdown, re-init) stops what it dispatched and
