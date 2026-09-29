@@ -286,11 +286,18 @@ async def _run_startup(application: FastAPI) -> None:
     security.startup()
 
     workers = task_queue.configured_workers()
-    if workers > 1 and get_backend_type() == "mlx":
-        logger.warning("VOICEBOX_GENERATION_WORKERS ignored: MLX inference stays on one lane")
-        workers = 1
-    init_queue(max_depth=security.settings.max_queue_depth, workers=workers)
+    engine_limits = task_queue.configured_engine_concurrency()
+    if get_backend_type() == "mlx":
+        if workers > 1:
+            logger.warning("VOICEBOX_GENERATION_WORKERS ignored: MLX inference stays on one lane")
+            workers = 1
+        if engine_limits:
+            logger.warning("VOICEBOX_ENGINE_CONCURRENCY ignored: MLX inference stays serial")
+            engine_limits = {}
+    init_queue(max_depth=security.settings.max_queue_depth, workers=workers, engine_concurrency=engine_limits)
     logger.info("Generation lanes: %s", ", ".join(task_queue.lane_names()))
+    if engine_limits:
+        logger.info("Engine concurrency: %s", ", ".join(f"{k}={v}" for k, v in sorted(engine_limits.items())))
 
     # uvicorn may have reconfigured its loggers after the import-time setup.
     if observability_logs.json_logging_enabled():

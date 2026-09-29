@@ -5,10 +5,14 @@ inference is strictly serial, which is what one GPU wants.  With
 ``VOICEBOX_GENERATION_WORKERS=2`` (``init_queue(workers=2)``) the work splits
 into a ``cpu`` and a ``gpu`` lane, each with its own FIFO and worker, so a
 CPU engine such as Kokoro synthesizes while a GPU engine does; jobs in the
-same lane still run one at a time.  Seeded jobs are *exclusive*:
-``torch.manual_seed`` is process-wide, so an exclusive job waits until the
-other lane is idle and blocks new starts until it finishes.  Model loading
-is serialized separately by ``services/generation.prepare_engine``.
+same lane run one at a time unless ``VOICEBOX_ENGINE_CONCURRENCY``
+(``init_queue(engine_concurrency=...)``) lets several jobs of one engine
+overlap: the lane's worker still takes jobs strictly in order, and the head
+job starts only when the lane is empty or already running its engine below
+that engine's limit, so a different engine never overtakes.  Seeded jobs
+are *exclusive*: ``torch.manual_seed`` is process-wide, so an exclusive job
+waits until everything is idle and blocks new starts until it finishes.
+Model loading is serialized separately by ``services/generation.prepare_engine``.
 """
 
 import asyncio
@@ -19,6 +23,7 @@ import time
 import traceback
 from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass, field
+from functools import partial
 from time import perf_counter
 from typing import Literal
 
@@ -41,6 +46,14 @@ LANE_CPU = "cpu"
 LANE_GPU = "gpu"
 WORKERS_ENV = "VOICEBOX_GENERATION_WORKERS"
 MAX_WORKERS = 2
+ENGINE_CONCURRENCY_ENV = "VOICEBOX_ENGINE_CONCURRENCY"
+MAX_ENGINE_CONCURRENCY = 4
+# Engines whose ``generate()`` keeps no per-call state on the shared model
+# object (reviewed 2026-09-29).  Chatterbox and Chatterbox Turbo are not on
+# the list: their ``generate(audio_prompt_path=...)`` stores the reference
+# voice on the model (``prepare_conditionals`` -> ``self.conds``), so two
+# concurrent calls would swap voices.
+CONCURRENCY_SAFE_ENGINES = frozenset({"kokoro", "qwen", "qwen_custom_voice", "luxtts", "tada"})
 
 
 class QueueFullError(Exception):
@@ -74,6 +87,13 @@ class _Lane:
     name: str
     queue: asyncio.Queue
     worker: asyncio.Task | None = None
+    # Jobs in flight on this lane (id -> task), the engine they share and
+    # whether the one running is exclusive; ``changed`` wakes the worker
+    # whenever a job finishes so the head of the queue can be reconsidered.
+    running: dict[str, asyncio.Task] = field(default_factory=dict)
+    running_engine: str | None = None
+    running_exclusive: bool = False
+    changed: asyncio.Condition = field(default_factory=asyncio.Condition)
 
 
 class _ExclusiveGate:
@@ -111,6 +131,8 @@ _queued_generation_ids: set[str] = set()
 _running_generation_tasks: dict[str, asyncio.Task] = {}
 _cancelled_generation_ids: set[str] = set()
 _max_depth: int = DEFAULT_MAX_DEPTH
+# Engine -> how many of its jobs may run at once in a lane (absent = 1).
+_engine_limits: dict[str, int] = {}
 # Pending (queued + running) jobs per owner (API key id), for per-key caps.
 _pending_by_owner: dict[str, int] = {}
 _job_owner: dict[str, str] = {}
@@ -132,6 +154,50 @@ def configured_workers(environ: Mapping[str, str] = os.environ) -> int:
     if value > MAX_WORKERS:
         logger.warning("%s=%d: only the cpu and gpu lanes exist; using %d", WORKERS_ENV, value, MAX_WORKERS)
     return max(1, min(value, MAX_WORKERS))
+
+
+def configured_engine_concurrency(environ: Mapping[str, str] = os.environ) -> dict[str, int]:
+    """``VOICEBOX_ENGINE_CONCURRENCY="kokoro=2,qwen=2"``: jobs of one engine that may run at once.
+
+    Only reviewed engines (``CONCURRENCY_SAFE_ENGINES``) may exceed 1, at most
+    ``MAX_ENGINE_CONCURRENCY``; anything else is logged and kept serial.
+    """
+    limits: dict[str, int] = {}
+    raw = environ.get(ENGINE_CONCURRENCY_ENV, "")
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name, _sep, value = item.partition("=")
+        name = name.strip().lower()
+        try:
+            count = int(value.strip())
+        except ValueError:
+            logger.warning("%s: %r is not engine=count; ignoring it", ENGINE_CONCURRENCY_ENV, item)
+            continue
+        if name not in CONCURRENCY_SAFE_ENGINES:
+            logger.warning(
+                "%s: %s is not reviewed for concurrent generation (safe: %s); keeping it serial",
+                ENGINE_CONCURRENCY_ENV,
+                name,
+                ", ".join(sorted(CONCURRENCY_SAFE_ENGINES)),
+            )
+            continue
+        if count > MAX_ENGINE_CONCURRENCY:
+            logger.warning("%s: %s=%d capped at %d", ENGINE_CONCURRENCY_ENV, name, count, MAX_ENGINE_CONCURRENCY)
+            count = MAX_ENGINE_CONCURRENCY
+        if count > 1:
+            limits[name] = count
+    return limits
+
+
+def engine_limit(engine: str | None) -> int:
+    """How many jobs of *engine* may run at once in one lane (1 unless configured)."""
+    return _engine_limits.get(engine, 1) if engine else 1
+
+
+def engine_limits() -> dict[str, int]:
+    return dict(_engine_limits)
 
 
 def create_background_task(coro) -> asyncio.Task:
@@ -162,49 +228,93 @@ def resolve_lane(lane: str | None) -> str:
     return lane if lane in _lanes else default_lane()
 
 
-async def _lane_worker(lane: _Lane):
-    """Run the lane's jobs one at a time."""
-    while True:
-        job = await lane.queue.get()
-        entered = False
-        try:
-            if job.generation_id in _cancelled_generation_ids:
-                _cancelled_generation_ids.discard(job.generation_id)
-                job.coro.close()
-                continue
+def _can_start(lane: _Lane, job: GenerationJob, limit: int) -> bool:
+    """Whether the head job may start now: an empty lane, or the same engine below its limit."""
+    if not lane.running:
+        return True
+    if job.exclusive or lane.running_exclusive:
+        return False
+    return job.engine is not None and job.engine == lane.running_engine and len(lane.running) < limit
 
-            metrics.QUEUE_WAIT_SECONDS.observe(perf_counter() - job.enqueued_at)
-            if _gate is not None:
-                await _gate.enter(job.exclusive)
-                entered = True
-            task = asyncio.create_task(job.coro)
-            _running_generation_tasks[job.generation_id] = task
-            _queued_generation_ids.discard(job.generation_id)
-            metrics.QUEUE_RUNNING.labels(lane.name).set(1)
+
+def _skip_cancelled(job: GenerationJob) -> bool:
+    if job.generation_id not in _cancelled_generation_ids:
+        return False
+    _cancelled_generation_ids.discard(job.generation_id)
+    job.coro.close()
+    return True
+
+
+async def _lane_worker(lane: _Lane):
+    """Dispatch the lane's jobs in order; same-engine jobs overlap up to the engine's limit (default 1)."""
+    held: GenerationJob | None = None  # taken off the queue, not dispatched yet
+    try:
+        while True:
+            job = await lane.queue.get()
+            held = job
             try:
-                await task
-            except asyncio.CancelledError:
-                # A cancelled job must not take the worker down with it, but a
-                # cancellation aimed at the worker itself (shutdown, test
-                # teardown) has to win even when the job was cancelled too.
-                current = asyncio.current_task()
-                if not task.cancelled() or (current is not None and current.cancelling()):
-                    raise
-        except Exception:
-            traceback.print_exc()
-            await _force_fail_if_active(
-                job.generation_id,
-                "Worker exited without writing terminal status",
-            )
-        finally:
-            metrics.QUEUE_RUNNING.labels(lane.name).set(0)
-            if entered and _gate is not None:
-                await _gate.leave(job.exclusive)
-            _running_generation_tasks.pop(job.generation_id, None)
-            _queued_generation_ids.discard(job.generation_id)
-            _release(job.generation_id)
-            lane.queue.task_done()
+                if _skip_cancelled(job):
+                    continue
+                limit = engine_limit(job.engine)
+                async with lane.changed:
+                    await lane.changed.wait_for(partial(_can_start, lane, job, limit))
+                if _skip_cancelled(job):  # cancelled while it waited for a slot
+                    continue
+
+                metrics.QUEUE_WAIT_SECONDS.observe(perf_counter() - job.enqueued_at)
+                entered = False
+                if _gate is not None:
+                    await _gate.enter(job.exclusive)
+                    entered = True
+                task = asyncio.create_task(_run_job(lane, job, entered))
+                lane.running[job.generation_id] = task
+                lane.running_engine = job.engine
+                lane.running_exclusive = job.exclusive
+                _running_generation_tasks[job.generation_id] = task
+                _queued_generation_ids.discard(job.generation_id)
+                metrics.QUEUE_RUNNING.labels(lane.name).set(len(lane.running))
+            finally:
+                held = None
+                lane.queue.task_done()
+    except asyncio.CancelledError:
+        # Stopping the worker (shutdown, re-init) stops what it dispatched and
+        # drops the job it was holding for a slot, as shutdown() drops queued ones.
+        for task in list(lane.running.values()):
+            task.cancel()
+        if held is not None:
+            held.coro.close()
+            _queued_generation_ids.discard(held.generation_id)
+            _release(held.generation_id)
             metrics.QUEUE_PENDING.set(pending_count())
+        raise
+
+
+async def _run_job(lane: _Lane, job: GenerationJob, entered: bool) -> None:
+    """Await one job and do the lane's bookkeeping when it ends, however it ends."""
+    try:
+        await job.coro
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        traceback.print_exc()
+        await _force_fail_if_active(
+            job.generation_id,
+            "Worker exited without writing terminal status",
+        )
+    finally:
+        if entered and _gate is not None:
+            await _gate.leave(job.exclusive)
+        lane.running.pop(job.generation_id, None)
+        if not lane.running:
+            lane.running_engine = None
+            lane.running_exclusive = False
+        _running_generation_tasks.pop(job.generation_id, None)
+        _queued_generation_ids.discard(job.generation_id)
+        _release(job.generation_id)
+        metrics.QUEUE_RUNNING.labels(lane.name).set(len(lane.running))
+        metrics.QUEUE_PENDING.set(pending_count())
+        async with lane.changed:
+            lane.changed.notify_all()
 
 
 async def _force_fail_if_active(generation_id: str, error: str) -> None:
@@ -382,19 +492,27 @@ async def shutdown(drain_timeout_s: float) -> bool:
     return drained
 
 
-def init_queue(force: bool = False, *, max_depth: int | None = None, workers: int = 1):
+def init_queue(
+    force: bool = False,
+    *,
+    max_depth: int | None = None,
+    workers: int = 1,
+    engine_concurrency: Mapping[str, int] | None = None,
+):
     """Create the lanes and start their workers.
 
     Must be called once during application startup (inside a running event
     loop).  ``workers=1`` keeps everything serial in one lane; ``workers=2``
-    creates the ``gpu`` and ``cpu`` lanes.
+    creates the ``gpu`` and ``cpu`` lanes.  ``engine_concurrency`` maps an
+    engine to how many of its jobs may run at once within a lane.
     """
-    global _lanes, _gate, _generation_worker_task, _max_depth
+    global _lanes, _gate, _generation_worker_task, _max_depth, _engine_limits
     global _queued_generation_ids, _running_generation_tasks, _cancelled_generation_ids
     global _pending_by_owner, _job_owner, _job_engine, _engine_last_used
 
     # Reset fully so a forced re-init (tests, restarts) never inherits a cap.
     _max_depth = DEFAULT_MAX_DEPTH if max_depth is None else max(1, max_depth)
+    _engine_limits = {name: max(1, int(count)) for name, count in (engine_concurrency or {}).items()}
 
     if worker_running():
         if not force:

@@ -16,6 +16,7 @@ Languages supported (via misaki G2P):
 """
 
 import asyncio
+import threading
 import logging
 import os
 from typing import Optional
@@ -127,6 +128,8 @@ class KokoroTTSBackend:
     def __init__(self):
         self._model = None
         self._pipelines: dict = {}  # lang_code -> KPipeline
+        # Concurrent generations (VOICEBOX_ENGINE_CONCURRENCY) must not build the same pipeline twice.
+        self._pipeline_lock = threading.Lock()
         self._device: Optional[str] = None
         self.model_size = "default"
 
@@ -183,17 +186,18 @@ class KokoroTTSBackend:
         """Get or create a KPipeline for the given language code."""
         kokoro_lang = LANG_CODE_MAP.get(lang_code, "a")
 
-        if kokoro_lang not in self._pipelines:
-            from kokoro import KPipeline
+        with self._pipeline_lock:
+            if kokoro_lang not in self._pipelines:
+                from kokoro import KPipeline
 
-            # Create pipeline with our existing model (no redundant model loading)
-            self._pipelines[kokoro_lang] = KPipeline(
-                lang_code=kokoro_lang,
-                repo_id=KOKORO_HF_REPO,
-                model=self._model,
-            )
+                # Create pipeline with our existing model (no redundant model loading)
+                self._pipelines[kokoro_lang] = KPipeline(
+                    lang_code=kokoro_lang,
+                    repo_id=KOKORO_HF_REPO,
+                    model=self._model,
+                )
 
-        return self._pipelines[kokoro_lang]
+            return self._pipelines[kokoro_lang]
 
     def unload_model(self) -> None:
         """Unload model to free memory."""

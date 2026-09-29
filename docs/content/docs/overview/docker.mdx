@@ -120,6 +120,7 @@ ports:
 | `VOICEBOX_LOG_FORMAT` | (plain) | `json` for one JSON object per log line with the request id and key id. |
 | `VOICEBOX_METRICS_PORT` | (unset) | Serve Prometheus metrics on this extra port without a key (the authenticated `GET /metrics` is always on). |
 | `VOICEBOX_GENERATION_WORKERS` | `1` | `2` runs a CPU engine and a GPU engine at the same time (separate lanes); jobs of one lane still run one at a time. Ignored on Apple Silicon. |
+| `VOICEBOX_ENGINE_CONCURRENCY` | (unset) | `kokoro=2,qwen=2`: jobs of one engine that may run at once within a lane (reviewed engines only, at most 4). Off by default; measure before enabling. Ignored on Apple Silicon. |
 | `VOICEBOX_MODEL_IDLE_UNLOAD_S` | (unset) | Unload models unused for this many seconds (minimum 30); preloaded models stay. |
 | `VOICEBOX_SEED_PROFILES` | (unset) | Directory of `.voicebox.zip` voice bundles imported at boot (skipped when the name exists); `/health/ready` waits for it. |
 | `VOICEBOX_API_KEYS_JSON` | `/app/data/api_keys.json` | Path of the hashed client-key file, for example a mounted secret shared by every replica. |
