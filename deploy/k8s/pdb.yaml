@@ -1,0 +1,12 @@
+# One replica stays up while the cluster autoscaler or an upgrade drains a node;
+# the pod's own drain (VOICEBOX_SHUTDOWN_DELAY_S) handles the eviction itself.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: voicebox
+  namespace: voicebox
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: voicebox

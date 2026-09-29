@@ -3,7 +3,7 @@
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["EC2"],
   "cpu": "4096",
-  "memory": "28672",
+  "memory": "14336",
   "executionRoleArn": "arn:aws:iam::ACCOUNT:role/ecsTaskExecutionRole",
   "taskRoleArn": "arn:aws:iam::ACCOUNT:role/voicebox-task",
   "containerDefinitions": [

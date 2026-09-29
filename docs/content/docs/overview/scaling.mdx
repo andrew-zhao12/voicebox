@@ -30,7 +30,7 @@ Everything else a replica writes (its SQLite, prompt cache, generated files) is 
 | `VOICEBOX_SHUTDOWN_DELAY_S` | 10 (15 on ECS, 5 on Cloud Run) | after `SIGTERM` the replica fails readiness but keeps serving, so the balancer stops routing before the listener closes; scale-in drops no requests |
 | Termination grace | 90 s | the delay, 40 s for open streams, 30 s queue drain, margin |
 | Scaling target | 2 concurrent requests per replica (4 with `VOICEBOX_GENERATION_WORKERS=2`) | one job runs while one waits per lane |
-| `VOICEBOX_MAX_QUEUE_DEPTH` | target + 2 | a replica answers `503` + `Retry-After` only when the balancer overshoots; the OpenAI SDKs retry `503` twice on their own |
+| `VOICEBOX_MAX_QUEUE_DEPTH` | target + 2 | a replica answers `429` + `Retry-After` only when the balancer overshoots (`503` only while it drains); the OpenAI SDKs retry both twice on their own |
 | Load-balancer request timeout | 600 s or more where configurable | a long text streams for minutes |
 | Minimum replicas | 1 | a cold start is an image pull plus a model load |
 | Maximum replicas | your GPU quota | |

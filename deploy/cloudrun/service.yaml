@@ -1,6 +1,8 @@
 # Cloud Run service with one NVIDIA L4 per instance.
 #   gcloud run services replace deploy/cloudrun/service.yaml --region us-central1
-# Placeholders: PROJECT, IMAGE, the two buckets and the secrets (see README.md).
+# Placeholders: PROJECT (3x), OWNER/VERSION of the image, the two buckets and
+# the three secrets (see README.md). Add VOICEBOX_ALLOWED_HOSTS once the
+# run.app hostname exists (gcloud run services update --update-env-vars).
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
@@ -48,18 +50,28 @@ spec:
                 secretKeyRef:
                   name: voicebox-admin-key
                   key: latest
+            - name: VOICEBOX_MEDIA_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: voicebox-media-token-secret
+                  key: latest
             - name: VOICEBOX_MAX_QUEUE_DEPTH
               value: "4"
             - name: VOICEBOX_RETENTION_DAYS
               value: "1"
             - name: VOICEBOX_SHUTDOWN_DELAY_S
               value: "5"
+            # Below timeoutSeconds: Cloud Run cuts a WebSocket at the request timeout.
+            - name: VOICEBOX_REALTIME_MAX_SESSION_S
+              value: "840"
             - name: VOICEBOX_MCP_STATELESS
               value: "1"
             - name: VOICEBOX_LOG_FORMAT
               value: json
             - name: VOICEBOX_DISABLE_DOCS
               value: "1"
+            - name: VOICEBOX_METRICS_PORT
+              value: "9464"
             - name: VOICEBOX_REQUIRE_GPU
               value: "1"
             - name: FORWARDED_ALLOW_IPS

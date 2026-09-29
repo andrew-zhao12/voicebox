@@ -22,10 +22,11 @@ two replicas behind Caddy with the same inputs, checked by
    `VOICEBOX_SEED_PROFILES=/seed`. Applied at boot, idempotent by name;
    `GET /health/ready` waits for it. Preset voices (`af_heart`, `Ryan`, ...)
    need no seed at all.
-2. **Keys**: `api_keys.json` (`python -m backend.keys create --id myapp
-   --role client --data-dir ./secrets`) mounted as a file and named by
-   `VOICEBOX_API_KEYS_JSON`; the admin key as the `VOICEBOX_API_KEY` secret.
-   The file holds SHA-256 digests only, never plaintext keys.
+2. **Keys**: `api_keys.json` (`CLIENT_KEY=$(python -m backend.keys create
+   --id myapp --role client --data-dir ./secrets)`, which prints the key
+   once) mounted as a file and named by `VOICEBOX_API_KEYS_JSON`; the admin
+   key as the `VOICEBOX_API_KEY` secret. The file holds SHA-256 digests
+   only, never plaintext keys.
 3. **Models**: either baked into the image (`docker build --build-arg
    VOICEBOX_BAKE_MODELS=kokoro,whisper-turbo`) or on a volume filled once
    with `python -m backend.preload ...` and mounted at `/models`
@@ -41,9 +42,12 @@ two replicas behind Caddy with the same inputs, checked by
 | `VOICEBOX_SHUTDOWN_DELAY_S` | 10 (15 on ECS, 5 on Cloud Run) | after SIGTERM, readiness answers 503 but requests are still served, so the load balancer stops routing before the listener closes |
 | Termination grace | 90 s | shutdown delay + 40 s for open streams + `VOICEBOX_DRAIN_TIMEOUT_S` (30) + margin |
 | Scaling target | 2 concurrent requests per replica (4 with `VOICEBOX_GENERATION_WORKERS=2`) | one job runs, one waits per lane |
-| `VOICEBOX_MAX_QUEUE_DEPTH` | scaling target + 2 | the replica answers 503 + `Retry-After` only when the platform overshoots; OpenAI SDKs retry 503 |
+| `VOICEBOX_MAX_QUEUE_DEPTH` | scaling target + 2 | the replica answers 429 + `Retry-After` only when the platform overshoots (503 only while it drains); the OpenAI SDKs retry both |
 | Request timeout at the load balancer | at least 600 s where configurable | long generations stream for minutes; Azure's fixed 240 s means capping `tts_chars` per key |
 | WebSockets (`/v1/realtime/transcription`) | enabled, with the connection timeout at or above `VOICEBOX_REALTIME_MAX_SESSION_S` | every platform below proxies WebSockets; the timeout that applies to a request applies to the whole session |
+| `VOICEBOX_REALTIME_MAX_SESSION_S` | below the platform's request timeout (840 on Cloud Run and ingress-nginx, 230 on Azure) | the server ends a live session cleanly (close 1000) before the proxy cuts it |
+| `VOICEBOX_MEDIA_TOKEN_SECRET` | one random string of 32+ characters shared by every replica | media tokens (`?token=` for browsers) verify on any replica |
+| `VOICEBOX_ALLOWED_HOSTS` | the public hostname(s), set once they exist | requests with a foreign `Host` header get 400; probes and loopback are exempt |
 | Minimum replicas | 1 | cold start = image pull + model load; 0 only when that latency is acceptable |
 | Maximum replicas | your GPU quota | Cloud Run gives 3 L4 per region by default |
 | `VOICEBOX_RETENTION_DAYS` | 1 | replicas keep nothing worth backing up |
@@ -72,10 +76,10 @@ replica count in mind when a fleet-wide budget matters.
 
 ```bash
 scripts/fleet-check.sh https://voice.example.com "$CLIENT_KEY" --rounds 6
-scripts/load_test.py --url https://voice.example.com --key "$CLIENT_KEY" --voice af_heart --model kokoro --concurrency 4 --requests 20
+backend/venv/bin/python scripts/load_test.py --url https://voice.example.com --key "$CLIENT_KEY" --voice af_heart --model kokoro --concurrency 4 --requests 20
 ```
 
-Then watch `voicebox_queue_pending_jobs`, the 503 rate and
+Then watch `voicebox_queue_pending_jobs`, the 429 rate and
 `voicebox_stream_first_chunk_seconds` while the load test runs; the scaling
 target is right when new replicas appear before requests queue for more
 than a few seconds.

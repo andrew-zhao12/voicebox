@@ -1,6 +1,9 @@
 # KEDA (https://keda.sh) scales the Deployment on the queue depth the
 # replicas export: desired replicas = ceil(sum(pending jobs) / threshold).
 # Requires a Prometheus that scrapes the `metrics` port (servicemonitor.yaml).
+# serverAddress is the Prometheus Service of kube-prometheus-stack installed
+# as release `prometheus` in namespace `monitoring` (which the ServiceMonitor
+# label assumes); confirm with `kubectl -n monitoring get svc`.
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -21,6 +24,6 @@ spec:
   triggers:
     - type: prometheus
       metadata:
-        serverAddress: http://prometheus.monitoring.svc:9090
+        serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
         query: sum(voicebox_queue_pending_jobs{namespace="voicebox"})
         threshold: "2"

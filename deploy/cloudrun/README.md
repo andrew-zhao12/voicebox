@@ -10,7 +10,11 @@ Everything below is `gcloud`; the service definition is `service.yaml`.
 export PROJECT=my-project REGION=us-central1
 gcloud config set project $PROJECT
 
-# Models: fill a bucket once from a machine that can download them.
+# Models: fill a bucket once from a machine that can download them. Use a
+# Linux machine or the CPU image (`docker run --rm -v $PWD/models-cache:/models
+# -e VOICEBOX_MODELS_DIR=/models ghcr.io/OWNER/voicebox:VERSION-cpu python -m
+# backend.preload kokoro whisper-turbo`): on Apple Silicon the Qwen TTS names
+# resolve to MLX repositories the CUDA image cannot use.
 VOICEBOX_MODELS_DIR=./models-cache python -m backend.preload kokoro whisper-turbo
 gsutil mb -l $REGION gs://$PROJECT-voicebox-models
 gsutil -m rsync -r ./models-cache gs://$PROJECT-voicebox-models
@@ -21,14 +25,19 @@ gsutil mb -l $REGION gs://$PROJECT-voicebox-seed
 gsutil -m rsync -r ./seed gs://$PROJECT-voicebox-seed
 
 # Keys: api_keys.json (hashes only) and the admin key as secrets.
-python -m backend.keys create --id myapp --role client --data-dir ./secrets   # prints the client key once
+CLIENT_KEY=$(python -m backend.keys create --id myapp --role client --data-dir ./secrets)   # printed once; keep it
 gcloud secrets create voicebox-keys-json --data-file=./secrets/api_keys.json
-openssl rand -base64 32 | gcloud secrets create voicebox-admin-key --data-file=-
+ADMIN_KEY=$(openssl rand -base64 32)          # keep it: it is the admin key of the fleet
+printf '%s' "$ADMIN_KEY" | gcloud secrets create voicebox-admin-key --data-file=-
+MEDIA_SECRET=$(openssl rand -base64 48)       # shared by every instance so media tokens verify anywhere
+printf '%s' "$MEDIA_SECRET" | gcloud secrets create voicebox-media-token-secret --data-file=-
 
-# A service account that may read both buckets and both secrets.
+# A service account that may write the models bucket (lock files), read the
+# seed bucket and read the three secrets.
 gcloud iam service-accounts create voicebox-sa
-for b in models seed; do gsutil iam ch serviceAccount:voicebox-sa@$PROJECT.iam.gserviceaccount.com:objectViewer gs://$PROJECT-voicebox-$b; done
-for s in voicebox-keys-json voicebox-admin-key; do gcloud secrets add-iam-policy-binding $s --member=serviceAccount:voicebox-sa@$PROJECT.iam.gserviceaccount.com --role=roles/secretmanager.secretAccessor; done
+gsutil iam ch serviceAccount:voicebox-sa@$PROJECT.iam.gserviceaccount.com:roles/storage.objectUser gs://$PROJECT-voicebox-models
+gsutil iam ch serviceAccount:voicebox-sa@$PROJECT.iam.gserviceaccount.com:objectViewer gs://$PROJECT-voicebox-seed
+for s in voicebox-keys-json voicebox-admin-key voicebox-media-token-secret; do gcloud secrets add-iam-policy-binding $s --member=serviceAccount:voicebox-sa@$PROJECT.iam.gserviceaccount.com --role=roles/secretmanager.secretAccessor; done
 ```
 
 Alternatively bake a small model set into the image
@@ -40,8 +49,9 @@ prevents downloads.
 
 ## 2. Deploy
 
-Edit `service.yaml` (PROJECT, OWNER/VERSION of the image, bucket names),
-then:
+Edit `service.yaml` (PROJECT, OWNER/VERSION of the image, bucket names;
+a public image on ghcr.io deploys directly, a private one must be copied
+into Artifact Registry), then:
 
 ```bash
 gcloud run services replace deploy/cloudrun/service.yaml --region $REGION
@@ -60,7 +70,7 @@ proxy only if you want Google IAM in front as well.
 
 - Cloud Run adds an instance when every instance has `containerConcurrency`
   requests in flight; a queue depth of 4 inside the replica absorbs brief
-  overshoot, and the OpenAI SDKs retry the rare 503.
+  overshoot, and the OpenAI SDKs retry the rare 429.
 - Shutdown: Cloud Run stops routing to an instance before it sends SIGTERM
   and allows 10 s before SIGKILL, so the recipe keeps a short
   `VOICEBOX_SHUTDOWN_DELAY_S=5` and relies on `minScale` to avoid shutting
@@ -82,5 +92,5 @@ and `VOICEBOX_REALTIME_MAX_SESSION_S` should stay below it.
 ```bash
 URL=$(gcloud run services describe voicebox --region $REGION --format='value(status.url)')
 scripts/fleet-check.sh "$URL" "$CLIENT_KEY" --rounds 6
-scripts/load_test.py --url "$URL" --key "$CLIENT_KEY" --voice af_heart --model kokoro --concurrency 4 --requests 20
+backend/venv/bin/python scripts/load_test.py --url "$URL" --key "$CLIENT_KEY" --voice af_heart --model kokoro --concurrency 4 --requests 20
 ```

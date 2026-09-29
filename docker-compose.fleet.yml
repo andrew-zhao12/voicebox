@@ -8,6 +8,7 @@
 # and generated audio in its own volume, so the stateless /v1 API scales by
 # adding replicas; history and the admin UI stay per replica.
 #
+#   docker build -t voicebox:local .            # native CPU image (amd64 or arm64)
 #   export VOICEBOX_API_KEY="$(openssl rand -base64 32)"
 #   VOICEBOX_IMAGE=voicebox:local docker compose -f docker-compose.fleet.yml up
 #   scripts/fleet-check.sh http://127.0.0.1:17600 <client key> --rounds 6

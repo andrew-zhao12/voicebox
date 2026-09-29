@@ -18,9 +18,10 @@ instance or a one-off task in the same VPC:
 sudo mount -t efs -o tls fs-EFS:/ /mnt/efs
 VOICEBOX_MODELS_DIR=/mnt/efs/models python -m backend.preload kokoro whisper-turbo
 python -m backend.voices export /mnt/efs/seed
-python -m backend.keys create --id myapp --role client --data-dir /mnt/efs/secrets   # prints the client key once
-aws secretsmanager create-secret --name voicebox/admin-key --secret-string "$(openssl rand -base64 32)"
-aws secretsmanager create-secret --name voicebox/media-token-secret --secret-string "$(openssl rand -base64 32)"
+CLIENT_KEY=$(python -m backend.keys create --id myapp --role client --data-dir /mnt/efs/secrets)   # printed once; keep it
+ADMIN_KEY=$(openssl rand -base64 32)   # keep it: the admin key of the fleet
+aws secretsmanager create-secret --name voicebox/admin-key --secret-string "$ADMIN_KEY"
+aws secretsmanager create-secret --name voicebox/media-token-secret --secret-string "$(openssl rand -base64 48)"
 ```
 
 EFS is fine for a few gigabytes of model files read once per boot; for
@@ -32,12 +33,13 @@ or on an instance-local NVMe warmed by the user data script.
 ```bash
 export REGION=us-east-1
 aws ecs create-cluster --cluster-name voicebox
-AMI=$(aws ssm get-parameters --names /aws/service/ecs/optimized-ami/amazon-linux-2/gpu/recommended --region $REGION --query 'Parameters[0].Value' --output text | python3 -c 'import json,sys; print(json.load(sys.stdin)["image_id"])')
+# The ECS GPU-optimized AMI (Amazon Linux 2023; the amazon-linux-2 parameter still exists for older accounts).
+AMI=$(aws ssm get-parameters --names /aws/service/ecs/optimized-ami/amazon-linux-2023/gpu/recommended --region $REGION --query 'Parameters[0].Value' --output text | python3 -c 'import json,sys; print(json.load(sys.stdin)["image_id"])')
 # Launch template: the GPU-optimized AMI, ECS_ENABLE_GPU_SUPPORT=true and the cluster name in user data.
 aws ec2 create-launch-template --launch-template-name voicebox-gpu --launch-template-data "{
   \"ImageId\": \"$AMI\", \"InstanceType\": \"g6.xlarge\",
   \"IamInstanceProfile\": {\"Name\": \"ecsInstanceRole\"},
-  \"UserData\": \"$(printf '#!/bin/bash\necho ECS_CLUSTER=voicebox >> /etc/ecs/ecs.config\necho ECS_ENABLE_GPU_SUPPORT=true >> /etc/ecs/ecs.config\n' | base64 -w0)\"
+  \"UserData\": \"$(printf '#!/bin/bash\necho ECS_CLUSTER=voicebox >> /etc/ecs/ecs.config\necho ECS_ENABLE_GPU_SUPPORT=true >> /etc/ecs/ecs.config\n' | base64 | tr -d '\n')\"
 }"
 aws autoscaling create-auto-scaling-group --auto-scaling-group-name voicebox-gpu \
   --launch-template LaunchTemplateName=voicebox-gpu --min-size 1 --max-size 4 --desired-capacity 1 \
@@ -49,7 +51,10 @@ aws ecs put-cluster-capacity-providers --cluster voicebox --capacity-providers v
 
 Managed scaling adds a g6 instance when a task cannot be placed and
 removes idle ones; a new GPU instance takes a few minutes to join, which is
-why the service keeps at least one task.
+why the service keeps at least one task. The task definition reserves
+14 GiB (`"memory": "14336"`), which fits the 16 GiB of a g6.xlarge with
+room for the agent; on a g6.2xlarge (32 GiB) raise it to 28672 for the
+larger engines.
 
 ## 3. Load balancer and service
 
