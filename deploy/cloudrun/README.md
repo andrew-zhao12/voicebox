@@ -55,6 +55,8 @@ into Artifact Registry), then:
 
 ```bash
 gcloud run services replace deploy/cloudrun/service.yaml --region $REGION
+# `services replace` does not grant public invocation (`gcloud run deploy --allow-unauthenticated` would):
+gcloud run services add-iam-policy-binding voicebox --region $REGION --member=allUsers --role=roles/run.invoker
 gcloud run services describe voicebox --region $REGION --format='value(status.url)'
 ```
 
@@ -62,9 +64,10 @@ The equivalent flags for `gcloud run deploy` are `--gpu 1 --gpu-type nvidia-l4
 --cpu 8 --memory 32Gi --concurrency 2 --timeout 900 --min-instances 1
 --max-instances 3 --no-cpu-throttling --no-gpu-zonal-redundancy`.
 
-Access: the service is public (`ingress: all`) and every route needs a
-Voicebox key anyway; add `--no-allow-unauthenticated` plus an ID-token
-proxy only if you want Google IAM in front as well.
+Access: `ingress: all` lets internet traffic reach the service and the
+`allUsers` invoker binding lets it in without a Google identity; every
+route still needs a Voicebox key. Skip the binding and put an ID-token
+proxy in front only if you want Google IAM as well.
 
 ## 3. Scale and observe
 
