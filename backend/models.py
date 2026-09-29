@@ -116,6 +116,15 @@ class StreamGenerationRequest(GenerationRequest):
             "pcm: raw signed 16-bit little-endian mono samples"
         ),
     )
+    speed: float = Field(
+        default=1.0,
+        ge=0.25,
+        le=4.0,
+        description=(
+            "Playback rate: Kokoro synthesizes at this rate; other engines are "
+            "time-stretched after synthesis with the pitch preserved"
+        ),
+    )
     first_chunk_chars: int | None = Field(
         default=DEFAULT_FIRST_CHUNK_CHARS,
         ge=20,

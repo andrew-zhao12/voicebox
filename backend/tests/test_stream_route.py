@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from backend import models
 from backend.auth.principal import KeyLimits, Principal
@@ -271,3 +272,21 @@ async def test_streaming_job_forwards_failures_after_the_first_chunk(fake_backen
     fake_backend.gate.set()
     second = await asyncio.wait_for(session.frames.get(), timeout=1)
     assert isinstance(second, RuntimeError)
+
+
+async def test_generate_stream_accepts_speed(fake_backend, monkeypatch):
+    calls: list[float] = []
+
+    def fake_stretch(audio, sample_rate, speed):
+        calls.append(speed)
+        return audio[::2]
+
+    monkeypatch.setattr(generation_service, "_time_stretch", fake_stretch)
+    response = await generations.stream_speech(request(format="pcm", speed=2.0), db=FakeDb())
+    body = await drain(response)
+    assert calls
+    assert set(calls) == {2.0}
+    assert len(body) < len(TEXT) * 2
+
+    with pytest.raises(ValidationError):
+        request(speed=0.1)

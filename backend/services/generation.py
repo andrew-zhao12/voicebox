@@ -23,19 +23,19 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Literal, Optional
+from typing import Literal
 
 import numpy as np
 
 from .. import config, models
 from ..auth import charge
 from ..auth.principal import Principal
-from . import history, personality, profiles, task_queue
-from .inference_slots import InferenceBusyError, llm_slot
-from .task_queue import QueueFullError, cancel_generation, enqueue_generation, ensure_capacity
 from ..database import get_db
 from ..observability import metrics
 from ..utils.tasks import get_task_manager
+from . import history, personality, profiles, task_queue
+from .inference_slots import InferenceBusyError, llm_slot
+from .task_queue import QueueFullError, cancel_generation, enqueue_generation, ensure_capacity
 
 logger = logging.getLogger(__name__)
 
@@ -189,22 +189,22 @@ async def run_generation(
     language: str,
     engine: str,
     model_size: str,
-    seed: Optional[int],
+    seed: int | None,
     normalize: bool = False,
-    effects_chain: Optional[list] = None,
-    instruct: Optional[str] = None,
+    effects_chain: list | None = None,
+    instruct: str | None = None,
     mode: Literal["generate", "retry", "regenerate"],
-    max_chunk_chars: Optional[int] = None,
-    crossfade_ms: Optional[int] = None,
-    version_id: Optional[str] = None,
+    max_chunk_chars: int | None = None,
+    crossfade_ms: int | None = None,
+    version_id: str | None = None,
 ) -> None:
     """Execute TTS inference and persist the result.
 
     This is the single entry point for all background generation work.
     It is designed to be enqueued via ``services.task_queue.enqueue_generation``.
     """
-    from ..utils.chunked_tts import generate_chunked
     from ..utils.audio import normalize_audio, save_audio
+    from ..utils.chunked_tts import generate_chunked
 
     task_manager = get_task_manager()
     bg_db = next(get_db())
@@ -324,6 +324,19 @@ def new_stream_session() -> StreamSession:
     return StreamSession(job_id=f"{task_queue.STREAM_JOB_PREFIX}{uuid.uuid4()}")
 
 
+# Engines that take the playback rate themselves; every other engine is
+# time-stretched after synthesis (``_time_stretch``).
+NATIVE_SPEED_ENGINES = frozenset({"kokoro"})
+
+
+def _time_stretch(audio: np.ndarray, sample_rate: int, speed: float) -> np.ndarray:
+    """Change the duration of *audio* by ``1/speed`` with the pitch preserved (Rubber Band via pedalboard)."""
+    from pedalboard import time_stretch  # lazy: native library
+
+    stretched = time_stretch(np.ascontiguousarray(audio, dtype=np.float32), sample_rate, stretch_factor=float(speed))
+    return np.asarray(stretched, dtype=np.float32).reshape(-1)
+
+
 async def run_generation_stream(
     *,
     session: StreamSession,
@@ -340,6 +353,7 @@ async def run_generation_stream(
     crossfade_ms: int,
     first_chunk_chars: int | None,
     voice_prompt: dict | None = None,
+    speed: float = 1.0,
 ) -> None:
     """Queued job behind ``POST /generate/stream``.
 
@@ -347,7 +361,9 @@ async def run_generation_stream(
     ``session.frames``.  Like :func:`run_generation` it runs inside the serial
     queue, so model loading, voice-prompt creation and inference never
     overlap other GPU work.  It writes no ``generations`` row; failures are
-    delivered to the consumer instead of the worker.
+    delivered to the consumer instead of the worker.  A *speed* other than
+    1.0 is handed to engines that support it and applied as a time stretch
+    to every chunk of the others.
     """
     from ..utils.audio import StreamingNormalizer
     from ..utils.chunked_tts import generate_chunked_stream
@@ -365,11 +381,18 @@ async def run_generation_stream(
 
         normalizer = StreamingNormalizer() if normalize else None
         effects = StreamingEffects(effects_chain) if effects_chain else None
+        engine_prompt = prep.voice_prompt
+        stretch: float | None = None
+        if speed != 1.0:
+            if engine in NATIVE_SPEED_ENGINES:
+                engine_prompt = {**prep.voice_prompt, "speed": speed}
+            else:
+                stretch = speed
 
         async for audio, sample_rate in generate_chunked_stream(
             prep.backend,
             text,
-            prep.voice_prompt,
+            engine_prompt,
             language=language,
             seed=seed,
             instruct=instruct,
@@ -383,8 +406,8 @@ async def run_generation_stream(
             if session.consumer_gone.is_set():
                 outcome = "abandoned"
                 break
-            if normalizer is not None or effects is not None:
-                audio = await asyncio.to_thread(_post_process_chunk, audio, sample_rate, normalizer, effects)
+            if normalizer is not None or effects is not None or stretch is not None:
+                audio = await asyncio.to_thread(_post_process_chunk, audio, sample_rate, normalizer, effects, stretch)
             frames.put_nowait((audio, sample_rate))
         else:
             outcome = "completed"
@@ -403,8 +426,10 @@ async def run_generation_stream(
         metrics.GENERATIONS.labels(engine, "stream", outcome).inc()
 
 
-def _post_process_chunk(audio, sample_rate: int, normalizer, effects):
-    """Normalize then apply effects, in the same order as ``run_generation``."""
+def _post_process_chunk(audio, sample_rate: int, normalizer, effects, stretch: float | None = None):
+    """Time-stretch, normalize, then apply effects (the last two in the same order as ``run_generation``)."""
+    if stretch is not None:
+        audio = _time_stretch(audio, sample_rate, stretch)
     if normalizer is not None:
         audio = normalizer.process(audio)
     if effects is not None:
@@ -431,7 +456,7 @@ def _save_generate(
     generation_id: str,
     audio,
     sample_rate: int,
-    effects_chain: Optional[list],
+    effects_chain: list | None,
     save_audio,
     db,
 ) -> str:
@@ -601,6 +626,7 @@ async def open_stream(
                 crossfade_ms=data.crossfade_ms,
                 first_chunk_chars=first_chunk_chars,
                 voice_prompt=voice_prompt,
+                speed=data.speed,
             ),
             owner=principal.key_id,
             max_pending=principal.limits.max_pending_jobs,
@@ -659,7 +685,7 @@ async def stream_frames(opened: OpenedStream) -> AsyncIterator[np.ndarray]:
 def _save_regenerate(
     *,
     generation_id: str,
-    version_id: Optional[str],
+    version_id: str | None,
     audio,
     sample_rate: int,
     save_audio,
@@ -669,9 +695,9 @@ def _save_regenerate(
 
     Returns the audio path.
     """
-    from . import versions as versions_mod
-
     import uuid as _uuid
+
+    from . import versions as versions_mod
 
     suffix = _uuid.uuid4().hex[:8]
     audio_path = config.get_generations_dir() / f"{generation_id}_{suffix}.wav"

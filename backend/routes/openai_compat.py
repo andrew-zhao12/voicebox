@@ -114,11 +114,10 @@ async def create_speech(data: models.OpenAISpeechRequest, request: Request, db: 
     ``tts-1`` for the voice's default engine, or a model or engine name from
     ``GET /v1/models``.  ``wav`` and ``pcm`` stream chunk by chunk; the
     compressed formats stream when ffmpeg is installed and are otherwise
-    sent once the clip is complete.
+    sent once the clip is complete.  ``speed`` (0.25-4.0) is native on
+    Kokoro and a pitch-preserving time stretch on every other engine.
     """
     principal = get_principal()
-    if data.speed != 1.0:
-        raise fail(400, "speed other than 1.0 is not supported", code="unsupported_value", param="speed")
     formats = encode.available_formats()
     if data.response_format not in formats:
         raise fail(
@@ -140,6 +139,7 @@ async def create_speech(data: models.OpenAISpeechRequest, request: Request, db: 
             model_size=model_size,
             instruct=data.instructions,
             format="pcm",
+            speed=data.speed,
         )
     except ValidationError as e:
         first = e.errors()[0] if e.errors() else {}

@@ -263,6 +263,7 @@ class KokoroTTSBackend:
         await self.load_model()
 
         voice_name = voice_prompt.get("preset_voice_id") or voice_prompt.get("kokoro_voice") or KOKORO_DEFAULT_VOICE
+        speed = float(voice_prompt.get("speed") or 1.0)
 
         def _generate_sync():
             import torch
@@ -276,7 +277,7 @@ class KokoroTTSBackend:
 
             # Generate all chunks and concatenate
             audio_chunks = []
-            for result in pipeline(text, voice=voice_name, speed=1.0):
+            for result in pipeline(text, voice=voice_name, speed=speed):
                 if result.audio is not None:
                     chunk = result.audio
                     if isinstance(chunk, torch.Tensor):

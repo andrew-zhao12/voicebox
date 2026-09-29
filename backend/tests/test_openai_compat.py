@@ -28,8 +28,12 @@ SR = 24000
 TEXT = "Hello from the OpenAI compatible route."
 
 
+GENERATE_PROMPTS: list[dict] = []
+
+
 class FakeBackend:
     async def generate(self, text, voice_prompt, language="en", seed=None, instruct=None):
+        GENERATE_PROMPTS.append(dict(voice_prompt))
         return np.full(len(text), 0.25, dtype=np.float32), SR
 
 
@@ -159,15 +163,12 @@ def test_model_speed_and_validation_errors_use_the_envelope(api):
     assert response.json()["error"]["code"] == "model_not_found"
 
     response = api.client.post(
-        "/v1/audio/speech", json={"input": TEXT, "voice": "Smoke Voice", "speed": 1.5}, headers=bearer(api.key)
+        "/v1/audio/speech", json={"input": TEXT, "voice": "Smoke Voice", "speed": 5}, headers=bearer(api.key)
     )
     assert response.status_code == 400
-    assert response.json()["error"] == {
-        "message": "speed other than 1.0 is not supported",
-        "type": "invalid_request_error",
-        "param": "speed",
-        "code": "unsupported_value",
-    }
+    error = response.json()["error"]
+    assert error["param"] == "speed"
+    assert error["code"] == "invalid_value"
 
     response = api.client.post("/v1/audio/speech", json={"voice": "Smoke Voice"}, headers=bearer(api.key))
     assert response.status_code == 400
@@ -439,3 +440,68 @@ def test_voice_creation_limits_and_validation(api, monkeypatch):
     )
     assert admin_made.status_code == 201
     assert api.client.delete("/v1/voices/Only One", headers=bearer(api.admin)).status_code == 200
+
+
+def test_speed_is_native_on_kokoro_and_a_time_stretch_elsewhere(api, monkeypatch):
+    stretched: list[tuple[int, float]] = []
+
+    def fake_stretch(audio, sample_rate, speed):
+        stretched.append((len(audio), speed))
+        return audio[:: int(speed)] if speed >= 1 else np.repeat(audio, round(1 / speed))
+
+    monkeypatch.setattr(generation_service, "_time_stretch", fake_stretch)
+
+    # Kokoro takes the rate itself: the prompt carries it and nothing is stretched.
+    GENERATE_PROMPTS.clear()
+    response = api.client.post(
+        "/v1/audio/speech",
+        json={"model": "kokoro", "input": TEXT, "voice": "Smoke Voice", "speed": 2.0, "response_format": "pcm"},
+        headers=bearer(api.key),
+    )
+    assert response.status_code == 200, response.text
+    assert len(response.content) == len(TEXT) * 2
+    assert GENERATE_PROMPTS
+    assert GENERATE_PROMPTS[-1]["speed"] == 2.0
+    assert stretched == []
+
+    # Any other engine is stretched chunk by chunk after synthesis.
+    created = api.client.post(
+        "/profiles",
+        json={"name": "Cloned Voice", "language": "en", "default_engine": "qwen"},
+        headers=bearer(api.admin),
+    )
+    assert created.status_code == 200, created.text
+    GENERATE_PROMPTS.clear()
+    response = api.client.post(
+        "/v1/audio/speech",
+        json={"model": "qwen", "input": TEXT, "voice": "Cloned Voice", "speed": 2.0, "response_format": "pcm"},
+        headers=bearer(api.key),
+    )
+    assert response.status_code == 200, response.text
+    assert "speed" not in GENERATE_PROMPTS[-1]
+    assert stretched
+    assert all(speed == 2.0 for _, speed in stretched)
+    assert len(response.content) == 2 * sum(-(-n // 2) for n, _ in stretched)
+
+    # speed=1.0 (the default) touches nothing.
+    stretched.clear()
+    response = api.client.post(
+        "/v1/audio/speech",
+        json={"model": "qwen", "input": TEXT, "voice": "Cloned Voice", "response_format": "pcm"},
+        headers=bearer(api.key),
+    )
+    assert response.status_code == 200
+    assert stretched == []
+    assert len(response.content) == len(TEXT) * 2
+
+
+def test_time_stretch_changes_duration_and_keeps_mono_float32():
+    t = np.arange(SR) / SR
+    tone = (0.3 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    faster = generation_service._time_stretch(tone, SR, 2.0)
+    slower = generation_service._time_stretch(tone, SR, 0.5)
+    assert faster.ndim == 1
+    assert faster.dtype == np.float32
+    assert abs(len(faster) - SR / 2) < SR * 0.05
+    assert abs(len(slower) - SR * 2) < SR * 0.1
+    assert np.abs(faster).max() < 1.0

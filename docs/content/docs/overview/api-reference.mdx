@@ -28,7 +28,7 @@ Every request carries `Authorization: Bearer <key>`. Give each application its o
 | `response_format` | `mp3` (default), `opus`, `aac`, `flac`, `wav`, `pcm` (signed 16-bit little-endian mono). |
 | `instructions` | Style hint, passed as the engine's `instruct` where the engine supports it (Qwen CustomVoice). |
 | `language` | Voicebox extension: language code of the input. Defaults to the profile's language. |
-| `speed` | Only `1.0` is accepted. |
+| `speed` | `0.25` to `4.0` (default `1.0`). Kokoro speaks at that rate natively; every other engine is time-stretched after synthesis with the pitch preserved, chunk by chunk, so streaming is unaffected. |
 
 The response is always chunked. `wav` and `pcm` leave the server sentence by sentence as synthesis proceeds; the compressed formats stream too when ffmpeg is installed (it is in the Docker image) and are otherwise sent once the clip is complete. `X-Voicebox-Sample-Rate` carries the engine's sample rate (24 kHz for most engines, 48 kHz for LuxTTS), `X-Voicebox-Engine` the engine used and `X-Voicebox-Voice` the resolved voice (a profile id, or `engine:voice_id` for a preset). Nothing is written to the generation history.
 
@@ -140,7 +140,7 @@ Under `/v1`, errors use OpenAI's envelope, so SDK exceptions carry the message:
 
 | Status | `type` | When |
 |--------|--------|------|
-| 400 | `invalid_request_error` | Bad body (`invalid_value`), unsupported `speed` or `response_format`, engine and profile mismatch |
+| 400 | `invalid_request_error` | Bad body (`invalid_value`, including `speed` outside 0.25–4.0), unsupported `response_format`, engine and voice mismatch |
 | 401 | `authentication_error` | Missing or invalid key |
 | 403 | `permission_error` | A client key on an admin route; `voice_not_owned` (deleting a shared voice), `voice_limit_reached` |
 | 404 | `invalid_request_error` | `voice_not_found`, `model_not_found` |
@@ -155,7 +155,7 @@ Responses also carry `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Res
 
 | Endpoint | Purpose |
 |----------|---------|
-| `POST /generate/stream` | The same streaming synthesis with Voicebox's own body (`profile_id`, `engine`, `effects_chain`, `seed`, chunking controls). |
+| `POST /generate/stream` | The same streaming synthesis with Voicebox's own body (`profile_id`, `engine`, `effects_chain`, `seed`, `speed`, chunking controls). |
 | `POST /generate` then `GET /generate/{id}/status` | Queue a generation that is saved to history; progress over SSE, audio at `GET /audio/{id}`. |
 | `POST /speak` | Speak through the profile bound to an `X-Voicebox-Client-Id` (agents). |
 | `POST /transcribe` | Transcription with `{"text", "duration"}`. |
