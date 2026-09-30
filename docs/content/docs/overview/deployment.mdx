@@ -98,6 +98,7 @@ Models are cached separately (`huggingface-cache` volume or `VOICEBOX_MODELS_DIR
 
 - Terminate TLS in front of the server: the Caddy overlay (`docker-compose.tls.yml`) does it with automatic certificates. Keys must never travel over plain HTTP outside loopback or a private network.
 - Behind your own proxy, set `FORWARDED_ALLOW_IPS` to the proxy's address so per-IP limits see the real client, and disable response buffering for `/generate/stream` and the SSE routes.
+- Keep the server's HTTP keep-alive above the balancer's idle timeout. The image starts uvicorn with `--timeout-keep-alive 650` for that reason (uvicorn's default is 5 s): a balancer that reuses an idle connection the replica just closed answers `502`, which is exactly what a 2-replica fleet behind Caddy showed with the default. Running uvicorn yourself behind an ALB (idle timeout 60 s by default, 300 s in the recipe) or Google's front ends (600 s), pass the same flag.
 - Set `VOICEBOX_ALLOWED_HOSTS` to the public name(s) (`voice.example.com`, `*.internal.example.com`). A browser tricked into resolving an attacker's domain to your server's address then sends that domain as `Host` and is refused with `400`; loopback names, `/health`, `/health/ready` and `/metrics` keep working for the desktop shell, probes and scrapers.
 - Per-key rate limits, upload caps and the queue depth are described in [API Keys](/overview/api-keys). Raise a key's limits in `api_keys.json` rather than turning limiting off.
 

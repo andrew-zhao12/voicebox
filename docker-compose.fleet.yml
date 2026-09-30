@@ -39,6 +39,11 @@ x-replica-env: &replica-env
   VOICEBOX_LOG_FORMAT: json
   VOICEBOX_DISABLE_DOCS: "1"
   VOICEBOX_METRICS_PORT: "9464"
+  # Two CPU replicas share this machine: without a cap each one starts a torch
+  # thread per core, the two starve each other and the readiness probes time
+  # out (Caddy then has no healthy upstream). Cloud replicas have a node each.
+  OMP_NUM_THREADS: ${VOICEBOX_REPLICA_THREADS:-4}
+  MKL_NUM_THREADS: ${VOICEBOX_REPLICA_THREADS:-4}
   # Caddy is the only peer on this network, so trust its X-Forwarded-For.
   FORWARDED_ALLOW_IPS: "*"
   NUMBA_CACHE_DIR: /tmp/numba_cache

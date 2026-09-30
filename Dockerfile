@@ -150,4 +150,7 @@ RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 # SIGTERM: uvicorn stops accepting, waits up to 40 s for open responses (streams,
 # SSE), then the app drains its generation queue (VOICEBOX_DRAIN_TIMEOUT_S).
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "17493", "--timeout-graceful-shutdown", "40"]
+# --timeout-keep-alive above any load balancer's idle timeout (ALB 60-300 s,
+# Google front ends 600 s): with uvicorn's default of 5 s a balancer reuses
+# an idle connection the replica just closed and answers 502.
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "17493", "--timeout-graceful-shutdown", "40", "--timeout-keep-alive", "650"]

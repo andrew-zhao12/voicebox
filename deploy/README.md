@@ -58,6 +58,7 @@ two replicas behind Caddy with the same inputs, checked by
 | `FORWARDED_ALLOW_IPS` | `*` behind the platform's load balancer | per-IP limits see the real client |
 
 ## What stays single-replica
+| Backend keep-alive | 650 s (`--timeout-keep-alive` in the image's `CMD`), above every balancer idle timeout | a balancer that reuses an idle connection the replica just closed answers 502; uvicorn's default is 5 s |
 
 `POST /generate` with `GET /generate/{id}/status` and `GET /audio/{id}`,
 `POST /speak` and the MCP `speak` tool (they queue a generation and return
