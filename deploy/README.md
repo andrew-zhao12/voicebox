@@ -13,7 +13,9 @@ the same probes; only the platform glue differs.
 
 The local stand-in is `docker-compose.fleet.yml` at the repository root:
 two replicas behind Caddy with the same inputs, checked by
-`scripts/fleet-check.sh`.
+`scripts/fleet-check.sh`. Step-by-step runbooks for the local fleet, Cloud
+Run, ECS and Kubernetes, with the expected output of every command, are in
+[`docs/walkthroughs/`](../docs/walkthroughs/README.md).
 
 ## What every replica needs
 
@@ -56,9 +58,9 @@ two replicas behind Caddy with the same inputs, checked by
 | `VOICEBOX_REQUIRE_GPU` | `1` on GPU platforms | a replica scheduled without a GPU never becomes ready |
 | `VOICEBOX_MCP_STATELESS` | `1` | MCP tool calls carry no session, so any replica can answer them |
 | `FORWARDED_ALLOW_IPS` | `*` behind the platform's load balancer | per-IP limits see the real client |
+| Backend keep-alive | 650 s (`--timeout-keep-alive` in the image's `CMD`), above every balancer idle timeout | a balancer that reuses an idle connection the replica just closed answers 502; uvicorn's default is 5 s |
 
 ## What stays single-replica
-| Backend keep-alive | 650 s (`--timeout-keep-alive` in the image's `CMD`), above every balancer idle timeout | a balancer that reuses an idle connection the replica just closed answers 502; uvicorn's default is 5 s |
 
 `POST /generate` with `GET /generate/{id}/status` and `GET /audio/{id}`,
 `POST /speak` and the MCP `speak` tool (they queue a generation and return

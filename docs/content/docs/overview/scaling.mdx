@@ -52,12 +52,14 @@ Which one: the platform you already operate. Without one, Cloud Run and Containe
 `docker-compose.fleet.yml` in the repository runs the smallest fleet on one machine: two replicas behind Caddy, a one-shot service that fills the shared model cache, the seed directory and the keys file mounted read-only.
 
 ```bash
-python -m backend.keys create --id myapp --role client --data-dir ./secrets   # prints the client key
+CLIENT_KEY=$(python -m backend.keys create --id myapp --role client --data-dir ./secrets)   # printed once
 python -m backend.voices export ./seed
 export VOICEBOX_API_KEY="$(openssl rand -base64 32)"
 VOICEBOX_IMAGE=ghcr.io/OWNER/voicebox:VERSION-cpu docker compose -f docker-compose.fleet.yml up -d
 scripts/fleet-check.sh http://127.0.0.1:17600 "$CLIENT_KEY" --rounds 6
 ```
+
+The two replicas share one machine, so the compose file caps each one at `VOICEBOX_REPLICA_THREADS` torch threads (default 4); without the cap they starve each other and miss their readiness probes. `docs/walkthroughs/01-test-locally.md` in the repository walks through this fleet step by step, with the expected output of every command.
 
 `scripts/fleet-check.sh` does what an application does, several times in a row: readiness, the voice catalog (its fingerprint must not change between replicas), a streamed `/v1/audio/speech` call and a `/v1/audio/transcriptions` call. Stop one replica while `scripts/load_test.py` runs to watch the drain: streams already open finish, new requests go to the other replica. Seeded profiles keep the id they had where they were exported, so a voice id is the same on every replica.
 

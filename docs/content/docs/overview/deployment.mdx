@@ -116,4 +116,6 @@ A voice profile travels as a `.voicebox.zip` bundle: the Export button in the UI
 
 ## 13. More than one replica
 
+Step-by-step runbooks for testing a deployment, locally and on Cloud Run, ECS or Kubernetes, live in the repository under `docs/walkthroughs/`.
+
 The speech and transcription routes keep no state between requests, so the way to grow is more identical containers behind the platform's load balancer. A replica needs three inputs: the seed directory above, the hashed keys file (`VOICEBOX_API_KEYS_JSON` pointing at a mounted secret; `VOICEBOX_API_KEY` for the admin key; `VOICEBOX_MEDIA_TOKEN_SECRET` when the browser UI is served through the balancer) and the models on disk (`VOICEBOX_BAKE_MODELS` at build time, or a shared volume filled by `python -m backend.preload` and `HF_HUB_OFFLINE=1`). Probe `/health/ready`, give the platform 90 s to stop a replica, target two concurrent requests per replica and set `VOICEBOX_MAX_QUEUE_DEPTH` a little above that. The [Scaling](/overview/scaling) page has the per-platform settings and `deploy/` in the repository the manifests; `docker-compose.fleet.yml` runs the smallest fleet locally and `scripts/fleet-check.sh` verifies any of them.
