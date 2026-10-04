@@ -871,3 +871,15 @@ class OpenAISpeechRequest(BaseModel):
         pattern="^(zh|en|ja|ko|de|fr|ru|pt|es|it|he|ar|da|el|fi|hi|ms|nl|no|pl|sv|sw|tr)$",
         description="Voicebox extension: language of the input; defaults to the voice profile's language",
     )
+    max_chunk_chars: Optional[int] = Field(
+        None,
+        ge=100,
+        le=5000,
+        description="Voicebox extension: cap on the characters synthesized per chunk (default 800)",
+    )
+    first_chunk_chars: Optional[int] = Field(
+        None,
+        ge=20,
+        le=1000,
+        description="Voicebox extension: cap on the first chunk so audio starts sooner (default 120)",
+    )

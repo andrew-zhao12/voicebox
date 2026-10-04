@@ -124,6 +124,46 @@ def test_speech_wav_streams_pcm_with_metadata(api):
     assert np.all(samples == samples[0])
 
 
+def test_speech_passes_chunk_size_knobs_to_the_stream_request(api, monkeypatch):
+    from backend.routes import openai_compat
+
+    seen = {}
+    original = openai_compat.generation_service.open_stream
+
+    async def recording_open_stream(stream_request, *args, **kwargs):
+        seen["request"] = stream_request
+        return await original(stream_request, *args, **kwargs)
+
+    monkeypatch.setattr(openai_compat.generation_service, "open_stream", recording_open_stream)
+    response = api.client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": TEXT,
+            "voice": "Smoke Voice",
+            "response_format": "pcm",
+            "max_chunk_chars": 200,
+            "first_chunk_chars": 60,
+        },
+        headers=bearer(api.key),
+    )
+    assert response.status_code == 200, response.text
+    assert seen["request"].max_chunk_chars == 200
+    assert seen["request"].first_chunk_chars == 60
+
+
+def test_speech_rejects_chunk_caps_below_the_minimum(api):
+    response = api.client.post(
+        "/v1/audio/speech",
+        json={"input": TEXT, "voice": "Smoke Voice", "first_chunk_chars": 5},
+        headers=bearer(api.key),
+    )
+    assert response.status_code == 400, response.text
+    error = response.json()["error"]
+    assert error["code"] == "invalid_value"
+    assert error["param"] == "first_chunk_chars"
+
+
 def test_speech_defaults_to_mp3_and_the_profile_engine(api):
     response = api.client.post(
         "/v1/audio/speech", json={"input": TEXT, "voice": "Smoke Voice"}, headers=bearer(api.key)

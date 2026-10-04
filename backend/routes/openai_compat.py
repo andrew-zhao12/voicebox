@@ -111,6 +111,16 @@ def _resolve_model(model: str) -> tuple[str | None, str | None]:
     )
 
 
+def _chunk_overrides(data: models.OpenAISpeechRequest) -> dict[str, int]:
+    """The chunk-size caps the client set, so the stream request keeps its defaults for the rest."""
+    overrides = {}
+    if data.max_chunk_chars is not None:
+        overrides["max_chunk_chars"] = data.max_chunk_chars
+    if data.first_chunk_chars is not None:
+        overrides["first_chunk_chars"] = data.first_chunk_chars
+    return overrides
+
+
 @router.post("/audio/speech")
 async def create_speech(data: models.OpenAISpeechRequest, request: Request, db: Session = Depends(get_db)):
     """Synthesize ``input`` in ``voice`` and stream it as ``response_format``.
@@ -122,6 +132,8 @@ async def create_speech(data: models.OpenAISpeechRequest, request: Request, db: 
     compressed formats stream when ffmpeg is installed and are otherwise
     sent once the clip is complete.  ``speed`` (0.25-4.0) is native on
     Kokoro and a pitch-preserving time stretch on every other engine.
+    ``max_chunk_chars`` and ``first_chunk_chars`` cap the server-side sentence
+    chunks, which bounds how much audio a cancelled request still renders.
     """
     principal = get_principal()
     formats = encode.available_formats()
@@ -146,6 +158,7 @@ async def create_speech(data: models.OpenAISpeechRequest, request: Request, db: 
             instruct=data.instructions,
             format="pcm",
             speed=data.speed,
+            **_chunk_overrides(data),
         )
     except ValidationError as e:
         first = e.errors()[0] if e.errors() else {}
