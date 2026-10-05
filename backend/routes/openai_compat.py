@@ -168,7 +168,7 @@ async def create_speech(data: models.OpenAISpeechRequest, request: Request, db: 
     try:
         opened = await generation_service.open_stream(stream_request, db, principal, voice=preset)
     except generation_service.GenerationRefused as e:
-        raise fail(e.status_code, e.detail, headers=e.headers) from e
+        raise fail(e.status_code, e.detail, code=e.code, param=e.param, headers=e.headers) from e
 
     fmt = data.response_format
     body = encode.encode_stream(generation_service.stream_frames(opened), opened.sample_rate, fmt)

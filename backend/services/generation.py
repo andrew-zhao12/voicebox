@@ -66,13 +66,26 @@ def lane_for_engine(engine: str) -> str:
 
 
 class GenerationRefused(Exception):
-    """A request cannot be served; carries the HTTP status the route should answer with."""
+    """A request cannot be served; carries the HTTP status the route should answer with.
 
-    def __init__(self, status_code: int, detail: str, headers: dict[str, str] | None = None) -> None:
+    ``code`` and ``param`` feed the OpenAI error envelope under ``/v1``.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        detail: str,
+        headers: dict[str, str] | None = None,
+        *,
+        code: str | None = None,
+        param: str | None = None,
+    ) -> None:
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
         self.headers = headers
+        self.code = code
+        self.param = param
 
 
 def resolve_engine(data: models.GenerationRequest, profile) -> str:
@@ -586,7 +599,8 @@ async def open_stream(
     try:
         profiles.validate_profile_engine(profile, engine)
     except ValueError as e:
-        raise GenerationRefused(400, str(e)) from e
+        # The voice is the part a client changes: it was made for another engine.
+        raise GenerationRefused(400, str(e), code="voice_engine_mismatch", param="voice") from e
 
     model_size = (data.model_size or "1.7B") if engine_has_model_sizes(engine) else None
     try:

@@ -182,7 +182,7 @@ Under `/v1`, errors use OpenAI's envelope, so SDK exceptions carry the message:
 
 | Status | `type` | When |
 |--------|--------|------|
-| 400 | `invalid_request_error` | Bad body (`invalid_value`, including `speed` outside 0.25–4.0), unsupported `response_format`, engine and voice mismatch |
+| 400 | `invalid_request_error` | Bad body (`invalid_value`, including `speed` outside 0.25–4.0), unsupported `response_format`, `voice_engine_mismatch` (`param: "voice"`: a preset of another engine, or a cloned voice on Kokoro or `qwen_custom_voice`; pick a voice of the requested engine or send `tts-1`) |
 | 401 | `authentication_error` | Missing or invalid key |
 | 403 | `permission_error` | A client key on an admin route; `voice_not_owned` (deleting a shared voice), `voice_limit_reached` |
 | 404 | `invalid_request_error` | `voice_not_found`, `model_not_found` |

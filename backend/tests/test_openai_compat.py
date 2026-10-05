@@ -190,6 +190,28 @@ def test_speech_defaults_to_mp3_and_the_profile_engine(api):
     assert abs(len(decoded) - len(TEXT)) < SR // 10  # mp3 padding
 
 
+@pytest.mark.parametrize(
+    ("model", "voice"),
+    [
+        ("luxtts", "Smoke Voice"),  # a Kokoro preset profile on a cloning engine
+        ("kokoro", "Aiden"),  # a qwen_custom_voice preset on Kokoro
+    ],
+)
+def test_a_voice_made_for_another_engine_is_a_voice_error(api, model, voice):
+    """Clients key their voice fallback on ``param``; a bare 400 reads as a server failure."""
+    response = api.client.post(
+        "/v1/audio/speech",
+        json={"model": model, "input": TEXT, "voice": voice},
+        headers=bearer(api.key),
+    )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == "voice_engine_mismatch"
+    assert error["param"] == "voice"
+    assert "engine" in error["message"]
+
+
 def test_voice_by_id_works_and_stock_names_need_a_default(api):
     response = api.client.post(
         "/v1/audio/speech",
