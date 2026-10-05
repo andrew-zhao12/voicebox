@@ -25,7 +25,7 @@ Every request carries `Authorization: Bearer <key>`. Give each application its o
 |-------|---------|
 | `voice` | Resolved in this order: a voice profile **id**, a profile **name**, a built-in **preset voice id** (`af_heart`, `Ryan`, or qualified as `kokoro:af_heart`), then OpenAI's stock names (`alloy`, `nova`, ...), which select the configured default voice (the per-client binding, else the default playback voice from Settings → MCP). `GET /v1/voices` lists every value. Voices another client key created are not visible. |
 | `model` | `tts-1`, `tts-1-hd` or `gpt-4o-mini-tts` use the voice's default engine. Otherwise a model or engine name from `GET /v1/models`: `kokoro`, `qwen-tts-1.7B`, `qwen-tts-0.6B`, `chatterbox-turbo`, `luxtts`, `tada-1b`, ... A preset voice only works with its own engine. |
-| `response_format` | `mp3` (default), `opus`, `aac`, `flac`, `wav`, `pcm` (signed 16-bit little-endian mono). |
+| `response_format` | `mp3` (default), `opus`, `aac`, `flac`, `wav`, `pcm` (signed 16-bit little-endian mono), `ulaw_8000` (G.711 mu-law at 8 kHz for telephony; band-limited before the sample rate drops, and `X-Voicebox-Sample-Rate` reports `8000`). |
 | `instructions` | Style hint, passed as the engine's `instruct` where the engine supports it (Qwen CustomVoice). |
 | `language` | Voicebox extension: language code of the input. Defaults to the profile's language. |
 | `speed` | `0.25` to `4.0` (default `1.0`). Kokoro speaks at that rate natively; every other engine is time-stretched after synthesis with the pitch preserved, chunk by chunk, so streaming is unaffected. |

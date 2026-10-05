@@ -1,6 +1,7 @@
 """Encode streamed PCM into the formats OpenAI clients ask for.
 
-``wav`` and ``pcm`` are produced in Python and stream chunk by chunk.  The
+``wav``, ``pcm`` and ``ulaw_8000`` (G.711 mu-law at 8 kHz, for telephony) are
+produced in Python and stream chunk by chunk.  The
 compressed formats stream through an ffmpeg pipe when ffmpeg is installed
 (the Docker image ships it).  Without ffmpeg, ``mp3``, ``flac`` and ``opus``
 are encoded with libsndfile once the whole clip exists (soundfile bundles
@@ -27,7 +28,7 @@ from .wav_stream import float_to_pcm16_bytes, streaming_wav_header
 
 logger = logging.getLogger(__name__)
 
-FORMATS = ("mp3", "opus", "aac", "flac", "wav", "pcm")
+FORMATS = ("mp3", "opus", "aac", "flac", "wav", "pcm", "ulaw_8000")
 MEDIA_TYPES = {
     "mp3": "audio/mpeg",
     "opus": "audio/ogg",
@@ -35,8 +36,22 @@ MEDIA_TYPES = {
     "flac": "audio/flac",
     "wav": "audio/wav",
     "pcm": "audio/pcm",
+    "ulaw_8000": "audio/basic",
 }
-EXTENSIONS = {"mp3": "mp3", "opus": "ogg", "aac": "aac", "flac": "flac", "wav": "wav", "pcm": "pcm"}
+EXTENSIONS = {
+    "mp3": "mp3",
+    "opus": "ogg",
+    "aac": "aac",
+    "flac": "flac",
+    "wav": "wav",
+    "pcm": "pcm",
+    "ulaw_8000": "ulaw",
+}
+# Encoded in this module, so always available and always streamed.
+_PYTHON_FORMATS = ("wav", "pcm", "ulaw_8000")
+TELEPHONY_RATE = 8000
+# G.711 mu-law segment ends for 14-bit magnitudes (ITU-T G.711, as in audioop).
+_ULAW_SEGMENT_ENDS = np.array([0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF])
 
 # Container and codec per format.  ``-write_xing 0`` keeps the mp3 muxer from
 # trying to seek back into a pipe; adts and ogg are stream containers anyway.
@@ -76,12 +91,83 @@ def _soundfile_supports(fmt: str) -> bool:
 def available_formats() -> list[str]:
     """Formats this server can produce, in ``FORMATS`` order."""
     has_ffmpeg = ffmpeg_path() is not None
-    return [fmt for fmt in FORMATS if fmt in ("wav", "pcm") or has_ffmpeg or _soundfile_supports(fmt)]
+    return [fmt for fmt in FORMATS if fmt in _PYTHON_FORMATS or has_ffmpeg or _soundfile_supports(fmt)]
 
 
 def streams_incrementally(fmt: str) -> bool:
     """Whether bytes leave before synthesis has finished."""
-    return fmt in ("wav", "pcm") or ffmpeg_path() is not None
+    return fmt in _PYTHON_FORMATS or ffmpeg_path() is not None
+
+
+def output_sample_rate(fmt: str, sample_rate: int) -> int:
+    """The rate of the encoded audio: the engine's, except for the telephony format."""
+    return TELEPHONY_RATE if fmt == "ulaw_8000" else sample_rate
+
+
+def _lowpass_kernel(cutoff: float, sample_rate: int, taps: int) -> np.ndarray:
+    """Windowed-sinc FIR low-pass (Hann), unity DC gain."""
+    n = np.arange(taps) - (taps - 1) / 2
+    fc = cutoff / sample_rate
+    kernel = 2 * fc * np.sinc(2 * fc * n)
+    kernel *= np.hanning(taps)
+    return (kernel / kernel.sum()).astype(np.float32)
+
+
+def linear_to_ulaw(pcm16: np.ndarray) -> bytes:
+    """G.711 mu-law bytes for signed 16-bit samples, identical to ``audioop.lin2ulaw``."""
+    value = pcm16.astype(np.int32) >> 2
+    negative = value < 0
+    magnitude = np.minimum(np.where(negative, -value, value), 8159) + 33
+    segment = np.searchsorted(_ULAW_SEGMENT_ENDS, magnitude)
+    code = (np.minimum(segment, 7) << 4) | ((magnitude >> (np.minimum(segment, 7) + 1)) & 0x0F)
+    code = np.where(segment >= 8, 0x7F, code)
+    return (code ^ np.where(negative, 0x7F, 0xFF)).astype(np.uint8).tobytes()
+
+
+class TelephonyEncoder:
+    """Stream float PCM at any engine rate into mu-law at 8 kHz.
+
+    A low-pass filter removes everything above the telephone band before the
+    samples are dropped; decimating without it folds sibilants back into the
+    band at full level.  The filter history and the decimation position carry
+    across chunks, so chunked output matches a single pass, and the filter's
+    delay is skipped at the start and flushed at the end so the output keeps
+    the input's timing and length.
+    """
+
+    def __init__(self, sample_rate: int) -> None:
+        if sample_rate < TELEPHONY_RATE:
+            raise UnsupportedFormatError(f"ulaw_8000 from {sample_rate} Hz")
+        self.step = sample_rate / TELEPHONY_RATE
+        # The transition band narrows as the rate rises, so the kernel grows with it.
+        taps = max(63, int(63 * self.step / 3) | 1)
+        self.kernel = _lowpass_kernel(0.45 * TELEPHONY_RATE, sample_rate, taps)
+        self.history = np.zeros(taps - 1, dtype=np.float32)
+        self.delay = (taps - 1) // 2
+        self.position = float(self.delay)
+        self._flushed = False
+
+    def feed(self, frame: np.ndarray) -> bytes:
+        samples = np.asarray(frame, dtype=np.float32).reshape(-1)
+        if samples.size == 0:
+            return b""
+        signal = np.concatenate([self.history, samples])
+        filtered = np.convolve(signal, self.kernel, mode="valid")
+        self.history = signal[-(self.kernel.size - 1) :]
+        positions = np.arange(self.position, filtered.size, self.step)
+        if self.step.is_integer():
+            picked = filtered[positions.astype(np.int64)]
+        else:
+            picked = np.interp(positions, np.arange(filtered.size), filtered)
+        self.position += self.step * positions.size - filtered.size
+        return linear_to_ulaw(np.frombuffer(float_to_pcm16_bytes(picked), dtype="<i2"))
+
+    def flush(self) -> bytes:
+        """Release the last samples, which are still inside the filter."""
+        if self._flushed:
+            return b""
+        self._flushed = True
+        return self.feed(np.zeros(self.delay, dtype=np.float32))
 
 
 def encode_bytes(audio: np.ndarray, sample_rate: int, fmt: str) -> bytes:
@@ -90,6 +176,9 @@ def encode_bytes(audio: np.ndarray, sample_rate: int, fmt: str) -> bytes:
         return streaming_wav_header(sample_rate, data_length=len(audio) * 2) + float_to_pcm16_bytes(audio)
     if fmt == "pcm":
         return float_to_pcm16_bytes(audio)
+    if fmt == "ulaw_8000":
+        encoder = TelephonyEncoder(sample_rate)
+        return encoder.feed(audio) + encoder.flush()
     if not _soundfile_supports(fmt):
         raise UnsupportedFormatError(fmt)
     major, subtype = _SOUNDFILE[fmt]
@@ -110,6 +199,14 @@ async def encode_stream(frames: AsyncIterator[np.ndarray], sample_rate: int, fmt
     if fmt == "pcm":
         async for frame in frames:
             yield float_to_pcm16_bytes(frame)
+        return
+    if fmt == "ulaw_8000":
+        encoder = TelephonyEncoder(sample_rate)
+        async for frame in frames:
+            if chunk := encoder.feed(frame):
+                yield chunk
+        if tail := encoder.flush():
+            yield tail
         return
     ffmpeg = ffmpeg_path()
     if ffmpeg is not None:

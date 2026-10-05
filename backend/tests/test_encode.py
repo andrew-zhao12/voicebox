@@ -104,3 +104,69 @@ async def test_ffmpeg_is_stopped_when_the_consumer_leaves():
     await stream.aclose()
     produced = len(seen)
     assert produced < 10_000  # the feeder stopped with the consumer
+
+
+def sine(freq: float, rate: int = SR, seconds: float = 0.5, amplitude: float = 0.5) -> np.ndarray:
+    t = np.arange(int(rate * seconds)) / rate
+    return (amplitude * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+
+
+def ulaw_decode(data: bytes) -> np.ndarray:
+    """G.711 mu-law to 16-bit linear, the reference decoder."""
+    code = ~np.frombuffer(data, dtype=np.uint8).astype(np.int32) & 0xFF
+    exponent = (code >> 4) & 0x07
+    magnitude = (((code & 0x0F) << 3) + 0x84) << exponent
+    sample = magnitude - 0x84
+    return np.where(code & 0x80, -sample, sample).astype(np.float64)
+
+
+def level_db(signal: np.ndarray, freq: float, rate: int = encode.TELEPHONY_RATE) -> float:
+    spectrum = np.abs(np.fft.rfft(signal * np.hanning(len(signal))))
+    bins = np.fft.rfftfreq(len(signal), 1 / rate)
+    return 20 * np.log10(spectrum[np.argmin(np.abs(bins - freq))] + 1e-9)
+
+
+def test_ulaw_is_offered_and_reports_the_telephony_rate():
+    assert "ulaw_8000" in encode.available_formats()
+    assert encode.streams_incrementally("ulaw_8000")
+    assert encode.output_sample_rate("ulaw_8000", SR) == 8000
+    assert encode.output_sample_rate("pcm", SR) == SR
+    assert encode.MEDIA_TYPES["ulaw_8000"] == "audio/basic"
+
+
+def test_linear_to_ulaw_matches_audioop():
+    audioop = pytest.importorskip("audioop")
+    pcm = np.random.default_rng(7).integers(-32768, 32767, 20000, dtype=np.int16)
+    assert encode.linear_to_ulaw(pcm) == audioop.lin2ulaw(pcm.tobytes(), 2)
+
+
+def test_ulaw_8000_keeps_the_telephone_band_and_drops_what_is_above():
+    """Without the low-pass, a 6 kHz tone would fold onto 2 kHz at full level."""
+    in_band = ulaw_decode(encode.encode_bytes(sine(1000), SR, "ulaw_8000"))
+    above = ulaw_decode(encode.encode_bytes(sine(6000), SR, "ulaw_8000"))
+
+    reference = level_db(in_band, 1000)
+    assert level_db(above, 2000) < reference - 40
+
+
+@pytest.mark.parametrize("rate", [24000, 48000])
+def test_ulaw_8000_keeps_the_input_length(rate):
+    audio = sine(1000, rate=rate, seconds=1.0)
+    out = encode.encode_bytes(audio, rate, "ulaw_8000")
+    assert abs(len(out) - 8000) <= 1
+
+
+def test_ulaw_8000_chunked_matches_a_single_pass():
+    audio = np.random.default_rng(3).uniform(-0.5, 0.5, SR).astype(np.float32)
+    encoder = encode.TelephonyEncoder(SR)
+    pieces = [audio[:1], audio[1:4801], audio[4801:4802], audio[4802:13337], audio[13337:]]
+
+    chunked = b"".join(encoder.feed(piece) for piece in pieces) + encoder.flush()
+
+    assert chunked == encode.encode_bytes(audio, SR, "ulaw_8000")
+
+
+async def test_ulaw_8000_streams_the_same_bytes():
+    audio = tone()
+    streamed = await collect(encode.encode_stream(frames(audio[:5000], audio[5000:]), SR, "ulaw_8000"))
+    assert streamed == encode.encode_bytes(audio, SR, "ulaw_8000")

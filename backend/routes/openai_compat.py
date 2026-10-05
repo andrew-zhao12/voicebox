@@ -128,7 +128,8 @@ async def create_speech(data: models.OpenAISpeechRequest, request: Request, db: 
     ``voice`` is a profile name or id, a built-in preset voice id, or one of
     OpenAI's stock names (the configured default voice); ``model`` is
     ``tts-1`` for the voice's default engine, or a model or engine name from
-    ``GET /v1/models``.  ``wav`` and ``pcm`` stream chunk by chunk; the
+    ``GET /v1/models``.  ``wav``, ``pcm`` and ``ulaw_8000`` (G.711 mu-law at
+    8 kHz, band-limited first, for telephony) stream chunk by chunk; the
     compressed formats stream when ffmpeg is installed and are otherwise
     sent once the clip is complete.  ``speed`` (0.25-4.0) is native on
     Kokoro and a pitch-preserving time stretch on every other engine.
@@ -175,7 +176,7 @@ async def create_speech(data: models.OpenAISpeechRequest, request: Request, db: 
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
         "X-Voicebox-Job-Id": opened.session.job_id,
-        "X-Voicebox-Sample-Rate": str(opened.sample_rate),
+        "X-Voicebox-Sample-Rate": str(encode.output_sample_rate(fmt, opened.sample_rate)),
         "X-Voicebox-Engine": opened.engine,
         "X-Voicebox-Voice": voice.id,
         "Content-Disposition": f'inline; filename="speech.{encode.EXTENSIONS[fmt]}"',

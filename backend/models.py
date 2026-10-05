@@ -863,7 +863,7 @@ class OpenAISpeechRequest(BaseModel):
     model: str = Field(default="tts-1", max_length=100)
     input: str = Field(..., min_length=1, max_length=50000)
     voice: str = Field(..., min_length=1, max_length=200)
-    response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = "mp3"
+    response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm", "ulaw_8000"] = "mp3"
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
     instructions: Optional[str] = Field(None, max_length=500)
     language: Optional[str] = Field(

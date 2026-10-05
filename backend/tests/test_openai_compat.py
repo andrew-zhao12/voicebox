@@ -124,6 +124,19 @@ def test_speech_wav_streams_pcm_with_metadata(api):
     assert np.all(samples == samples[0])
 
 
+def test_speech_ulaw_8000_is_telephony_audio(api):
+    response = api.client.post(
+        "/v1/audio/speech",
+        json={"model": "kokoro", "input": TEXT, "voice": "Smoke Voice", "response_format": "ulaw_8000"},
+        headers=bearer(api.key),
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("audio/basic")
+    assert response.headers["x-voicebox-sample-rate"] == "8000"
+    # The fake engine renders one sample per character at 24 kHz.
+    assert abs(len(response.content) - len(TEXT) / 3) <= 1
+
+
 def test_speech_passes_chunk_size_knobs_to_the_stream_request(api, monkeypatch):
     from backend.routes import openai_compat
 
