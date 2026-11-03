@@ -70,7 +70,9 @@ def lane_for_model(name: str) -> str:
     return LANE_GPU
 
 
-async def _await_maybe(result) -> None:
+async def _call_load(load: Callable[[], object]) -> None:
+    """Call a registry load function, awaiting it when it returns a coroutine."""
+    result = load()
     if asyncio.iscoroutine(result):
         await result
 
@@ -95,10 +97,11 @@ async def _load_one(name: str, done: asyncio.Event) -> None:
         else:
             slot = None
         if slot is None:
-            await _await_maybe(load())
+            await _call_load(load)
         else:
-            async with slot.acquire():
-                await _await_maybe(load())
+            # run() calls load only once the slot is taken, and keeps the slot
+            # until the load ends even when shutdown cancels this job.
+            await slot.run(_call_load, load)
         lifecycle.preload_ready(name)
         logger.info("Preloaded %s", name)
     except asyncio.CancelledError:

@@ -71,15 +71,15 @@ async def llm_generate(request: models.LLMGenerateRequest):
         examples = [(pair[0], pair[1]) for pair in request.examples]
 
     try:
-        async with llm_slot.acquire():
-            text = await backend.generate(
-                prompt=request.prompt,
-                system=request.system,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature,
-                model_size=model_size,
-                examples=examples,
-            )
+        text = await llm_slot.run(
+            backend.generate,
+            prompt=request.prompt,
+            system=request.system,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            model_size=model_size,
+            examples=examples,
+        )
         return models.LLMGenerateResponse(text=text, model_size=model_size)
     except InferenceBusyError as e:
         raise HTTPException(status_code=429, detail=str(e), headers={"Retry-After": str(e.retry_after_s)}) from e

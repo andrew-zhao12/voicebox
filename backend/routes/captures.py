@@ -12,7 +12,7 @@ from ..backends import WHISPER_HF_REPOS, get_llm_model_configs, get_stt_model_co
 from ..backends.base import is_model_cached
 from ..database import Capture as DBCapture, get_db
 from ..services import captures as captures_service, settings as settings_service
-from ..services.inference_slots import InferenceBusyError, llm_slot, whisper_slot
+from ..services.inference_slots import InferenceBusyError
 from ..services.refinement import RefinementFlags
 
 logger = logging.getLogger(__name__)
@@ -62,19 +62,18 @@ async def create_capture_endpoint(
         resolved_language = None if language == "auto" else language
 
     try:
-        async with whisper_slot.acquire():
-            capture = await captures_service.create_capture(
-                audio_bytes=audio_bytes,
-                filename=file.filename or "capture.wav",
-                source=source,
-                language=resolved_language,
-                stt_model=resolved_stt,
-                db=db,
-            )
+        capture = await captures_service.create_capture(
+            audio_bytes=audio_bytes,
+            filename=file.filename or "capture.wav",
+            source=source,
+            language=resolved_language,
+            stt_model=resolved_stt,
+            db=db,
+        )
     except InferenceBusyError as e:
         raise _busy(e) from e
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         logger.exception("Failed to create capture")
         raise HTTPException(status_code=500, detail="Failed to create capture") from e
@@ -158,13 +157,12 @@ async def refine_capture_endpoint(
     resolved_model = request.model_size or saved.llm_model
 
     try:
-        async with llm_slot.acquire():
-            capture = await captures_service.refine_capture(
-                capture_id=capture_id,
-                flags=flags,
-                model_size=resolved_model,
-                db=db,
-            )
+        capture = await captures_service.refine_capture(
+            capture_id=capture_id,
+            flags=flags,
+            model_size=resolved_model,
+            db=db,
+        )
     except InferenceBusyError as e:
         raise _busy(e) from e
     except Exception as e:
@@ -236,17 +234,16 @@ async def retranscribe_capture_endpoint(
         resolved_language = request.language
 
     try:
-        async with whisper_slot.acquire():
-            capture = await captures_service.retranscribe_capture(
-                capture_id=capture_id,
-                stt_model=resolved_stt,
-                language=resolved_language,
-                db=db,
-            )
+        capture = await captures_service.retranscribe_capture(
+            capture_id=capture_id,
+            stt_model=resolved_stt,
+            language=resolved_language,
+            db=db,
+        )
     except InferenceBusyError as e:
         raise _busy(e) from e
     except FileNotFoundError as e:
-        raise HTTPException(status_code=410, detail=str(e))
+        raise HTTPException(status_code=410, detail=str(e)) from e
     except Exception as e:
         logger.exception("Retranscribe failed for capture %s", capture_id)
         raise HTTPException(status_code=500, detail="Retranscription failed") from e

@@ -391,8 +391,7 @@ async def compose_in_character(
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
     try:
-        async with llm_slot.acquire():
-            result = await personality.compose_as_profile(profile.personality)
+        result = await llm_slot.run(personality.compose_as_profile, profile.personality)
     except InferenceBusyError as e:
         raise HTTPException(status_code=429, detail=str(e), headers={"Retry-After": str(e.retry_after_s)}) from e
     except ValueError as e:

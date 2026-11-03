@@ -5,6 +5,10 @@ optionally, an LLM-refined version.
 A capture is a single voice input event (dictation, long-form recording, or
 uploaded file). Storage mirrors the generations flow: audio lives under
 ``data/captures/<id>.wav`` and rows live in the ``captures`` table.
+
+Only the model calls hold the Whisper and LLM slots (``InferenceSlot.run``):
+a cancelled caller leaves its model call running to the end, and that call
+must not touch the request's database session, which closes with the request.
 """
 
 import contextlib
@@ -20,7 +24,7 @@ from sqlalchemy.orm import Session
 from .. import config
 from ..database import Capture as DBCapture
 from ..models import CaptureResponse, RefinementFlagsModel
-from ..utils.audio import load_audio
+from .inference_slots import llm_slot, whisper_slot
 from .refinement import RefinementFlags, refine_transcript
 from .transcribe import get_whisper_model
 
@@ -66,7 +70,15 @@ async def create_capture(
     stt_model: Optional[str],
     db: Session,
 ) -> CaptureResponse:
-    """Persist raw audio, run STT, store the row."""
+    """Persist raw audio, run STT, store the row.
+
+    Raises:
+        ValueError: An unknown source, or audio that cannot be decoded.
+        InferenceBusyError: The Whisper slot is full.  Nothing is kept on disk
+            after either error.
+    """
+    from ..utils.audio import load_audio  # lazy: librosa
+
     if source not in VALID_SOURCES:
         raise ValueError(f"Invalid source '{source}'. Must be one of {sorted(VALID_SOURCES)}")
 
@@ -119,7 +131,7 @@ async def create_capture(
 
         whisper = get_whisper_model()
         resolved_stt = stt_model or whisper.model_size
-        transcript = await whisper.transcribe(str(audio_path), language, resolved_stt)
+        transcript = await whisper_slot.run(whisper.transcribe, str(audio_path), language, resolved_stt)
 
         row = DBCapture(
             id=capture_id,
@@ -191,7 +203,8 @@ async def refine_capture(
     if not row:
         return None
 
-    refined, llm_size = await refine_transcript(
+    refined, llm_size = await llm_slot.run(
+        refine_transcript,
         row.transcript_raw or "",
         flags,
         model_size=model_size,
@@ -221,7 +234,7 @@ async def retranscribe_capture(
 
     whisper = get_whisper_model()
     resolved_stt = stt_model or whisper.model_size
-    transcript = await whisper.transcribe(str(resolved), language, resolved_stt)
+    transcript = await whisper_slot.run(whisper.transcribe, str(resolved), language, resolved_stt)
 
     row.transcript_raw = transcript
     row.stt_model = resolved_stt

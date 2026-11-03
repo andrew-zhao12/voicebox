@@ -373,8 +373,7 @@ async def _transcribe_file(
         )
 
     try:
-        async with whisper_slot.acquire():
-            text = await whisper.transcribe(str(path), language, model_size)
+        text = await whisper_slot.run(whisper.transcribe, str(path), language, model_size)
     except InferenceBusyError as e:
         raise ToolError(str(e)) from e
     return {

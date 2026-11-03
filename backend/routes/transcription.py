@@ -141,14 +141,15 @@ async def _run_whisper(tmp_path: str, language: str | None, model: str | None, *
                 },
             )
 
+        # Whisper's thread outlives a cancelled caller (a realtime socket closing
+        # mid-utterance), so run() keeps the slot taken until the call ends.
         try:
-            async with whisper_slot.acquire():
-                if detailed:
-                    transcript = await whisper_model.transcribe_detailed(stt_path, language, model_size)
-                    if transcript.duration <= 0:
-                        transcript = replace(transcript, duration=duration)
-                    return transcript
-                text = await whisper_model.transcribe(stt_path, language, model_size)
+            if detailed:
+                transcript = await whisper_slot.run(whisper_model.transcribe_detailed, stt_path, language, model_size)
+                if transcript.duration <= 0:
+                    transcript = replace(transcript, duration=duration)
+                return transcript
+            text = await whisper_slot.run(whisper_model.transcribe, stt_path, language, model_size)
         except InferenceBusyError as e:
             raise HTTPException(status_code=429, detail=str(e), headers={"Retry-After": str(e.retry_after_s)}) from e
 
