@@ -1504,7 +1504,7 @@
     "/generate/stream": {
       "post": {
         "summary": "Stream Speech",
-        "description": "Generate speech and stream it as soon as the first sentence is ready.\n\nThe text is synthesized one sentence chunk at a time inside the serial\ngeneration queue, and every chunk is sent as PCM16 the moment it exists.\n``format=wav`` (default) prefixes a RIFF header whose length fields are\n``0xFFFFFFFF`` (unknown length); ``format=pcm`` sends raw signed 16-bit\nlittle-endian mono samples.  The sample rate is reported in the\n``X-Voicebox-Sample-Rate`` header.  Nothing is written to history.",
+        "description": "Generate speech and stream it as soon as the first sentence is ready.\n\nThe text is synthesized one sentence chunk at a time inside the serial\ngeneration queue, and every chunk is sent as PCM16 the moment it exists.\n``format=wav`` (default) prefixes a RIFF header whose length fields are\n``0xFFFFFFFF`` (unknown length); ``format=pcm`` sends raw signed 16-bit\nlittle-endian mono samples at the engine's own rate.  The sample rate is\nreported in the ``X-Voicebox-Sample-Rate`` header.  Nothing is written to\nhistory.  Disconnecting before the first chunk cancels the job; a failure\nafter audio has started drops the connection before the body ends.",
         "operationId": "stream_speech_generate_stream_post",
         "requestBody": {
           "content": {
@@ -4615,7 +4615,7 @@
           "OpenAI compatible"
         ],
         "summary": "Create Speech",
-        "description": "Synthesize ``input`` in ``voice`` and stream it as ``response_format``.\n\n``voice`` is a profile name or id, a built-in preset voice id, or one of\nOpenAI's stock names (the configured default voice); ``model`` is\n``tts-1`` for the voice's default engine, or a model or engine name from\n``GET /v1/models``.  ``wav`` and ``pcm`` stream chunk by chunk; the\ncompressed formats stream when ffmpeg is installed and are otherwise\nsent once the clip is complete.",
+        "description": "Synthesize ``input`` in ``voice`` and stream it as ``response_format``.\n\n``voice`` is a profile name or id, a built-in preset voice id, or one of\nOpenAI's stock names (the configured default voice); ``model`` is\n``tts-1`` for the voice's default engine, or a model or engine name from\n``GET /v1/models``.  ``wav``, ``pcm`` and ``ulaw_8000`` (G.711 mu-law at\n8 kHz, band-limited first, for telephony) stream chunk by chunk; the\ncompressed formats stream when ffmpeg is installed and are otherwise\nsent once the clip is complete.  ``pcm`` is always 24 kHz, as OpenAI\ndocuments it; ``wav`` and the compressed formats keep the engine's rate,\nand ``X-Voicebox-Sample-Rate`` reports the rate of every format.\n``speed`` (0.25-4.0) is native on Kokoro and a pitch-preserving time\nstretch on every other engine.  ``max_chunk_chars`` and\n``first_chunk_chars`` cap the server-side sentence chunks, which bounds\nhow much audio a cancelled request still renders.  Disconnecting before\nthe first chunk cancels the job; a failure after audio has started drops\nthe connection before the body ends, so it never passes for a short clip.",
         "operationId": "create_speech_v1_audio_speech_post",
         "requestBody": {
           "content": {
@@ -4649,13 +4649,33 @@
         }
       }
     },
+    "/v1": {
+      "get": {
+        "tags": [
+          "OpenAI compatible"
+        ],
+        "summary": "Service Info",
+        "description": "Identify the server; OpenAI clients probe ``GET {base_url}/`` to warm the connection.",
+        "operationId": "service_info_v1_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/audio/transcriptions": {
       "post": {
         "tags": [
           "OpenAI compatible"
         ],
         "summary": "Create Transcription",
-        "description": "Transcribe an uploaded file with Whisper (``json`` or ``text``).\n\n``whisper-1`` uses the server's current Whisper size; ``whisper-turbo``,\n``whisper-large`` and the other registry sizes pick one explicitly.\nTimestamped formats (``srt``, ``vtt``, ``verbose_json``) are not available.",
+        "description": "Transcribe an uploaded file with Whisper.\n\n``whisper-1`` uses the server's current Whisper size; ``whisper-turbo``,\n``whisper-large`` and the other registry sizes pick one explicitly.\n``response_format`` is ``json`` (default), ``text``, ``verbose_json``\n(segments with timestamps), ``srt`` or ``vtt``; only segment timestamps\nexist, so ``timestamp_granularities[]=word`` is refused.",
         "operationId": "create_transcription_v1_audio_transcriptions_post",
         "requestBody": {
           "content": {
@@ -4984,7 +5004,7 @@
               }
             ],
             "title": "Limits",
-            "description": "Overrides: requests, inference, uploads_bytes, tts_chars (per minute), max_pending_jobs, max_voices (counts); null = unlimited."
+            "description": "Overrides: requests, inference, uploads_bytes, tts_chars (per minute), max_pending_jobs, max_voices, max_realtime_sessions (counts); null = unlimited."
           }
         },
         "type": "object",
@@ -5378,6 +5398,14 @@
             "type": "string",
             "title": "Response Format",
             "default": "json"
+          },
+          "timestamp_granularities[]": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Timestamp Granularities[]",
+            "default": []
           }
         },
         "type": "object",
@@ -7558,7 +7586,8 @@
               "aac",
               "flac",
               "wav",
-              "pcm"
+              "pcm",
+              "ulaw_8000"
             ],
             "title": "Response Format",
             "default": "mp3"
@@ -7594,6 +7623,34 @@
             ],
             "title": "Language",
             "description": "Voicebox extension: language of the input; defaults to the voice profile's language"
+          },
+          "max_chunk_chars": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 5000.0,
+                "minimum": 100.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Chunk Chars",
+            "description": "Voicebox extension: cap on the characters synthesized per chunk (default 800)"
+          },
+          "first_chunk_chars": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 1000.0,
+                "minimum": 20.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Chunk Chars",
+            "description": "Voicebox extension: cap on the first chunk so audio starts sooner (default 120)"
           }
         },
         "type": "object",
@@ -8455,6 +8512,14 @@
             "title": "Format",
             "description": "wav: RIFF header with unknown length followed by PCM16 frames; pcm: raw signed 16-bit little-endian mono samples",
             "default": "wav"
+          },
+          "speed": {
+            "type": "number",
+            "maximum": 4.0,
+            "minimum": 0.25,
+            "title": "Speed",
+            "description": "Playback rate: Kokoro synthesizes at this rate; other engines are time-stretched after synthesis with the pitch preserved",
+            "default": 1.0
           },
           "first_chunk_chars": {
             "anyOf": [

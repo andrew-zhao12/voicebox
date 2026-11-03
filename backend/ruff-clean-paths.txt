@@ -1,6 +1,7 @@
 # Paths CI holds to `ruff check` and `ruff format --check` (the rest of the
 # backend predates ruff and is still being brought in line).  Add every new
 # module and test here; remove a path only after cleaning it.
+# integrations/livekit is checked against its own ruff.toml (Python 3.10, width 100).
 backend/api_errors.py
 backend/auth
 backend/config.py
@@ -10,6 +11,7 @@ backend/mcp_server/server.py
 backend/mcp_shim
 backend/observability
 backend/preload.py
+backend/routes/captures.py
 backend/routes/maintenance.py
 backend/routes/openai_compat.py
 backend/routes/realtime.py
@@ -23,10 +25,12 @@ backend/services/retention.py
 backend/services/seed_profiles.py
 backend/services/task_queue.py
 backend/tests/security_testapp.py
+backend/tests/test_auth_errors.py
 backend/tests/test_auth_keystore.py
 backend/tests/test_auth_middleware.py
 backend/tests/test_auth_policy.py
 backend/tests/test_auth_tokens.py
+backend/tests/test_captures.py
 backend/tests/test_chunked_tts_stream.py
 backend/tests/test_config_paths.py
 backend/tests/test_cors.py
@@ -37,7 +41,10 @@ backend/tests/test_idle_unload.py
 backend/tests/test_inference_slots.py
 backend/tests/test_keys_cli.py
 backend/tests/test_lifecycle.py
+backend/tests/test_logfilter.py
 backend/tests/test_mcp_stateless.py
+backend/tests/test_mcp_transcribe.py
+backend/tests/test_mlx_whisper.py
 backend/tests/test_observability.py
 backend/tests/test_openai_compat.py
 backend/tests/test_preload.py
@@ -46,6 +53,7 @@ backend/tests/test_progress.py
 backend/tests/test_ratelimit.py
 backend/tests/test_realtime_route.py
 backend/tests/test_realtime_stt.py
+backend/tests/test_resample.py
 backend/tests/test_retention.py
 backend/tests/test_route_classification.py
 backend/tests/test_seed_profiles.py
@@ -60,7 +68,9 @@ backend/utils/chunked_tts.py
 backend/utils/clock.py
 backend/utils/encode.py
 backend/utils/http.py
+backend/utils/resample.py
 backend/utils/subtitles.py
 backend/utils/wav_stream.py
 backend/voices.py
+integrations/livekit
 scripts/realtime_client.py

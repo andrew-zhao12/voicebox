@@ -60,13 +60,15 @@ Models load on first use and stay resident. On a server, load them at boot inste
 
 - `VOICEBOX_PRELOAD_MODELS` takes registry names (`python -m backend.preload --list` prints them, for example `kokoro`, `qwen-tts-1.7B`, `chatterbox-turbo`, `whisper-turbo`). Each one is loaded as a job on the generation queue, so a generation that arrives during the warm-up simply waits behind it.
 - To bake the weights into an image or an init container, run `python -m backend.preload kokoro whisper-turbo` (or `--from-env`) with the same `VOICEBOX_MODELS_DIR` / HuggingFace cache the server will use. It downloads and loads each model, then exits.
-- Client keys cannot trigger downloads; a request for a model that is not on disk gets a `409`. Preloading avoids that.
+- Client keys cannot trigger downloads; a request for a model that is not on disk is refused (`409` for Whisper, `400` for a speech model). Preloading avoids that, and voice agents need it: LiveKit's plugin gives up on a sentence whose audio has not started after 30 seconds, which a cold model load can exceed.
 
 ## 5. Graceful stop
 
 On `SIGTERM` the server stops accepting connections, finishes streams and SSE responses that are already open (up to 40 s), then drains its generation queue: new jobs are refused with `503` and `Retry-After`, `/health/ready` turns `503`, and queued and running generations get up to `VOICEBOX_DRAIN_TIMEOUT_S` (default 30) to finish before they are cancelled and the models unload. The compose file sets `stop_grace_period: 45s` to match; give your orchestrator a termination grace period of at least that.
 
 Behind a load balancer, set `VOICEBOX_SHUTDOWN_DELAY_S` (10 is a good start): the first `SIGTERM` then only turns `/health/ready` to `503` while the server keeps accepting and serving requests for that many seconds, so the balancer stops routing to it before the listener closes and no request lands on a closing replica. A second signal skips the rest of the delay. Add the delay to the grace period (90 s covers 10 + 40 + 30). The default is 0, so the desktop app quits at once.
+
+Live transcription sockets need the delay too. During it, each open session commits the utterance in progress, delivers its pending transcripts (for up to 10 s, or `VOICEBOX_DRAIN_TIMEOUT_S` if that is shorter, so a 10 s delay covers the longest wait) and closes with `1012`, and clients such as LiveKit reconnect to another replica. Without a delay, the sockets close as soon as the signal arrives and the words being spoken or transcribed at that moment are lost.
 
 ## 6. Retention
 
@@ -75,7 +77,7 @@ Generated audio and captures stay forever by default. With `VOICEBOX_RETENTION_D
 ## 7. Observability
 
 - **Request ids.** Every response carries `X-Request-Id` (echoed when the client sends a well-formed one). A `500` returns the same value as `error_id`, so an id reported by an application finds the traceback in the server log.
-- **JSON logs.** `VOICEBOX_LOG_FORMAT=json` switches the application and uvicorn loggers to one JSON object per line (`ts`, `level`, `logger`, `msg`, `request_id`, `key_id`, and for access lines `client`, `method`, `path`, `status`). Query strings still have media tokens and OAuth codes redacted.
+- **JSON logs.** `VOICEBOX_LOG_FORMAT=json` switches the application and uvicorn loggers to one JSON object per line (`ts`, `level`, `logger`, `msg`, `request_id`, `key_id`, and for access lines `client`, `method`, `path`, `status`). Query strings still have media tokens and OAuth codes redacted, in request lines and in WebSocket handshake lines.
 - **Metrics.** `GET /metrics` (admin key) serves Prometheus metrics: HTTP requests and latency by route, queue depth and wait, synthesis duration and characters per engine, time to the first streamed chunk, Whisper/LLM slot waits, model load times, rate-limit rejections, CUDA memory. `VOICEBOX_METRICS_PORT=9464` additionally serves them on a separate unauthenticated port for scrapers that cannot send a bearer; keep that port on a private network.
 - **Load test.** `scripts/load_test.py --url ... --key ... --voice ... --model kokoro --concurrency 4 --requests 20` streams through `/v1/audio/speech` and prints time to first byte, total time, realtime factor and the 429 count. Run it once per engine on the target hardware before choosing rate limits. For scale: Kokoro on an Apple M-series CPU serves sentence-length requests with the first byte after about one second and produces roughly six seconds of audio per wall second per request.
 
@@ -87,6 +89,7 @@ One process serves one request at a time per lane. By default there is one lane,
 - `VOICEBOX_MODEL_IDLE_UNLOAD_S=900` unloads engines that finished their last job more than that many seconds ago, and Whisper or the LLM when their slot has been idle as long, so a server with several engines does not keep all of them resident for a request that came once. Preloaded models are never unloaded. The minimum is 30 seconds.
 - `POST /models/{name}/unload` answers `409` while that engine has a job queued or running.
 - Same-engine concurrency is off by default because the backends share model state. `VOICEBOX_ENGINE_CONCURRENCY=kokoro=2,qwen=2` lets that many jobs of one engine run at once within a lane: the queue still hands out jobs strictly in order, a different engine waits until the lane is empty, and seeded jobs still run alone. Only engines reviewed for it are accepted (`kokoro`, `qwen`, `qwen_custom_voice`, `luxtts`, `tada`; Chatterbox stores the reference voice on the model, so it stays serial), at most 4 each, and Apple Silicon (MLX) ignores the setting. Measure with `scripts/load_test.py` before and after: on a GPU a second job of the same model often adds throughput, on a CPU it usually only shares the cores.
+- Whisper runs one call at a time per process, outside the generation queue; uploads, MCP transcriptions and live transcription share it. [LiveKit Agents → Sizing](/integrations/livekit#sizing) works through what that means for voice agents.
 
 ## 9. Backups
 
@@ -101,6 +104,7 @@ Models are cached separately (`huggingface-cache` volume or `VOICEBOX_MODELS_DIR
 - Keep the server's HTTP keep-alive above the balancer's idle timeout. The image starts uvicorn with `--timeout-keep-alive 650` for that reason (uvicorn's default is 5 s): a balancer that reuses an idle connection the replica just closed answers `502`, which is exactly what a 2-replica fleet behind Caddy showed with the default. Running uvicorn yourself behind an ALB (idle timeout 60 s by default, 300 s in the recipe) or Google's front ends (600 s), pass the same flag.
 - Set `VOICEBOX_ALLOWED_HOSTS` to the public name(s) (`voice.example.com`, `*.internal.example.com`). A browser tricked into resolving an attacker's domain to your server's address then sends that domain as `Host` and is refused with `400`; loopback names, `/health`, `/health/ready` and `/metrics` keep working for the desktop shell, probes and scrapers.
 - Per-key rate limits, upload caps and the queue depth are described in [API Keys](/overview/api-keys). Raise a key's limits in `api_keys.json` rather than turning limiting off.
+- Voice agents are heavy users: a [LiveKit Agents](/integrations/livekit) worker sends one speech request per sentence and holds a live transcription session per call. Give each worker its own client key with raised `inference`, `requests`, `max_pending_jobs` and `max_realtime_sessions` (the defaults are 30 per minute, 300 per minute, 4 and 2), and raise `VOICEBOX_REALTIME_MAX_SESSIONS` (default 4) to the number of calls one replica should carry.
 
 ## 11. Upgrading
 

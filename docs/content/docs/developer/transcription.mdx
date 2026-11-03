@@ -76,6 +76,8 @@ WhisperForConditionalGeneration.from_pretrained(hf_repo).to(device)
 
 Both load paths use `model_load_progress()` from `backends/base.py` so the frontend sees live download progress on the first use.
 
+On MLX, `MLXSTTBackend._load_model_sync` also patches mlx-audio's tokenizer wrapper. mlx-audio (the pinned 0.4.1, and its main branch) looks the no-speech token up only as `<|nospeech|>`, but the tokenizers before large-v3 call it `<|nocaptions|>`. The lookup fell back to the unknown token, which in Whisper is `<|endoftext|>`, and because decoding suppresses the no-speech token it suppressed end-of-text: Base, Small and Medium decoded every 30 s window up to the token limit, appending invented text to nearly every transcript, and `no_speech_prob` never flagged silence. `_no_speech_token` resolves either name and is installed as `HFTokenizerWrapper.no_speech`; `backend/tests/test_mlx_whisper.py` guards it. Large (v3) and Turbo were never affected. Keep the patch until mlx-audio fixes the lookup upstream.
+
 ## Audio Preprocessing
 
 Whisper expects mono 16 kHz audio. The audio utility in `backend/utils/audio.py` handles resampling and format conversion transparently:
@@ -90,6 +92,10 @@ Files longer than Whisper's 30-second window are transcribed window by window. O
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/transcribe` | Transcribe an uploaded audio file |
+| POST | `/v1/audio/transcriptions` | The OpenAI-compatible upload, with `verbose_json`, `srt` and `vtt` output ([API Reference](/overview/api-reference)) |
+| WebSocket | `/v1/realtime?intent=transcription`, `/v1/realtime/transcription` | Live transcription: partial and final transcripts per utterance ([API Reference](/overview/api-reference)) |
+
+Whisper runs outside the generation queue, one call at a time, behind `services/inference_slots.py::whisper_slot`: up to four callers wait (60 s each), the rest get `429`. Every path calls `whisper_slot.run(...)`, which keeps the slot until the worker thread has finished even when the caller is cancelled (a live transcription socket closing mid-utterance, a client hanging up), so two transcriptions never overlap.
 
 ### Request
 
@@ -127,7 +133,8 @@ Adding a voice sample triggers transcription automatically:
 ### Quality Tips
 
 - Provide a language hint for short clips (under 5 seconds) — auto-detection is unreliable on little audio.
-- Use Turbo or Large for noisy audio — Base can hallucinate on hard inputs.
+- Larger sizes are more accurate on noisy, accented or technical speech; Turbo gives Large-tier accuracy in a fraction of the time. Base is fine for clean speech on both backends.
+- Silence and pure noise transcribe to an empty string on MLX; on the PyTorch path Base tends to return a stray word ("you") for them, so trim long silences before transcribing.
 - Prefer clean audio; transcription errors become reference-text errors, which become cloning errors.
 
 ## Memory Management

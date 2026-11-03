@@ -46,13 +46,17 @@ The full list of routes a client key may call:
 | GET | `/auth/whoami` |
 | POST | `/auth/media-token` |
 | MCP | `/mcp` — the `voicebox.speak`, `voicebox.transcribe` (base64 audio) and `voicebox.list_profiles` tools |
+| GET | `/v1`, `/v1/models`, `/v1/voices` |
+| POST | `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/voices` |
+| DELETE | `/v1/voices/{voice}` (voices the key created) |
+| WebSocket | `/v1/realtime?intent=transcription`, `/v1/realtime/transcription` |
 
 Everything else is admin-only. A client key on an admin route gets `403`; a request without a key gets `401`. Unknown paths answer the same way, so nobody can map the API without a key.
 
 Two things to plan for when you build on a client key:
 
 - **Models must already be downloaded.** Client keys can't trigger downloads. `/generate` and `/generate/stream` answer `400` and `/transcribe` answers `409` while the model is missing. Download it from the desktop app or with an admin key (`POST /models/download`) first.
-- **Keys don't partition data.** Any client key can list every profile and fetch any generation by id. Per-key ownership is not implemented.
+- **Keys partition voices, not generations.** A client key sees the shared voice profiles (the ones an admin created) and the voices it created itself through `POST /v1/voices`, never another key's. Generations have no owner: any client key can fetch any generation by id (`/history/{id}`, `/audio/{id}`).
 
 ## Where your key lives
 
@@ -137,9 +141,15 @@ backend/venv/bin/python -m backend.keys create --id myapp --role client
 backend/venv/bin/python -m backend.keys create --id batch-job --role client \
   --limit requests=600 --limit inference=60
 
+# A LiveKit Agents worker serving about eight calls at once
+backend/venv/bin/python -m backend.keys create --id livekit-agent --role client \
+  --limit inference=600 --limit requests=1200 --limit max_pending_jobs=16 --limit max_realtime_sessions=8
+
 backend/venv/bin/python -m backend.keys list
 backend/venv/bin/python -m backend.keys revoke --id myapp
 ```
+
+A voice agent sends one speech request per sentence and keeps a live transcription session open per call, so the client defaults (30 inference requests per minute, 2 sessions) carry a call or two at most; [LiveKit Agents](/integrations/livekit#before-you-start) lists what each call uses.
 
 Inside the Docker container the same CLI is available; run it as the `voicebox` user so the server can read the file it writes:
 
@@ -237,12 +247,12 @@ Limits are token buckets per key, refilled continuously (a limit of 300 per minu
 | Limit | Admin key | Client key | Notes |
 |-------|-----------|------------|-------|
 | Requests per minute | 1200 | 300 | Every authenticated request |
-| Inference requests per minute | 120 | 30 | TTS, STT and LLM routes, plus the MCP `speak` and `transcribe` tools |
+| Inference requests per minute | 120 | 30 | TTS, STT and LLM routes, the MCP `speak` and `transcribe` tools, and each live transcription session |
 | Upload bytes per minute | 2 GiB | 256 MiB | Request bodies, from `Content-Length` or counted as they arrive |
-| TTS characters per minute | 600,000 | 60,000 | The `text` of each `/generate`, `/generate/stream` and `/speak` call |
+| TTS characters per minute | 600,000 | 60,000 | The text of each `/generate`, `/generate/stream`, `/speak` and `/v1/audio/speech` call, charged up front |
 | Pending queued jobs | unlimited | 4 | Generations waiting in or running through the queue at once |
 | Voices per key | unlimited | 50 | Cloned voices the key created through `POST /v1/voices` (a count, not a rate) |
-| Live transcription sessions | unlimited | 2 | Open `/v1/realtime/transcription` sockets at once (a count); `VOICEBOX_REALTIME_MAX_SESSIONS` caps the whole server |
+| Live transcription sessions | unlimited | 2 | Open `/v1/realtime` and `/v1/realtime/transcription` sockets at once (a count); `VOICEBOX_REALTIME_MAX_SESSIONS` caps the whole server |
 | Global queue depth | 32 | 32 | Whole server, all keys together; `VOICEBOX_MAX_QUEUE_DEPTH` |
 | Failed authentications per minute | 30 per IP | 30 per IP | Bad keys and `403`s; a valid key keeps working regardless |
 | Anonymous requests per minute | 300 per IP | 300 per IP | The public endpoints above |
@@ -287,7 +297,7 @@ Bodies above the cap are rejected with `413`:
 | `429` | | A rate limit or the queue is exhausted. Wait `Retry-After` seconds. |
 | `500` | `{"detail": "Internal server error", "error_id": "..."}` | Something unexpected happened. Details are never sent to clients; search the server log for the `error_id`. |
 
-The server's access log redacts `token=` values, so it is safe to share when you report a problem.
+The server's log redacts `token=` values, in request lines and in the WebSocket handshake lines alike, so it is safe to share when you report a problem.
 
 ## Rotating and revoking keys
 

@@ -1,0 +1,330 @@
+---
+title: "LiveKit Agents"
+description: "Use a self-hosted Voicebox as the speech and transcription of a LiveKit voice agent, through LiveKit's stock OpenAI plugin"
+---
+
+## Overview
+
+[LiveKit Agents](https://docs.livekit.io/agents/) builds voice agents that join LiveKit rooms and phone calls. Voicebox can be their speech and their transcription: LiveKit's own OpenAI plugin (`livekit-plugins-openai`) pointed at Voicebox's [OpenAI-compatible `/v1` API](/overview/api-reference) is all it takes, so there is no Voicebox package to install.
+
+| Job | Done by |
+|-----|---------|
+| Rooms, WebRTC media, phone calls over SIP | The LiveKit server |
+| Voice activity detection, end of turn, interruptions | The agent worker: Silero VAD and LiveKit's turn detector model, both running locally |
+| The conversation | Any OpenAI-compatible chat API through `openai.LLM` (Voicebox has no chat endpoint) |
+| Speech | Voicebox `POST /v1/audio/speech`, through `openai.TTS` |
+| Transcription | Voicebox `WS /v1/realtime?intent=transcription`, through `openai.STT(use_realtime=True)`, or one `POST /v1/audio/transcriptions` per utterance through `openai.STT()` |
+
+<Callout type="info">
+  Install `livekit-agents>=1.8.6,<2` with the `openai` and `silero` extras. The plugin calls on this page were tested with livekit-agents and livekit-plugins-openai 1.8.8 on Python 3.12, and the end-to-end check in `integrations/livekit/e2e` also passed with 1.8.6 on Python 3.10. Keep the upper bound: livekit-agents 2.0 is a beta that runs on LiveKit's staging environment only, the 1.8.8 OpenAI and turn-detector plugins fail to import on 2.0.0b1, and a bare `>=` pin lets an installer that accepts pre-releases choose it.
+</Callout>
+
+The example and six real-room sessions were revalidated on 2026-11-03 with LiveKit Agents and the OpenAI plugin 1.8.10 on Python 3.12: realtime and batch transcription, barge-in cancellation, and the unmodified example worker all passed. The measurements below retain the original run's larger sample.
+
+## Before you start
+
+- **A Voicebox server the worker can reach.** The worker calls Voicebox for every sentence it speaks and streams every word the caller says to it, so keep the two close: the same host or the same private network. Run the [Docker image](/overview/docker) or a headless server ([Deployment Checklist](/overview/deployment)); the desktop app's server on `127.0.0.1:17493` only serves a worker on the same machine, and only while the app is open. Beyond loopback or a private network, use HTTPS: the plugin turns an `https://` base URL into `wss://` for the transcription socket, and the key travels in every request.
+- **An LLM.** Any OpenAI-compatible chat API: OpenAI, or a local server such as Ollama (`http://127.0.0.1:11434/v1`).
+- **A client key for the worker, with raised limits.** The defaults suit one application making occasional calls, not an agent that speaks every few seconds. A call uses:
+
+  | Limit | Client default | What a LiveKit call uses |
+  |-------|----------------|--------------------------|
+  | `inference` per minute | 30 | One per sentence spoken, one per utterance transcribed in batch mode, one per live transcription session and per reconnect |
+  | `requests` per minute | 300 | One per sentence spoken and per batch utterance (the transcription socket is not counted) |
+  | `max_pending_jobs` | 4 | One while a sentence is being synthesized; two for a moment after the caller interrupts |
+  | `max_realtime_sessions` | 2 | One per call with `use_realtime=True` |
+  | `tts_chars` per minute | 60,000 | The text the agent speaks |
+  | `uploads_bytes` per minute | 256 MiB | The caller's audio, about 2.9 MB per minute of call |
+
+  For about eight simultaneous calls:
+
+  ```bash
+  python -m backend.keys create --id livekit-agent --role client \
+    --limit inference=600 --limit requests=1200 \
+    --limit max_pending_jobs=16 --limit max_realtime_sessions=8
+  ```
+
+  Give the worker its own key rather than the admin key, so its limits can be tuned and it can be revoked alone (see [API Keys](/overview/api-keys)). Raise the server-wide `VOICEBOX_REALTIME_MAX_SESSIONS` (default 4) to the number of calls as well; with Docker Compose, set it under `environment:` in an override file.
+- **The models in memory before the first call.** Set `VOICEBOX_PRELOAD_MODELS` to the speech model and the Whisper size the agent uses (for example `kokoro,whisper-base`) and dispatch agents only once `GET /health/ready` answers `200`. A client key never downloads a model, and the plugin gives up on a sentence that has not started arriving after 30 seconds, which a cold model load can exceed.
+
+## Quick start
+
+<Steps>
+<Step>
+
+### Start Voicebox with the models loaded
+
+With Docker, from the repository root:
+
+```bash
+export VOICEBOX_API_KEY="$(openssl rand -base64 32)"   # the server's admin key
+export VOICEBOX_PRELOAD_MODELS=kokoro,whisper-base
+docker compose up -d --build
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:17600/health/ready   # 200 once both are loaded
+```
+
+</Step>
+<Step>
+
+### Create the worker's key
+
+```bash
+docker compose exec -u voicebox voicebox python -m backend.keys create --id livekit-agent --role client \
+  --limit inference=600 --limit requests=1200 --limit max_pending_jobs=16 --limit max_realtime_sessions=8
+```
+
+The key is printed once; keep it for `VOICEBOX_CLIENT_KEY` below.
+
+</Step>
+<Step>
+
+### Install LiveKit Agents
+
+```bash
+pip install "livekit-agents[openai,silero]>=1.8.6,<2"
+```
+
+</Step>
+<Step>
+
+### Write the agent
+
+```python title="agent.py"
+import os
+
+from livekit.agents import Agent, AgentServer, AgentSession, JobContext, cli, inference
+from livekit.plugins import openai, silero
+
+VOICEBOX = os.environ["VOICEBOX_URL"].rstrip("/") + "/v1"  # e.g. http://localhost:17600
+KEY = os.environ["VOICEBOX_CLIENT_KEY"]  # a client key, never the server's admin key
+
+server = AgentServer()
+
+
+@server.rtc_session()
+async def entrypoint(ctx: JobContext) -> None:
+    session = AgentSession(
+        vad=silero.VAD.load(),
+        stt=openai.STT(
+            base_url=VOICEBOX,
+            api_key=KEY,
+            model="whisper-1",  # the Whisper size the server has loaded
+            language="en",
+            use_realtime=True,  # WS /v1/realtime?intent=transcription
+        ),
+        llm=openai.LLM(model="gpt-4.1-mini"),  # or any OpenAI-compatible chat API
+        tts=openai.TTS(
+            base_url=VOICEBOX,
+            api_key=KEY,
+            model="kokoro",
+            voice="af_heart",  # always pass a voice
+            response_format="wav",
+        ),
+        turn_handling={
+            "turn_detection": inference.TurnDetector(version="v1-mini"),  # local model
+            "interruption": {"mode": "vad"},
+        },
+    )
+    await session.start(agent=Agent(instructions="You are a helpful voice assistant. Keep replies short."), room=ctx.room)
+    await session.generate_reply(instructions="Greet the user and offer your help.")
+
+
+if __name__ == "__main__":
+    cli.run_app(server)
+```
+
+`openai.LLM` reads `OPENAI_API_KEY`; for a local model use `openai.LLM.with_ollama(model="llama3.1")` or `openai.LLM(base_url=..., api_key=..., model=...)`. Pass `api_key` to the Voicebox plugins explicitly: without it they fall back to `OPENAI_API_KEY` and send that to Voicebox.
+
+</Step>
+<Step>
+
+### Run it
+
+```bash
+export VOICEBOX_URL=http://localhost:17600 VOICEBOX_CLIENT_KEY=vbx_... OPENAI_API_KEY=sk-...
+python agent.py console   # talk to it through this machine's microphone and speakers
+python agent.py start     # or serve rooms on the LiveKit server in LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET
+```
+
+</Step>
+</Steps>
+
+The repository has a complete worker in `integrations/livekit/agent.py` (install its dependencies with `pip install -r integrations/livekit/requirements.txt`): the same pipeline with the VAD loaded once per worker process, a greeting, transcript logging and a configuration check. It reads:
+
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `VOICEBOX_URL` | Voicebox server root; `/v1` is appended | `http://127.0.0.1:17493` |
+| `VOICEBOX_CLIENT_KEY` | The worker's client key | required |
+| `VOICEBOX_VOICE` | The agent's voice: a preset id, or a voice profile's name or id | `af_heart` |
+| `VOICEBOX_TTS_MODEL` | Speech engine or model; `tts-1` uses the voice's own engine, so it serves preset and cloned voices alike | `tts-1` |
+| `VOICEBOX_STT_MODEL` | Whisper model | `whisper-1` |
+| `VOICEBOX_STT_REALTIME` | `1` streams to the live transcription socket, `0` uploads each utterance | `1` |
+| `VOICEBOX_LANGUAGE` | Language the caller speaks | `en` |
+| `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` | The chat API; `LLM_API_KEY` falls back to `OPENAI_API_KEY` | OpenAI, `gpt-4.1-mini` |
+| `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | The LiveKit server, for `dev` and `start` | |
+
+The key variable is deliberately not `VOICEBOX_API_KEY`: that name is the server's own admin key, and a worker sharing an environment with the server would pick up a key with no limits.
+
+## Speech
+
+### Plugin settings
+
+| `openai.TTS` argument | On Voicebox |
+|-----------------------|-------------|
+| `base_url` | `https://<voicebox>/v1` |
+| `api_key` | The worker's client key |
+| `model` | An engine or model name from `GET /v1/models` (`kokoro`, `qwen-tts-1.7B`, `chatterbox-turbo`, `luxtts`, ...). `tts-1` and `gpt-4o-mini-tts`, the plugin's default, use the voice's own engine. A preset voice works only with its engine, a cloned voice only with a cloning engine. |
+| `voice` | A preset voice id (`af_heart`, or `kokoro:af_heart`) or a voice profile's name or id; `GET /v1/voices` lists them. Always set it: the plugin's default, `ash`, is one of OpenAI's stock names, which Voicebox maps to the configured default voice, and the request fails with `404` when none is configured. |
+| `response_format` | `wav` or `pcm`. Both stream chunk by chunk. `pcm` is always 24 kHz, the rate the plugin assumes for raw audio; `wav` carries the engine's rate in its header (48 kHz for LuxTTS) and the plugin resamples it. The plugin's default, `mp3`, and the other compressed formats stream only when the server has ffmpeg (the Docker image does); `aac` needs it. Never `ulaw_8000` (see [Phone calls](#phone-calls-livekit-sip)). |
+| `speed` | `0.25` to `4.0`. Native on Kokoro, a pitch-preserving time stretch on the other engines. |
+| `instructions` | A delivery hint for the engines that take one (Qwen CustomVoice); the others ignore it. |
+
+The plugin sends nothing else, so Voicebox's own speech fields are out of reach: `language` (set it on the voice profile; a preset voice speaks its own language), `max_chunk_chars` and `first_chunk_chars` (the server defaults apply).
+
+### One request per sentence
+
+The plugin does not stream text in, so `AgentSession` wraps it in LiveKit's sentence adapter: the reply is split into sentences (very short ones are merged with the next), and each sentence is one `POST /v1/audio/speech`, sent once the previous sentence's audio has fully arrived. Within a request Voicebox streams too: a sentence longer than 120 characters is cut at a clause boundary inside its first 120 characters when it has one, so its audio starts before the whole sentence is synthesized.
+
+So the first audio of a reply waits for the first sentence of the LLM's answer, any queue wait, and the synthesis of its first chunk. While a sentence plays, the next one is synthesized; an engine slower than real time leaves gaps between sentences. Every request is one job in Voicebox's generation queue, shared with every other call (see [Sizing](#sizing)).
+
+### Interruptions
+
+When the caller talks over the agent, LiveKit pauses playback at once (0.7 s into the caller's speech in the [measurements](#latency)) and closes the speech request in flight only when the caller's final transcript arrives. Until then it may still resume the reply, if the sound brings no transcript within 2 s of silence (a false interruption), so Voicebox keeps synthesizing the reply's sentences while the caller talks. With `"interruption": {"mode": "vad", "resume_false_interruption": False}` LiveKit closes the request as soon as the interruption starts instead, and never resumes. Once the request is closed:
+
+- **Before its first audio**, Voicebox gives the job up: a job still queued is skipped at once, a running one stops when the engine call in progress returns (an engine call cannot be interrupted), and either way the key's pending slot is freed. The request is counted as `499`.
+- **While its audio streams**, the job stops after the chunk being synthesized.
+
+The characters stay charged to the key's `tts_chars` either way. Keep LiveKit's `preemptive_tts` off (the default): it starts speech before the turn is confirmed, and every cancelled start is synthesis the queue did for nothing.
+
+### Failures
+
+A failure before the first audio is an ordinary error status (`400` for a model that is not downloaded or a voice that does not fit the engine, `404` for an unknown voice or model, `429` for a limit). A failure after audio has started drops the connection instead of ending the response normally, so the plugin never mistakes a cut-off sentence for a complete one; it retries the sentence from its start, which the caller may hear as a repeated beginning. The cause is in the Voicebox log.
+
+## Transcription
+
+### Live transcription
+
+`openai.STT(..., use_realtime=True)` opens `/v1/realtime?intent=transcription&model=<model>` on the Voicebox server and streams the caller's audio for the whole call, as 24 kHz PCM16 in 50 ms messages. Its first message configures the session with the model, the language and Voicebox's voice activity detection, which cuts the audio into utterances for Whisper. The plugin's defaults, and what Voicebox's energy-based detector makes of them:
+
+| Setting (plugin default) | On Voicebox |
+|--------------------------|-------------|
+| `threshold` (`0.5`) | A 20 ms frame counts as speech when it is 6 to 24 dB above an adaptive noise floor (15 dB at `0.5`) and above −45 dBFS; an utterance starts after about 150 ms of speech |
+| `prefix_padding_ms` (`600`) | Audio kept from before the speech started |
+| `silence_duration_ms` (`350`) | Quiet that ends an utterance; all but the last 200 ms of it is trimmed before Whisper |
+
+Change them with the plugin's `turn_detection` argument, for example `turn_detection={"type": "server_vad", "threshold": 0.7, "prefix_padding_ms": 300, "silence_duration_ms": 500}` for a noisy line. While an utterance goes on, Whisper runs on it every second, and the words two passes agree on arrive as interim transcripts; when it ends, one more pass gives the final transcript. Utterances are cut at 30 seconds (Whisper's window), at a short pause once they pass 24.
+
+The plugin maps `speech_started` and `speech_stopped` to LiveKit's start and end of speech, accumulates the deltas into interim transcripts and turns `completed` into the final transcript. It treats any `error` event as fatal for the stream and ignores `failed` events.
+
+Voicebox ends a session in these cases; the close carries the reason as text:
+
+| Close | When | What the plugin does |
+|-------|------|----------------------|
+| `1000 idle_timeout` | No message from the worker for `VOICEBOX_REALTIME_IDLE_S` seconds (default 60, minimum 15), for example while the caller is muted | Reconnects |
+| `1000 session_too_long` | The session reached `VOICEBOX_REALTIME_MAX_SESSION_S` (default 1800) | Reconnects |
+| `1012 server_shutting_down` | The server received `SIGTERM` | Reconnects, to another replica behind a balancer |
+| `1013 session_limit_reached` | The key's `max_realtime_sessions` or the server's `VOICEBOX_REALTIME_MAX_SESSIONS` is reached | Retries |
+| `1013 rate_limit_exceeded` | The key's `inference` or `uploads_bytes` budget is spent | Retries |
+| `1008` (`model_not_found`, `model_not_downloaded`) | The model is unknown, or not on disk for a client key; refused when the socket opens | Stops: an `error` event comes first |
+
+These closes come without an `error` event, except the `1008` ones, so the plugin treats them as recoverable and reconnects: after 0.1 s, then every 2 s, giving up after three retries in a row. A connection that lasted longer than LiveKit's 10 s connect timeout starts that count over, which is why the idle timeout cannot go below 15 s. Before an idle, too-long or shutdown close, Voicebox commits the utterance in progress and delivers its final transcript first; on shutdown that needs `VOICEBOX_SHUTDOWN_DELAY_S` (see [Deployment](/overview/deployment#5-graceful-stop)). Every reconnect costs one `inference`, so a muted caller costs one per idle timeout, and the plugin itself starts a fresh session after ten minutes, at its next final transcript.
+
+The socket accepts the plugin's `prompt` (up to 4,096 characters) but does not pass it to Whisper yet, and ignores `noise_reduction_type`.
+
+### Batch transcription
+
+`openai.STT(...)` without `use_realtime` posts each utterance to `POST /v1/audio/transcriptions`. The plugin cannot stream in this mode, so `AgentSession` lets the session's VAD cut the utterances; it must have one, and `vad=None` fails with "does not support streaming, add a VAD". The final transcript arrives one Whisper pass after Silero closes the utterance, with no interim transcripts. There is no session to keep open, and each utterance costs one `inference` and one request. `prompt` and `temperature` are ignored.
+
+### Models
+
+| `model` | On Voicebox |
+|---------|-------------|
+| `whisper-1`, `gpt-4o-mini-transcribe` (the plugin's default), `gpt-4o-transcribe` | The Whisper size the server loaded last: the preloaded one, or `base` on a fresh server |
+| `whisper-base`, `whisper-small`, `whisper-medium`, `whisper-large`, `whisper-turbo` | That size |
+| `gpt-realtime-whisper`, `gpt-live-transcribe`, anything else | Refused: `404` in batch mode, `model_not_found` and close `1008` on the socket |
+
+Whisper keeps one size in memory, and a request for another size replaces it, so preload one size and use `whisper-1` everywhere. On a CPU, `whisper-base` or `whisper-small` keeps transcription quick; `whisper-turbo` is the better choice with a GPU or on Apple Silicon. A size that is not downloaded is refused for client keys: `409` in batch mode, `model_not_downloaded` and close `1008` on the socket. Neither refusal is retried.
+
+## Turn detection
+
+LiveKit decides when the caller has finished speaking; Voicebox only transcribes. Keep Silero VAD and LiveKit's turn detector, and pass both turn settings explicitly:
+
+```python
+turn_handling={
+    "turn_detection": inference.TurnDetector(version="v1-mini"),
+    "interruption": {"mode": "vad"},
+},
+```
+
+Left to its defaults, livekit-agents 1.8 picks these by mode. `python agent.py console` and `dev` set `LIVEKIT_DEV_MODE=1`, and in that mode, or when the agent is hosted on LiveKit Cloud, the default turn detector is the cloud `v1` model and adaptive interruption detection is switched on, both served by LiveKit Cloud's inference gateway. `v1-mini` runs inside the worker. Silero's default `min_silence_duration` (0.55 s) satisfies the turn detector, which needs at least 0.25 s.
+
+## Phone calls (LiveKit SIP)
+
+[LiveKit telephony](https://docs.livekit.io/telephony/) brings callers into rooms as ordinary participants. LiveKit's SIP service handles the phone codecs (G.711 μ-law and A-law, G.722) itself, so the agent hears and speaks plain PCM and the setup above stays the same.
+
+- **Do not use `response_format="ulaw_8000"`.** It is for clients that forward raw telephone audio themselves, such as a Twilio Media Streams bridge; LiveKit's audio decoder cannot read it, and every sentence fails. Likewise, the G.711 input formats of the transcription socket (`audio/pcmu`, `audio/pcma`) are for such clients; the plugin always sends 24 kHz PCM.
+- **Check transcription on real phone audio.** A phone line carries little above 3.4 kHz; try the Whisper size you plan to use on recorded calls before going live. On LiveKit Cloud, the telephony noise cancellation model (`noise_cancellation.BVCTelephony()`) cleans up callers' audio before the VAD, the turn detector and Voicebox hear it.
+
+## Latency
+
+A reply starts once LiveKit has decided the turn is over and the final transcript is in, whichever comes later, plus the LLM's first sentence and Voicebox's first chunk of it. With live transcription the final transcript follows the caller's last word by Voicebox's 350 ms of silence and one Whisper pass on the utterance; in batch mode, by Silero's silence and one Whisper pass. The speech side adds any wait in Voicebox's queue and the synthesis of the first chunk.
+
+Measured on 2026-10-17 with the end-to-end check in `integrations/livekit/e2e`, on an Apple Silicon Mac (M5 Pro): Voicebox's MLX backend with Kokoro on the CPU and Whisper Base on MLX, livekit-server 1.13.10 in Docker Desktop and the worker on the same machine, one call at a time, `response_format="wav"`, the `v1-mini` turn detector, and an echo LLM that answers within 12 ms. Times are medians with the range in brackets, over 9 sessions per transcription mode (7 and 6 for the last row), all of which passed:
+
+| Measure | Live transcription | Batch transcription |
+|---------|--------------------|---------------------|
+| End of the caller's speech → first audio of the reply at the caller | 1.49 s (1.44–1.52) | 1.71 s (1.68–1.73) |
+| End of speech → final transcript in the worker | 0.52 s (0.50–0.54) | 0.85 s (0.80–0.85) |
+| End of speech → LiveKit commits the turn (`end_of_turn_delay`) | 0.58 s | 0.65 s (0.64–0.65) |
+| Speech request → Voicebox's first audio byte (`ttfb` of `openai.TTS`) | 0.36 s (0.34–0.38) | 0.35 s (0.34–0.36) |
+| Caller cuts in → the agent's audio stops at the caller | 0.69 s (0.69–0.71) | 0.70 s (0.69–0.75) |
+
+The first row is what a caller feels. With LiveKit's defaults the LLM starts on the final transcript while the turn is being confirmed, and the speech request goes out once it is: in the live column the turn was committed 0.58 s after the caller stopped and Voicebox's first audio byte followed 0.36 s after the request. The remaining half second or so is the audio path through LiveKit in both directions, which these measurements do not split. Batch transcription answers about 0.2 s later because the upload starts only once Silero has heard the caller stop. A real deployment adds the LLM's time to its first sentence (less the part that overlaps the turn confirmation), any network between the worker and Voicebox, and its own engine's time to first audio in place of Kokoro's on this CPU (`scripts/load_test.py` prints it as `first byte`). The repository's `docs/walkthroughs/07-livekit.md` repeats these runs step by step, with the expected output of every command.
+
+## Sizing
+
+- **Speech is serial by default.** Voicebox synthesizes one job at a time per queue lane, and there is one lane unless `VOICEBOX_GENERATION_WORKERS=2`. Every sentence of every call is a job, served in arrival order, so when several calls speak at once each one's next sentence waits for the others'. Playback stays continuous while the engine renders audio faster than the calls consume it: measure the engine's realtime factor on your hardware (`scripts/load_test.py` at concurrency 1 prints it as audio seconds per wall second) and keep it above the number of calls you expect to speak at the same moment.
+- **More synthesis at once.** `VOICEBOX_GENERATION_WORKERS=2` gives CPU engines (Kokoro, LuxTTS) and GPU engines a lane each, which helps when agents use both. `VOICEBOX_ENGINE_CONCURRENCY=kokoro=2` lets two jobs of one engine run at once in a lane; it is off by default and ignored on Apple Silicon, so measure before and after (see [Deployment → Throughput](/overview/deployment#8-throughput)).
+- **Whisper runs one call at a time** per server, for every call's interim passes, final passes and batch uploads alike. Interim passes are skipped while it is busy; final passes wait, four at most and for 60 s each, after which the utterance fails (`whisper_busy` on the socket, which the plugin ignores, or `429` in batch mode). Under load, interim transcripts become rarer before finals get slower. A live-transcribed call keeps at most eight utterances waiting for their final pass; the next one fails at once with `whisper_busy`.
+- **Sessions.** Each live-transcribed call holds one of the key's `max_realtime_sessions` and one of the server's `VOICEBOX_REALTIME_MAX_SESSIONS` for its whole length.
+- **Everything is per replica.** Rate limits, queue caps and session counts live in each process. Past what one replica serves, run several behind a load balancer ([Scaling](/overview/scaling)): a transcription socket stays on the replica it connected to, and a reconnect may land on any of them. Keep `VOICEBOX_REALTIME_MAX_SESSION_S` below the balancer's longest allowed connection, so Voicebox ends sessions itself and delivers their finals first.
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---------|---------------|
+| `APIStatusError` 404: "'ash' maps to the default voice, and none is configured" | `voice` is not set. Pass a preset id or a voice profile name (`GET /v1/voices`). |
+| `APIStatusError` 400: "... model is not downloaded yet" | The speech model is not on the server. Download it with the admin key, or add it to `VOICEBOX_PRELOAD_MODELS`. |
+| `APIStatusError` 400: "response_format 'aac' needs ffmpeg on the server" | Use `wav` or `pcm`. |
+| "no audio frames were pushed" | The plugin could not decode the audio: `response_format="ulaw_8000"`, or livekit-agents older than 1.7.1 with a model other than `tts-1`. Use `wav` or `pcm` and livekit-agents 1.8.6 or later. |
+| The first reply after a restart takes 30 s or more | The model was loading: the plugin waited 30 s and retried. Preload the models and wait for `/health/ready`. |
+| `429` "Rate limit exceeded for inference" in the worker log, sentences skipped | The key's limits are too low for the calls. Raise `inference`, `requests` and `max_pending_jobs`; LiveKit retries after 0.1 s and 2 s and does not wait for `Retry-After`. |
+| The transcription socket fails with HTTP 403 | The key is wrong, or the server predates `/v1/realtime`. Check `VOICEBOX_CLIENT_KEY`, upgrade, or use batch mode. |
+| "OpenAI Realtime STT error: Whisper model ... is not downloaded" | Preload or download that size, or use `whisper-1`. |
+| "OpenAI Realtime STT error: Unknown model ..." | Use `whisper-1` or `whisper-<size>`. |
+| The third call hears nothing; the worker log shows retries ending in `session_limit_reached` | Raise the key's `max_realtime_sessions` and the server's `VOICEBOX_REALTIME_MAX_SESSIONS`. |
+| The transcription stream reconnects every minute while the caller is muted | Expected: the idle timeout. Raise `VOICEBOX_REALTIME_IDLE_S` to reconnect less often. |
+| "does not support streaming, add a VAD" | Batch transcription with `vad=None`. Pass a VAD, or use `use_realtime=True`. |
+| The caller hears the start of a sentence twice | Synthesis failed part-way and the plugin retried the sentence. The cause is in the Voicebox log. |
+| Transcripts go missing during deploys | Set `VOICEBOX_SHUTDOWN_DELAY_S` so sessions deliver their finals before the server stops. |
+| Interim transcripts thin out and finals arrive late with many calls | Whisper is saturated. Use a smaller size, a GPU, or more replicas (see [Sizing](#sizing)). |
+
+## Next steps
+
+<Cards>
+  <Card title="API Reference" href="/overview/api-reference">
+    The `/v1` endpoints the plugin calls, and the live transcription protocol.
+  </Card>
+  <Card title="API Keys" href="/overview/api-keys">
+    Client keys, limits and how to raise them.
+  </Card>
+  <Card title="Deployment Checklist" href="/overview/deployment">
+    Preloading, readiness, graceful stop and throughput.
+  </Card>
+  <Card title="Scaling" href="/overview/scaling">
+    Several replicas behind a load balancer.
+  </Card>
+  <Card title="MCP Server" href="/overview/mcp-server">
+    The other way agents use Voicebox: a tool call to speak or transcribe.
+  </Card>
+</Cards>

@@ -168,7 +168,7 @@ Text longer than `max_chunk_chars` (default 800, range 100–5000) is split at s
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `format` | `"wav"` | `wav`: a 44-byte RIFF header whose length fields are `0xFFFFFFFF` (unknown length), then PCM16 frames. `pcm`: raw signed 16-bit little-endian mono samples. |
+| `format` | `"wav"` | `wav`: a 44-byte RIFF header whose length fields are `0xFFFFFFFF` (unknown length), then PCM16 frames. `pcm`: raw signed 16-bit little-endian mono samples. Both are at the engine's own rate (24 kHz for most engines, 48 kHz for LuxTTS); unlike `/v1/audio/speech`, this route never resamples `pcm` to 24 kHz. |
 | `first_chunk_chars` | `120` | Cap for the first chunk so the first audio arrives after roughly one sentence. `null` keeps the normal `max_chunk_chars` splitting. |
 
 How it works:
@@ -177,6 +177,8 @@ How it works:
 2. The job is enqueued in the same serial queue as `/generate`, so it waits for any running generation and never overlaps other GPU work.
 3. Each chunk is synthesized, crossfaded into the previous one on the fly (`CrossfadeJoiner` in `backend/utils/chunked_tts.py`, sample-identical to the buffered join) and sent as PCM16 the moment it exists. Engines that implement `generate_stream` (Qwen3-TTS on MLX) additionally stream sub-sentence pieces.
 4. The HTTP headers go out together with the first chunk, so a failure before any audio still gets a real 4xx/5xx and the sample rate is known when the WAV header is written.
+5. Until that first chunk exists nothing reads the connection, so `services/generation.py::open_stream_while_connected` watches the ASGI receive channel for the disconnect. A client that hangs up first gives the job up: a queued job is skipped, a running one is cancelled and stops once the engine call in progress returns (`utils/chunked_tts.py::_await_inflight`; the worker thread cannot be interrupted). The per-key pending slot is released, the route answers `499` (nothing reaches the client, but the HTTP metrics count it) and the server logs `Stream <id> abandoned before its first chunk; its job was <state>` (`queued`, `running` or `finished`). The `tts_chars` charge is not refunded. A client that leaves after the first chunk stops the job the same way, from `stream_frames`.
+6. If the engine fails after the first chunk, `stream_frames` raises `StreamAbortedError`, and the server drops the connection without the chunked body's final empty chunk: clients see an incomplete transfer (`httpx.RemoteProtocolError` in Python) rather than a clean `200` with truncated audio. Every middleware on this path is plain ASGI because Starlette's `BaseHTTPMiddleware` would end such a body cleanly.
 
 Response headers: `X-Voicebox-Sample-Rate`, `X-Voicebox-Channels` (always `1`), `X-Voicebox-Sample-Format` (`s16le`), `X-Voicebox-Stream-Mode` (`chunked`), `X-Voicebox-Job-Id`, plus `X-Accel-Buffering: no` for reverse proxies.
 

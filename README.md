@@ -82,7 +82,7 @@ The two cloud incumbents sit on opposite halves of the voice I/O loop — Eleven
 - **Voice input** — global dictation hotkey with push-to-talk and toggle modes, accessibility-verified auto-paste on macOS, in-app mic on every text field, Whisper-based STT
 - **Agent voice output** — one tool call (`voicebox.speak`) and any MCP-aware agent (Claude Code, Cursor, Cline) speaks to you in a voice you've cloned
 - **Voice personalities** — attach a free-form persona to any voice profile, then Compose, Rewrite, or Respond via a bundled local LLM — agents can invoke the same modes over MCP
-- **API-first** — REST API plus a built-in MCP server for integrating voice I/O into your own apps and agents
+- **API-first** — REST API with OpenAI-compatible `/v1` endpoints, plus a built-in MCP server for integrating voice I/O into your own apps and agents, and drop-in speech and transcription for [LiveKit Agents](#livekit-agents) voice agents
 - **Native performance** — built with Tauri (Rust), not Electron
 - **Runs everywhere** — macOS (MLX/Metal), Windows (CUDA), Linux, AMD ROCm, Intel Arc, Docker
 
@@ -281,7 +281,7 @@ Use cases: agent dev loops (dictate a question, hear the answer in a cloned voic
 
 ## API
 
-Voicebox exposes a REST API for integrating voice I/O into your own apps and agents.
+Voicebox exposes a REST API for integrating voice I/O into your own apps and agents. OpenAI clients can use the compatible `/v1` endpoints instead: speech and transcription through the OpenAI SDKs, and live transcription over `WS /v1/realtime` as LiveKit's OpenAI plugin does; see the [API reference](https://docs.voicebox.sh/overview/api-reference).
 
 Every endpoint requires an API key sent as a bearer token. The desktop app creates its own (copy it from **Settings → MCP**), `just api-key` prints the development key, and `python -m backend.keys create --id myapp --role client` mints a key for one of your apps with its own rate limits. See the [API keys guide](https://docs.voicebox.sh/overview/api-keys).
 
@@ -373,6 +373,22 @@ await voicebox.speak({
 **Use cases:** agent dev loops (voice in, voice out), game dialogue, podcast production, accessibility tools, voice assistants, content automation.
 
 Full API documentation available at `http://127.0.0.1:17493/docs`.
+
+### LiveKit Agents
+
+Voicebox can be the speech and transcription of a [LiveKit Agents](https://docs.livekit.io/agents/) voice agent, for calls in LiveKit rooms or over the phone through LiveKit SIP. LiveKit keeps the call, the turn-taking and the LLM; Voicebox speaks and listens through LiveKit's stock OpenAI plugin, so there is nothing extra to install on the Voicebox side:
+
+```python
+from livekit.plugins import openai
+
+VOICEBOX = "https://voice.example.com/v1"
+KEY = "vbx_..."  # a client key for the agent worker
+
+tts = openai.TTS(base_url=VOICEBOX, api_key=KEY, model="kokoro", voice="af_heart", response_format="wav")
+stt = openai.STT(base_url=VOICEBOX, api_key=KEY, model="whisper-1", language="en", use_realtime=True)
+```
+
+Live transcription streams the caller's audio to `/v1/realtime?intent=transcription` and returns interim and final transcripts; each sentence the agent says is one `/v1/audio/speech` request, stopped when the caller interrupts. Requires `livekit-agents>=1.8.6,<2`. The [LiveKit guide](https://docs.voicebox.sh/integrations/livekit) covers keys and limits, turn detection, phone calls, sizing and troubleshooting, and [`integrations/livekit/`](integrations/livekit/) holds a complete worker.
 
 ---
 

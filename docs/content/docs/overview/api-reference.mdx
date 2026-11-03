@@ -5,7 +5,7 @@ description: "Call Voicebox from your applications: the OpenAI-compatible /v1 en
 
 Voicebox speaks two APIs on the same port and with the same [API keys](/overview/api-keys):
 
-- **`/v1`, OpenAI-compatible.** Speech and transcription in the shape the OpenAI SDKs expect, so any OpenAI client works with `base_url` pointed at your server. This is the surface to build applications on.
+- **`/v1`, OpenAI-compatible.** Speech and transcription in the shape the OpenAI SDKs expect, so any OpenAI client works with `base_url` pointed at your server. This is the surface to build applications on, and the one voice agents use: [LiveKit Agents](/integrations/livekit) runs on it through LiveKit's stock OpenAI plugin.
 - **The native API.** Everything the desktop UI uses: profiles, samples, history, stories, captures, models, settings. Its interactive reference is at `/docs` on a running server (unless `VOICEBOX_DISABLE_DOCS=1`), and the schema is in the repo at `docs/openapi.json`.
 
 Every request carries `Authorization: Bearer <key>`. Give each application its own **client** key; it can synthesize, transcribe, and read profiles and models, and nothing else.
@@ -25,13 +25,17 @@ Every request carries `Authorization: Bearer <key>`. Give each application its o
 |-------|---------|
 | `voice` | Resolved in this order: a voice profile **id**, a profile **name**, a built-in **preset voice id** (`af_heart`, `Ryan`, or qualified as `kokoro:af_heart`), then OpenAI's stock names (`alloy`, `nova`, ...), which select the configured default voice (the per-client binding, else the default playback voice from Settings → MCP). `GET /v1/voices` lists every value. Voices another client key created are not visible. |
 | `model` | `tts-1`, `tts-1-hd` or `gpt-4o-mini-tts` use the voice's default engine. Otherwise a model or engine name from `GET /v1/models`: `kokoro`, `qwen-tts-1.7B`, `qwen-tts-0.6B`, `chatterbox-turbo`, `luxtts`, `tada-1b`, ... A preset voice only works with its own engine. |
-| `response_format` | `mp3` (default), `opus`, `aac`, `flac`, `wav`, `pcm` (signed 16-bit little-endian mono), `ulaw_8000` (G.711 mu-law at 8 kHz for telephony; band-limited before the sample rate drops, and `X-Voicebox-Sample-Rate` reports `8000`). |
+| `response_format` | `mp3` (default), `opus`, `aac`, `flac`, `wav`, `pcm` (signed 16-bit little-endian mono at 24 kHz, the rate OpenAI clients assume for raw audio; resampled when the engine's rate differs), `ulaw_8000` (G.711 mu-law at 8 kHz for telephony, band-limited before the sample rate drops). |
 | `instructions` | Style hint, passed as the engine's `instruct` where the engine supports it (Qwen CustomVoice). |
 | `language` | Voicebox extension: language code of the input. Defaults to the profile's language. |
 | `speed` | `0.25` to `4.0` (default `1.0`). Kokoro speaks at that rate natively; every other engine is time-stretched after synthesis with the pitch preserved, chunk by chunk, so streaming is unaffected. |
 | `max_chunk_chars`, `first_chunk_chars` | Voicebox extension: caps on the characters synthesized per chunk (defaults `800` and `120`, minimums `100` and `20`). Smaller chunks start audio sooner and bound how much a cancelled request still renders. |
 
-The response is always chunked. `wav` and `pcm` leave the server sentence by sentence as synthesis proceeds; the compressed formats stream too when ffmpeg is installed (it is in the Docker image) and are otherwise sent once the clip is complete. `X-Voicebox-Sample-Rate` carries the engine's sample rate (24 kHz for most engines, 48 kHz for LuxTTS), `X-Voicebox-Engine` the engine used and `X-Voicebox-Voice` the resolved voice (a profile id, or `engine:voice_id` for a preset). Nothing is written to the generation history.
+The response is always chunked. `wav`, `pcm` and `ulaw_8000` leave the server sentence by sentence as synthesis proceeds; the compressed formats stream too when ffmpeg is installed (it is in the Docker image) and are otherwise sent once the clip is complete. `X-Voicebox-Sample-Rate` is the sample rate of the audio in the response: `24000` for `pcm`, `8000` for `ulaw_8000`, and the engine's own rate for `wav` and the compressed formats (24 kHz for most engines, 48 kHz for LuxTTS). `X-Voicebox-Engine` names the engine used and `X-Voicebox-Voice` the resolved voice (a profile id, or `engine:voice_id` for a preset). Nothing is written to the generation history.
+
+The status line and headers leave with the first chunk, so a request refused before any audio exists (unknown voice, full queue, model not downloaded) still gets its real status code. A client that hangs up before the first chunk gives the job up: still queued, it is skipped; already running, it stops when the engine call in progress returns. The server records such a request as `499`, and its characters stay charged to `tts_chars`. Hanging up later stops the job after the chunk being synthesized. If synthesis fails after the first chunk, the server drops the connection without ending the chunked body, so the client sees an incomplete transfer (an error in most HTTP libraries) instead of a short clip that looks complete.
+
+Voice agents built on [LiveKit Agents](/integrations/livekit) use this endpoint through LiveKit's OpenAI plugin, one request per sentence.
 
 **Python (OpenAI SDK)**
 
@@ -93,26 +97,85 @@ for segment in detailed.segments:
     print(f"{segment.start:6.2f}-{segment.end:6.2f}  {segment.text}")
 ```
 
-## Live transcription: `WS /v1/realtime/transcription`
+## Live transcription: `WS /v1/realtime`
 
-For conversation features, stream microphone audio over a WebSocket and receive partial text while the user speaks and a final transcript per utterance. The events use the names of the OpenAI Realtime transcription API so client code ports easily; Voicebox does not promise SDK compatibility, and Whisper is not a streaming model, so "live" means utterances are cut by a server-side voice activity detector (or by your commits) and each one is transcribed as it ends, with partial passes every second in between.
+For conversation features, stream microphone audio over a WebSocket and receive partial text while the user speaks and a final transcript per utterance. Whisper is not a streaming model, so "live" means utterances are cut by a server-side voice activity detector (or by your commits) and each one is transcribed as it ends, with partial passes every second in between. Two paths serve the same sessions:
 
-- **Connect** with `Authorization: Bearer <client key>`; browsers, which cannot set WebSocket headers, pass a media token instead: `wss://host/v1/realtime/transcription?token=<POST /auth/media-token>`.
-- **Configure** with `transcription_session.update` (alias `session.update`): `input_audio_format` must be `pcm16` (signed 16-bit little-endian mono); `input_sample_rate` 8000, 16000, 22050, 24000 (default) or 48000; `input_audio_transcription: {model, language}`; `turn_detection: {type: "server_vad", threshold, prefix_padding_ms, silence_duration_ms}` or `null` for manual turns; `partial_interval_ms` (300–10000, default 1000).
-- **Send audio** as `input_audio_buffer.append {audio: <base64 PCM16>}`, or as raw binary frames. `input_audio_buffer.commit` ends the current utterance now (required with `turn_detection: null`), `input_audio_buffer.clear` discards it.
-- **Receive** `transcription_session.created` / `.updated`, `input_audio_buffer.speech_started` / `.speech_stopped` / `.committed` / `.cleared`, `conversation.item.input_audio_transcription.delta {item_id, delta}`, `...completed {item_id, transcript}`, `...failed` and `error {error: {type, code, message}}`. Deltas are append-only: only the words two consecutive passes agree on are sent, and `completed` is the authoritative text (it may revise earlier deltas).
-- **Limits**: messages up to 1 MiB, utterances are cut at 30 s (one Whisper window), sessions end after 60 s without a message or `VOICEBOX_REALTIME_MAX_SESSION_S` (default 1800), at most `VOICEBOX_REALTIME_MAX_SESSIONS` (default 4) sessions per server and `max_realtime_sessions` per key (default 2). Every session costs one `inference` request and the audio counts against `uploads_bytes`. Close codes: `1008` policy (bad key, missing model, oversize message), `1013` try later (session cap, rate limit), `1012` the server is restarting.
+| Path | Protocol |
+|------|----------|
+| `/v1/realtime?intent=transcription` | OpenAI's GA Realtime transcription protocol: `session.created` and `session.updated` carry a `realtime.transcription_session` object. LiveKit's `openai.STT(use_realtime=True)` connects here unmodified (see [LiveKit Agents](/integrations/livekit)). Any other `intent` is refused with `unsupported_intent` and close `1008`; conversation sessions are not served. |
+| `/v1/realtime/transcription` | Voicebox's original dialect, with OpenAI's beta event names: `transcription_session.created` and `.updated` carry the flat session object. |
+
+Both paths read either shape of session update and take `?model=` (for example `?model=whisper-turbo`), which sets the session's model as it opens. The model is checked at that moment: an unknown name (`model_not_found`) or, for a client key, a size that is not downloaded (`model_not_downloaded`) closes the socket with `1008`. A model set later by a session update is checked the same way but only answered with an `error` event, and the session keeps its previous settings. The paths differ only in their session events and in which closes an `error` event announces (see Closing below).
+
+- **Connect** with `Authorization: Bearer <client key>`; browsers, which cannot set WebSocket headers, pass a media token instead: `wss://host/v1/realtime?intent=transcription&token=<POST /auth/media-token>`. A missing or invalid key fails the handshake with HTTP `403`.
+- **Configure** with `session.update` (alias `transcription_session.update`), in the GA shape or the flat one. Fields left out keep their value.
+
+  ```json
+  {"type": "session.update", "session": {"type": "transcription", "audio": {"input": {
+    "format": {"type": "audio/pcm", "rate": 24000},
+    "transcription": {"model": "whisper-turbo", "language": "en"},
+    "turn_detection": {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 500}
+  }}}}
+  ```
+
+  ```json
+  {"type": "transcription_session.update", "session": {
+    "input_audio_format": "pcm16", "input_sample_rate": 16000,
+    "input_audio_transcription": {"model": "whisper-turbo", "language": "en"},
+    "turn_detection": {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 500},
+    "partial_interval_ms": 1000
+  }}
+  ```
+
+  | Setting | GA (under `session.audio.input`) | Flat | Values |
+  |---------|----------------------------------|------|--------|
+  | Format | `format.type` | `input_audio_format` | `audio/pcm` or `pcm16` (signed 16-bit little-endian mono); `audio/pcmu` or `g711_ulaw`, `audio/pcma` or `g711_alaw` (G.711 mu-law and A-law, always 8 kHz) |
+  | PCM sample rate | `format.rate` | `input_sample_rate` | 8000, 16000, 22050, 24000 (default), 44100 or 48000; OpenAI itself accepts only 24000 |
+  | Model and language | `transcription` | `input_audio_transcription` | `model` as for `/v1/audio/transcriptions`, `language` (up to 32 characters), and `prompt` (up to 4,096 characters), which is stored and echoed but not passed to Whisper yet |
+  | Turn detection | `turn_detection` | `turn_detection` | `server_vad` with `threshold` (0–1), `prefix_padding_ms` (0–2000) and `silence_duration_ms` (100–5000), or `null` for manual turns; `semantic_vad` is refused |
+  | Partial interval | `partial_interval_ms` (on `session`) | `partial_interval_ms` | 300–10000 ms, default 1000; a Voicebox extension |
+
+  Other GA settings (`noise_reduction`, `include`, `idle_timeout_ms`, ...) are ignored. A value out of range gets an `invalid_session` error and leaves the session as it was.
+- **Send audio** as `input_audio_buffer.append` with `audio` holding base64 in the session's format, or as raw binary frames. The server resamples it to Whisper's 16 kHz with one filter for the whole stream, so chunk size does not matter. `input_audio_buffer.commit` ends the current utterance now (required with `turn_detection: null`), `input_audio_buffer.clear` discards it.
+- **Receive** these events. Every event carries its own `event_id`.
+
+  | Event | Fields |
+  |-------|--------|
+  | `session.created` / `session.updated` (GA path), `transcription_session.created` / `.updated` (Voicebox path) | `session` |
+  | `input_audio_buffer.speech_started` / `.speech_stopped` | `item_id`, `audio_start_ms` / `audio_end_ms` |
+  | `input_audio_buffer.committed` | `item_id`, `previous_item_id` (`null` for the first utterance) |
+  | `input_audio_buffer.cleared` | |
+  | `conversation.item.input_audio_transcription.delta` | `item_id`, `content_index` (always `0`), `delta` |
+  | `conversation.item.input_audio_transcription.completed` | `item_id`, `content_index`, `transcript`, `usage` (`{"type": "duration", "seconds": ...}`, the audio sent to Whisper) |
+  | `conversation.item.input_audio_transcription.failed` | `item_id`, `content_index`, `error` with a `code`: `transcription_failed`, `whisper_busy` or `session_closed` |
+  | `error` | `error` with `type`, `code`, `message`, and `event_id` when the client event that caused it had one |
+
+  Deltas are append-only: only the words two consecutive passes agree on are sent, and `completed` is the authoritative text (it may revise earlier deltas).
+- **Limits**: messages up to 1 MiB, utterances are cut at 30 s (one Whisper window), sessions end after `VOICEBOX_REALTIME_IDLE_S` seconds without a message (default 60, minimum 15) or after `VOICEBOX_REALTIME_MAX_SESSION_S` (default 1800), at most `VOICEBOX_REALTIME_MAX_SESSIONS` (default 4) sessions per server and `max_realtime_sessions` per key (default 2). At most eight utterances of a session wait for their final pass at once; the next one fails straight away with `whisper_busy`, so audio sent faster than Whisper transcribes it is dropped rather than queued. Every session costs one `inference` request and the audio counts against `uploads_bytes`.
+
+**Closing.** The close reason is the code word in the table. Before an idle, too-long or shutdown close, the server commits the utterance in progress, stops partials, ignores further audio and delivers the pending finals, waiting up to 10 s (and no longer than `VOICEBOX_DRAIN_TIMEOUT_S` while the server stops); a final still missing after that arrives as `...failed` with code `session_closed`. On shutdown this needs `VOICEBOX_SHUTDOWN_DELAY_S` above 0 (see [Deployment](/overview/deployment#5-graceful-stop)); without it the socket closes as soon as the signal arrives and the utterance in progress is lost.
+
+| Close | Reason | When |
+|-------|--------|------|
+| `1000` | `idle_timeout`, `session_too_long` | No message for `VOICEBOX_REALTIME_IDLE_S`; the session reached `VOICEBOX_REALTIME_MAX_SESSION_S` |
+| `1008` | `unsupported_intent`, `model_not_found`, `model_not_downloaded`, `message_too_large` | The session cannot be served as asked |
+| `1011` | `server_error` | The session failed inside the server |
+| `1012` | `server_shutting_down` | The server is stopping; reconnect |
+| `1013` | `session_limit_reached`, `rate_limit_exceeded` | Session cap or rate limit; try again later |
+
+On `/v1/realtime/transcription` every close except `1011` is preceded by an `error` event with the same code. On `/v1/realtime` only the `1008` closes are, because OpenAI clients treat any `error` event as fatal: the other closes come without one, and the client reconnects.
 
 ```python
 import asyncio, base64, json, websockets
 
 async def main():
     async with websockets.connect(
-        "wss://voice.example.com/v1/realtime/transcription",
+        "wss://voice.example.com/v1/realtime?intent=transcription&model=whisper-turbo",
         additional_headers={"Authorization": "Bearer vbx_..."},
     ) as ws:
-        await ws.send(json.dumps({"type": "transcription_session.update", "session": {
-            "input_sample_rate": 16000, "input_audio_transcription": {"model": "whisper-turbo", "language": "en"}}}))
+        await ws.send(json.dumps({"type": "session.update", "session": {"type": "transcription", "audio": {"input": {
+            "format": {"type": "audio/pcm", "rate": 16000}, "transcription": {"language": "en"}}}}}))
         async def send_audio():
             async for pcm16_chunk in microphone():  # your capture loop, 16 kHz mono PCM16
                 await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm16_chunk).decode()}))
@@ -127,9 +190,11 @@ async def main():
 asyncio.run(main())
 ```
 
-`scripts/realtime_client.py` in the repository streams a WAV file at real-time pace and prints the events, which is the quickest way to try a server.
+`scripts/realtime_client.py` in the repository streams a WAV file to `/v1/realtime/transcription` at real-time pace and prints the events, which is the quickest way to try a server.
 
-## Discovery: `GET /v1/models` and `GET /v1/voices`
+## Discovery: `GET /v1`, `GET /v1/models` and `GET /v1/voices`
+
+`/v1` (and `/v1/`) answers any valid key with `{"object": "service", "name": "voicebox", "version": "..."}`. OpenAI clients fetch it to open a connection ahead of the first request, as LiveKit's TTS plugin does when a session starts.
 
 `/v1/models` lists every TTS and STT model with `engine`, `kind` (`tts`/`stt`), `languages`, `supports_instruct`, `downloaded` and `loaded`, plus a top-level `formats` array with the `response_format` values this server can produce.
 
@@ -182,13 +247,13 @@ Under `/v1`, errors use OpenAI's envelope, so SDK exceptions carry the message:
 
 | Status | `type` | When |
 |--------|--------|------|
-| 400 | `invalid_request_error` | Bad body (`invalid_value`, including `speed` outside 0.25–4.0), unsupported `response_format`, `voice_engine_mismatch` (`param: "voice"`: a preset of another engine, or a cloned voice on Kokoro or `qwen_custom_voice`; pick a voice of the requested engine or send `tts-1`) |
+| 400 | `invalid_request_error` | Bad body (`invalid_value`, including `speed` outside 0.25–4.0), unsupported `response_format`, `voice_engine_mismatch` (`param: "voice"`: a preset of another engine, or a cloned voice on Kokoro or `qwen_custom_voice`; pick a voice of the requested engine or send `tts-1`), a speech model that is not downloaded |
 | 401 | `authentication_error` | Missing or invalid key |
 | 403 | `permission_error` | A client key on an admin route; `voice_not_owned` (deleting a shared voice), `voice_limit_reached` |
 | 404 | `invalid_request_error` | `voice_not_found`, `model_not_found` |
-| 409 | `invalid_request_error` | The model is not downloaded (client keys); `voice_exists` |
+| 409 | `invalid_request_error` | A Whisper model that is not downloaded (client keys); `voice_exists` |
 | 413 | `invalid_request_error` | A sample or request body above its cap |
-| 429 | `rate_limit_error` | Per-key limits or a full queue; honour `Retry-After` (a WebSocket session gets an `error` event and close code `1013`) |
+| 429 | `rate_limit_error` | Per-key limits, a full queue or a busy Whisper; honour `Retry-After` (a WebSocket session closes with `1013`, announced by an `error` event only on `/v1/realtime/transcription`) |
 | 503 | `server_error` | The server is draining before a restart; retry after `Retry-After` |
 
 Responses also carry `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset` (see [API Keys → Rate limits](/overview/api-keys#rate-limits)).
@@ -197,7 +262,7 @@ Responses also carry `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Res
 
 | Endpoint | Purpose |
 |----------|---------|
-| `POST /generate/stream` | The same streaming synthesis with Voicebox's own body (`profile_id`, `engine`, `effects_chain`, `seed`, `speed`, chunking controls). |
+| `POST /generate/stream` | The same streaming synthesis with Voicebox's own body (`profile_id`, `engine`, `effects_chain`, `seed`, `speed`, chunking controls), as `wav` or `pcm` at the engine's own rate. |
 | `POST /generate` then `GET /generate/{id}/status` | Queue a generation that is saved to history; progress over SSE, audio at `GET /audio/{id}`. |
 | `POST /speak` | Speak through the profile bound to an `X-Voicebox-Client-Id` (agents). |
 | `POST /transcribe` | Transcription with `{"text", "duration"}`. |

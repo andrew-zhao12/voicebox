@@ -1,9 +1,11 @@
 # Test modules that run without torch, librosa or a model (the CI backend job).
+backend/tests/test_auth_errors.py
 backend/tests/test_auth_keystore.py
 backend/tests/test_auth_middleware.py
 backend/tests/test_auth_policy.py
 backend/tests/test_auth_routes.py
 backend/tests/test_auth_tokens.py
+backend/tests/test_captures.py
 backend/tests/test_chunked_tts_stream.py
 backend/tests/test_config_paths.py
 backend/tests/test_cors.py
@@ -13,10 +15,12 @@ backend/tests/test_idle_unload.py
 backend/tests/test_inference_slots.py
 backend/tests/test_keys_cli.py
 backend/tests/test_lifecycle.py
+backend/tests/test_logfilter.py
 backend/tests/test_observability.py
 backend/tests/test_preload.py
 backend/tests/test_ratelimit.py
 backend/tests/test_realtime_stt.py
+backend/tests/test_resample.py
 backend/tests/test_retention.py
 backend/tests/test_seed_profiles.py
 backend/tests/test_subtitles.py

@@ -1,0 +1,11 @@
+# livekit-server for the end-to-end check (run_e2e.py mounts this file):
+#   docker run --rm -d --name lk-e2e -p 7880:7880 -p 7881:7881 -p 7882:7882/udp \
+#     -v "$PWD/livekit.yaml:/etc/livekit.yaml:ro" livekit/livekit-server:v1.13.10 \
+#     --dev --bind 0.0.0.0 --config /etc/livekit.yaml
+# --dev supplies the API key pair devkey/secret; --bind 0.0.0.0 is needed inside a container.
+port: 7880
+rtc:
+  udp_port: 7882          # one UDP port for all media: publish it as 7882:7882/udp
+  tcp_port: 7881          # ICE over TCP when UDP is blocked
+  use_external_ip: false  # no STUN lookup of a public address, so it works offline
+  node_ip: 127.0.0.1      # advertise loopback, i.e. the published ports (clients on this host)

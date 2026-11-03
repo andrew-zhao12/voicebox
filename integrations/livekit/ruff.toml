@@ -1,0 +1,20 @@
+# Lint and format settings for the LiveKit integration: the backend's rule set
+# (backend/pyproject.toml) at Python 3.10 and 100 columns, because these files
+# run in the user's own LiveKit worker. Check with `ruff check integrations/livekit`.
+line-length = 100
+target-version = "py310"
+
+[lint]
+select = ["F", "E", "W", "I", "N", "UP", "B", "A", "SIM", "T20", "RET", "PIE", "PT", "RUF", "ERA", "FIX"]
+ignore = [
+    "T201",    # the e2e scripts are command-line tools that print their results
+    "RET504",  # unnecessary assignment before return
+    "SIM108",  # use ternary operator (sometimes less readable)
+]
+
+[lint.isort]
+known-first-party = ["agent", "echo", "run_e2e"]
+
+[format]
+quote-style = "double"
+docstring-code-format = true

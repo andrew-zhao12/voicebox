@@ -1,13 +1,15 @@
 # Walkthroughs
 
 Step-by-step runbooks for one person at one keyboard: test Voicebox on this
-machine, put it on a cloud, and test it there. They are written to be
-followed top to bottom, with a check after every step, and they name the
-exact commands, files and outputs of this repository at the time of writing
-(2026-09-29). The reference pages they lean on are
+machine, put it on a cloud, test it there, and run a LiveKit voice agent on
+it. They are written to be followed top to bottom, with a check after every
+step, and they name the exact commands, files and outputs of this repository
+at the time of writing (2026-09-29 for 1–6, 2026-10-17 for 7). The reference
+pages they lean on are
 [Deployment](../content/docs/overview/deployment.mdx),
 [Scaling](../content/docs/overview/scaling.mdx),
-[API reference](../content/docs/overview/api-reference.mdx) and the recipes
+[API reference](../content/docs/overview/api-reference.mdx),
+[LiveKit Agents](../content/docs/integrations/livekit.mdx) and the recipes
 under [`deploy/`](../../deploy/README.md); the walkthroughs sequence those
 pages, they do not replace them.
 
@@ -19,10 +21,13 @@ pages, they do not replace them.
 | 4 | [Deploy to AWS ECS](04-deploy-aws-ecs.md) | ECS tasks on g6 instances behind an Application Load Balancer, scaling 1–4 | ~3 h the first time | GPU instances, the ALB and EFS while they run |
 | 5 | [Deploy to Kubernetes with KEDA](05-deploy-kubernetes-keda.md) | A GPU node pool, TLS ingress, Prometheus and KEDA scaling on queue depth | ~2 h | the cluster fee and GPU nodes while they run |
 | 6 | [Test on the cloud](06-test-on-the-cloud.md) | The functional checks through the public URL, the per-engine GPU numbers, autoscaling observed, and everything torn down | ~1 h per platform plus the measurement runs | the deployment above while you test |
+| 7 | [LiveKit Agents](07-livekit.md) | A LiveKit voice agent hearing and speaking through a local Voicebox: the end-to-end check passing with live and batch transcription and with barge-in, its latency numbers read, and the example worker answering a call in a room you started | ~30 min | none |
 
 Do 1 first: it produces files the others mount, and it is where you learn
 what a healthy server looks like. Do 2 once. Then pick 3, 4 or 5 (you only
-need one cloud) and finish with 6.
+need one cloud) and finish with 6. Document 7 stands alone: it needs only the
+`backend/venv` and Docker, and starts its own server with a fresh data
+directory.
 
 ## How to read a step
 
@@ -38,7 +43,9 @@ Every step has the same shape:
 
 Values you collect along the way (keys, URLs, ids) are exported once and
 appended to `~/.voicebox-cloud.env`, a file outside the repository that
-every later block loads with `source ~/.voicebox-cloud.env`. Create it once:
+every later block loads with `source ~/.voicebox-cloud.env` (document 7, which
+shares nothing with the cloud documents, keeps its own in
+`~/voicebox-livekit/env`). Create it once:
 
 ```bash
 touch ~/.voicebox-cloud.env && chmod 600 ~/.voicebox-cloud.env
@@ -49,12 +56,13 @@ command, so a block either runs or fails loudly on an unset variable.
 
 ## What was actually run
 
-Document 1 was executed end to end on this Mac on 2026-09-29 and its
-expected outputs are copied from that run. Documents 3, 4 and 5 have **not**
-been run on an account yet: every vendor-side claim carries the page it was
-checked against, and anything that could not be checked without an account
-says "confirm at run time". Treat the first run of a cloud document as a
-test of the document too, and fix it as you go.
+Document 1 was executed end to end on this Mac on 2026-09-29, and document
+7 on 2026-10-17; their expected outputs are copied from those runs.
+Documents 3, 4 and 5 have **not** been run on an account yet: every
+vendor-side claim carries the page it was checked against, and anything that
+could not be checked without an account says "confirm at run time". Treat the
+first run of a cloud document as a test of the document too, and fix it as you
+go.
 
 ## What cannot be tested locally
 

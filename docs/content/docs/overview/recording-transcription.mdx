@@ -70,10 +70,14 @@ PyTorch). Everywhere else it runs through PyTorch `transformers`. The
 backend picks the right one — you don't configure it.
 
 <Callout type="info">
-  For noisy clips, prefer **Turbo** or **Large**. Base can hallucinate on
-  hard inputs — most famously the "thanks for watching" loop. Voicebox
-  strips those loops deterministically before LLM refinement runs, so a
-  capture can be cleanly re-refined even if the raw transcript has them.
+  Base is a good default for clean speech; for noisy clips **Turbo** or
+  **Large** are more accurate. On Apple Silicon, Base, Small and Medium used
+  to append invented text to nearly every transcript; that was a bug in the
+  MLX Whisper library, which Voicebox now works around (Large and Turbo were
+  never affected). Whisper can still loop on hard input — most famously
+  the "thanks for watching" loop. Voicebox strips those loops
+  deterministically before LLM refinement runs, so a capture can be cleanly
+  re-refined even if the raw transcript has them.
 </Callout>
 
 ## Language
