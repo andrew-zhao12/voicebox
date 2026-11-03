@@ -51,6 +51,13 @@ from backend.auth import policy
         ("GET", "/auth/keys", "admin"),
         ("GET", "/nope", "admin"),
         ("GET", "/mcp/anything", "admin"),
+        ("GET", "/v1", "client"),
+        ("GET", "/v1/", "client"),
+        ("HEAD", "/v1/", "client"),
+        ("POST", "/v1/", "admin"),
+        ("GET", "/v1/realtime", "client"),
+        ("GET", "/v1/realtime/transcription", "client"),
+        ("GET", "/v1/realtime/other", "admin"),
     ],
 )
 def test_classify(method, path, expected):
@@ -77,6 +84,9 @@ def test_media_tokens_are_get_only_and_allowlisted():
     assert policy.token_allowed("HEAD", "/audio/version/x")
     assert policy.token_allowed("GET", "/generate/x/status")
     assert policy.token_allowed("GET", "/events/speak")
+    assert policy.token_allowed("GET", "/v1/realtime")  # browsers cannot set headers on a WebSocket
+    assert policy.token_allowed("GET", "/v1/realtime/transcription")
+    assert not policy.token_allowed("GET", "/v1/")
     assert not policy.token_allowed("POST", "/audio/x")
     assert not policy.token_allowed("GET", "/history")
     assert not policy.token_allowed("GET", "/profiles")

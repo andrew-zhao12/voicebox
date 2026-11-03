@@ -1,4 +1,4 @@
-"""Keep media tokens and OAuth codes out of uvicorn's access log."""
+"""Keep media tokens and OAuth codes out of uvicorn's logs."""
 
 from __future__ import annotations
 
@@ -6,23 +6,30 @@ import logging
 import re
 
 _SECRET_QUERY_RE = re.compile(r"([?&](?:token|code|state)=)[^&\s]*")
+# uvicorn logs HTTP requests on its access logger and WebSocket handshakes
+# ('%s - "WebSocket %s" [accepted]', or 403) on its error logger.
+_LOGGERS = ("uvicorn.access", "uvicorn.error")
 
 
 class RedactQueryTokenFilter(logging.Filter):
-    """Rewrite ``token=``/``code=``/``state=`` query values in access-log records.
+    """Rewrite ``token=``/``code=``/``state=`` query values in a record's string arguments.
 
-    uvicorn logs ``(client_addr, method, full_path, http_version, status)``;
-    the path is the third argument.
+    uvicorn passes the path with its query string as an argument: access
+    records carry ``(client_addr, method, full_path, http_version, status)``,
+    WebSocket handshake records ``(client_addr, full_path[, status])``.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
-        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str) and "=" in args[2]:
-            record.args = (*args[:2], _SECRET_QUERY_RE.sub(r"\1[redacted]", args[2]), *args[3:])
+        if isinstance(args, tuple) and any(isinstance(arg, str) and "=" in arg for arg in args):
+            record.args = tuple(
+                _SECRET_QUERY_RE.sub(r"\1[redacted]", arg) if isinstance(arg, str) else arg for arg in args
+            )
         return True
 
 
-def install_access_log_redaction() -> None:
-    access_logger = logging.getLogger("uvicorn.access")
-    if not any(isinstance(existing, RedactQueryTokenFilter) for existing in access_logger.filters):
-        access_logger.addFilter(RedactQueryTokenFilter())
+def install_log_redaction() -> None:
+    for name in _LOGGERS:
+        target = logging.getLogger(name)
+        if not any(isinstance(existing, RedactQueryTokenFilter) for existing in target.filters):
+            target.addFilter(RedactQueryTokenFilter())

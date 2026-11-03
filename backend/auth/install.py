@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from ..observability.requestid import RequestIdMiddleware
 from .errors import unhandled_exception_handler
 from .keystore import KeyStore
-from .logfilter import install_access_log_redaction
+from .logfilter import install_log_redaction
 from .middleware import (
     AuthMiddleware,
     BodyLimitMiddleware,
@@ -154,6 +154,6 @@ def install_security(app: FastAPI, settings: SecuritySettings) -> SecurityRuntim
     app.add_exception_handler(Exception, unhandled_exception_handler)
     if not settings.disable_docs:
         _add_bearer_scheme(app)
-    install_access_log_redaction()
+    install_log_redaction()
     app.state.security = runtime
     return runtime

@@ -97,14 +97,17 @@ CLIENT_RULES: tuple[Rule, ...] = (
     rule("POST", "/auth/media-token"),
     rule("*", "/mcp"),
     rule("*", "/mcp/"),
-    # OpenAI-compatible surface (routes/openai_compat.py)
+    # OpenAI-compatible surface (routes/openai_compat.py); the root answers the OpenAI SDK's prewarm.
+    rule("GET", "/v1"),
+    rule("GET", "/v1/"),
     rule("POST", "/v1/audio/speech"),
     rule("POST", "/v1/audio/transcriptions"),
     rule("GET", "/v1/models"),
     rule("GET", "/v1/voices"),
     rule("POST", "/v1/voices"),
     rule("DELETE", "/v1/voices/{voice}"),
-    # WebSocket (routes/realtime.py); classified as GET like every websocket scope.
+    # WebSockets (routes/realtime.py); classified as GET like every websocket scope.
+    rule("GET", "/v1/realtime"),
     rule("GET", "/v1/realtime/transcription"),
 )
 
@@ -202,7 +205,8 @@ ADMIN_RULES: tuple[Rule, ...] = (
 # ``?token=`` is honoured only here, and only for GET/HEAD.
 MEDIA_TOKEN_RULES: tuple[Rule, ...] = (
     # Browsers cannot set headers on a WebSocket, so the live transcription
-    # socket accepts ``?token=`` like the media routes.
+    # sockets accept ``?token=`` like the media routes.
+    rule("GET", "/v1/realtime"),
     rule("GET", "/v1/realtime/transcription"),
     rule("GET", "/generate/{generation_id}/status"),
     rule("GET", "/models/progress/{model_name}"),
