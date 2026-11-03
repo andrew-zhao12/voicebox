@@ -363,6 +363,10 @@ class MLXSTTBackend:
 
         with model_load_progress(progress_model_name, is_cached):
             from mlx_audio.stt import load
+            from mlx_audio.stt.models.whisper.whisper import HFTokenizerWrapper  # lazy: heavy import
+
+            # mlx-audio's own lookup suppresses end-of-text on pre-v3 models; see _no_speech_token.
+            HFTokenizerWrapper.no_speech = property(_no_speech_token)
 
             model_name = WHISPER_HF_REPOS.get(model_size, f"openai/whisper-{model_size}")
             logger.info("Loading MLX Whisper model %s...", model_size)
@@ -440,6 +444,25 @@ class MLXSTTBackend:
             return Transcript(text=text, segments=segments, language=language or detected, duration=duration)
 
         return await asyncio.to_thread(_transcribe_sync)
+
+
+def _no_speech_token(tokenizer) -> int | None:
+    """Whisper's no-speech token id under either name; installed as mlx-audio's ``HFTokenizerWrapper.no_speech``.
+
+    mlx-audio (0.4.1, and its main branch) looks up only ``<|nospeech|>``,
+    which the tokenizers before large-v3 (tiny to medium, large-v2) call
+    ``<|nocaptions|>``.  The lookup fell back to the unknown token, Whisper's
+    ``<|endoftext|>``, and since decoding suppresses the no-speech token it
+    suppressed end-of-text: every window decoded up to the token limit,
+    appending invented text, and ``no_speech_prob`` measured end-of-text
+    instead of silence.
+    """
+    hf_tokenizer = tokenizer.hf_tokenizer
+    for name in ("<|nospeech|>", "<|nocaptions|>"):
+        token_id = hf_tokenizer.convert_tokens_to_ids(name)
+        if token_id is not None and token_id != hf_tokenizer.unk_token_id:
+            return token_id
+    return None
 
 
 def _result_text(result) -> str:
