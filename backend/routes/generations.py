@@ -5,8 +5,8 @@ import logging
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
 
 from .. import config, lifecycle, models
@@ -14,9 +14,10 @@ from ..auth import charge, get_principal
 from ..database import Generation as DBGeneration, VoiceProfile as DBVoiceProfile, get_db
 from ..services import history, profiles
 from ..services.generation import (
+    ClientDisconnectedError,
     GenerationRefused,
     lane_for_engine,
-    open_stream,
+    open_stream_while_connected,
     resolve_effects_chain,
     resolve_engine,
     rewrite_for_personality,
@@ -380,6 +381,7 @@ async def get_generation_status(generation_id: str, db: Session = Depends(get_db
 @router.post("/generate/stream")
 async def stream_speech(
     data: models.StreamGenerationRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     """Generate speech and stream it as soon as the first sentence is ready.
@@ -388,13 +390,17 @@ async def stream_speech(
     generation queue, and every chunk is sent as PCM16 the moment it exists.
     ``format=wav`` (default) prefixes a RIFF header whose length fields are
     ``0xFFFFFFFF`` (unknown length); ``format=pcm`` sends raw signed 16-bit
-    little-endian mono samples.  The sample rate is reported in the
-    ``X-Voicebox-Sample-Rate`` header.  Nothing is written to history.
+    little-endian mono samples at the engine's own rate.  The sample rate is
+    reported in the ``X-Voicebox-Sample-Rate`` header.  Nothing is written to
+    history.  Disconnecting before the first chunk cancels the job; a failure
+    after audio has started drops the connection before the body ends.
     """
     try:
-        opened = await open_stream(data, db, get_principal())
+        opened = await open_stream_while_connected(request.receive, data, db, get_principal())
     except GenerationRefused as e:
         raise _refused(e) from e
+    except ClientDisconnectedError as e:
+        return Response(status_code=e.status_code)
 
     async def body():
         head = streaming_wav_header(opened.sample_rate) if data.format == "wav" else b""

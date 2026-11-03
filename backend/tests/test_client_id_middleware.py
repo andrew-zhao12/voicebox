@@ -7,7 +7,14 @@ auto-created for new REST callers.
 """
 
 import pytest
+from starlette.applications import Starlette
+from starlette.responses import PlainTextResponse
+from starlette.routing import Route
+from starlette.testclient import TestClient
+from starlette.types import ASGIApp, Receive, Scope, Send
 
+from backend.auth.principal import ANONYMOUS, KeyLimits, Principal
+from backend.mcp_server import context
 from backend.mcp_server.context import _is_stamped_path
 
 
@@ -47,3 +54,47 @@ def test_mcp_semantic_paths_are_stamped(path: str) -> None:
 )
 def test_other_paths_are_not_stamped(path: str) -> None:
     assert _is_stamped_path(path) is False
+
+
+CLIENT = Principal(key_id="app", role="client", via="header", limits=KeyLimits.defaults_for("client"))
+
+
+class SetPrincipal:
+    """Stands in for the auth middleware, which stores the caller on the scope."""
+
+    def __init__(self, app: ASGIApp, principal: Principal) -> None:
+        self.app = app
+        self.principal = principal
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        scope.setdefault("state", {})["principal"] = self.principal
+        await self.app(scope, receive, send)
+
+
+@pytest.mark.parametrize(
+    ("path", "principal", "header", "stamps"),
+    [
+        ("/speak", CLIENT, "cursor", ["cursor"]),
+        ("/health", CLIENT, "cursor", []),  # not a bindings path
+        ("/speak", ANONYMOUS, "cursor", []),  # the auth middleware let it through unauthenticated
+        ("/speak", CLIENT, None, []),
+    ],
+)
+def test_the_middleware_sets_the_context_and_stamps_binding_calls(monkeypatch, path, principal, header, stamps):
+    stamped: list[str] = []
+    monkeypatch.setattr(context, "_enqueue_stamp", stamped.append)
+    seen: list[tuple[str | None, str | None]] = []
+
+    async def endpoint(request):
+        seen.append((context.current_client_id.get(), context.current_remote_addr.get()))
+        return PlainTextResponse("ok")
+
+    app = Starlette(routes=[Route(path, endpoint, methods=["POST"])])
+    app = SetPrincipal(context.ClientIdMiddleware(app), principal)
+    headers = {context.CLIENT_ID_HEADER: header} if header else {}
+    response = TestClient(app).post(path, headers=headers)
+
+    assert response.text == "ok"
+    assert seen == [(header, "testclient")]
+    assert stamped == stamps
+    assert context.current_client_id.get() is None

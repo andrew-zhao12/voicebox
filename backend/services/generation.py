@@ -20,10 +20,10 @@ import asyncio
 import logging
 import traceback
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 
@@ -98,8 +98,9 @@ async def rewrite_for_personality(data: models.GenerationRequest, profile) -> tu
     if not (data.personality and getattr(profile, "personality", None)):
         return data.text, "manual"
     try:
-        async with llm_slot.acquire():
-            llm_result = await personality.rewrite_as_profile(profile.personality, data.text)
+        # The LLM's thread outlives a cancelled caller (a streaming client hanging
+        # up mid-rewrite), so run() keeps the slot taken until the call ends.
+        llm_result = await llm_slot.run(personality.rewrite_as_profile, profile.personality, data.text)
     except InferenceBusyError as e:
         raise GenerationRefused(429, str(e), {"Retry-After": str(e.retry_after_s)}) from e
     except ValueError as e:
@@ -552,10 +553,13 @@ class OpenedStream:
     text: str
 
 
-def abandon_stream(session: StreamSession) -> None:
-    """Stop a streaming job whose consumer went away (queued jobs are skipped, running ones cancelled)."""
+def abandon_stream(session: StreamSession) -> Literal["queued", "running"] | None:
+    """Stop a streaming job whose consumer went away (queued jobs are skipped, running ones cancelled).
+
+    Returns what ``cancel_generation`` found: ``queued``, ``running``, or ``None`` once the job has ended.
+    """
     session.consumer_gone.set()
-    cancel_generation(session.job_id)
+    return cancel_generation(session.job_id)
 
 
 async def open_stream(
@@ -567,13 +571,14 @@ async def open_stream(
 ) -> OpenedStream:
     """Validate a streamed request, queue its job and wait for the first chunk.
 
-    Shared by ``POST /generate/stream`` and ``POST /v1/audio/speech``: caps and
-    the ``tts_chars`` charge are applied here, the model must already be on
-    disk, and the first chunk (or the failure) arrives before any response
-    headers are sent, so early errors keep a real status code.  Raises
-    ``GenerationRefused`` for anything the caller must answer with an error.
-    A *voice* (built-in preset) replaces the profile lookup; otherwise the
-    profile must exist and be visible to *principal*.
+    Shared by ``POST /generate/stream`` and ``POST /v1/audio/speech`` (through
+    :func:`open_stream_while_connected`): caps and the ``tts_chars`` charge are
+    applied here, the model must already be on disk, and the first chunk (or
+    the failure) arrives before any response headers are sent, so early errors
+    keep a real status code.  Raises ``GenerationRefused`` for anything the
+    caller must answer with an error.  A *voice* (built-in preset) replaces the
+    profile lookup; otherwise the profile must exist and be visible to
+    *principal*.
     """
     from fastapi import HTTPException
 
@@ -654,7 +659,8 @@ async def open_stream(
     try:
         first = await session.frames.get()
     except asyncio.CancelledError:
-        abandon_stream(session)
+        state = abandon_stream(session)
+        logger.info("Stream %s abandoned before its first chunk; its job was %s", session.job_id, state or "finished")
         raise
     if first is None:
         raise GenerationRefused(500, "TTS produced no audio")
@@ -673,8 +679,86 @@ def _refused_queue(error: QueueFullError) -> GenerationRefused:
     return GenerationRefused(status, str(error), {"Retry-After": str(error.retry_after_s)})
 
 
+class ClientDisconnectedError(Exception):
+    """The HTTP client left before the first chunk; its streaming job has been abandoned.
+
+    ``status_code`` is nginx's "client closed request": routes answer with it
+    so the HTTP metrics count these requests, though nothing reaches the client.
+    """
+
+    status_code = 499
+
+
+async def _wait_for_disconnect(receive: Callable[[], Awaitable[Mapping[str, Any]]]) -> None:
+    # The request body has been read, so the disconnect is all that is left to arrive.
+    while (await receive())["type"] != "http.disconnect":
+        pass
+
+
+def _abandon_opened(opening: asyncio.Task) -> None:
+    """Cancel a pending ``open_stream`` (its first-chunk wait abandons the job), or abandon the stream it opened."""
+    if not opening.done():
+        opening.cancel()
+    elif not opening.cancelled() and opening.exception() is None:
+        abandon_stream(opening.result().session)
+
+
+async def open_stream_while_connected(
+    receive: Callable[[], Awaitable[Mapping[str, Any]]],
+    data: models.StreamGenerationRequest,
+    db,
+    principal: Principal,
+    *,
+    voice: profiles.PresetVoice | None = None,
+) -> OpenedStream:
+    """:func:`open_stream`, given up as soon as the HTTP client disconnects.
+
+    No response exists until the first chunk does, so nothing else reads the
+    connection meanwhile, and a client that left during the queue wait or the
+    first synthesis (an agent's barge-in) would keep its job, its per-key slot
+    and that whole synthesis.  *receive* is the request's ASGI receive
+    channel, its body already read.  The watcher is stopped before this
+    returns because the ``StreamingResponse`` listens for the disconnect
+    itself, and two readers must not overlap.
+
+    Raises:
+        ClientDisconnectedError: The client left first; nothing stays queued or running for it.
+        GenerationRefused: As :func:`open_stream`.
+    """
+    opening = asyncio.create_task(open_stream(data, db, principal, voice=voice))
+    watcher = asyncio.create_task(_wait_for_disconnect(receive))
+    try:
+        await asyncio.wait((opening, watcher), return_when=asyncio.FIRST_COMPLETED)
+        client_left = watcher.done()
+        watcher.cancel()
+        if client_left:
+            _abandon_opened(opening)
+        # Before the enqueue a cancelled open_stream leaves nothing behind;
+        # at the first-chunk wait it abandons the job on its way out.
+        await asyncio.wait((opening, watcher))
+    except asyncio.CancelledError:
+        watcher.cancel()
+        _abandon_opened(opening)
+        raise
+    if client_left:
+        watcher.result()  # a failing receive surfaces as its own error
+        raise ClientDisconnectedError
+    return opening.result()
+
+
+class StreamAbortedError(RuntimeError):
+    """A streamed response failed after its first chunk had been sent."""
+
+
 async def stream_frames(opened: OpenedStream) -> AsyncIterator[np.ndarray]:
-    """Yield the first chunk, then every later one, abandoning the job if the consumer stops early."""
+    """Yield the first chunk, then every later one, abandoning the job if the consumer stops early.
+
+    Raises:
+        StreamAbortedError: Synthesis failed after the first chunk.  The status
+            line went out with that chunk, so ending the body cleanly would
+            pass truncated audio off as a complete 200; raising makes the
+            server drop the connection without the final chunk instead.
+    """
     session = opened.session
     finished = False
     try:
@@ -686,8 +770,8 @@ async def stream_frames(opened: OpenedStream) -> AsyncIterator[np.ndarray]:
                 return
             if isinstance(item, Exception):
                 finished = True
-                logger.error("Stream %s ended early: %s", session.job_id, item)
-                return
+                # Not chained: the job has logged the engine's traceback already.
+                raise StreamAbortedError(f"Stream {session.job_id} failed mid-stream: {item!r}")
             yield item[0]
     finally:
         # Also runs on client disconnect (CancelledError) and generator

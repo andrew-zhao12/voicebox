@@ -2,9 +2,10 @@
 
 ``POST /v1/audio/speech`` streams synthesis in the format the client asks for,
 ``POST /v1/audio/transcriptions`` runs Whisper, ``GET /v1/models`` and
-``GET /v1/voices`` list what this server can do, and ``POST``/``DELETE
-/v1/voices`` let an application manage its own cloned voices.  Any OpenAI
-SDK works with ``base_url="https://<host>/v1"`` and a client API key.
+``GET /v1/voices`` list what this server can do, ``POST``/``DELETE
+/v1/voices`` let an application manage its own cloned voices, and ``GET
+/v1`` names the server (OpenAI clients fetch it to warm a connection).  Any
+OpenAI SDK works with ``base_url="https://<host>/v1"`` and a client API key.
 Errors under ``/v1`` use OpenAI's ``{"error": {...}}`` envelope (see
 ``backend/api_errors.py``); the handlers installed by
 ``install_openai_compat`` re-shape FastAPI's own ``HTTPException`` and
@@ -25,12 +26,12 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .. import models
+from .. import __version__, models
 from ..api_errors import is_openai_path, openai_error
 from ..auth import get_principal
 from ..auth.principal import Principal
@@ -131,10 +132,15 @@ async def create_speech(data: models.OpenAISpeechRequest, request: Request, db: 
     ``GET /v1/models``.  ``wav``, ``pcm`` and ``ulaw_8000`` (G.711 mu-law at
     8 kHz, band-limited first, for telephony) stream chunk by chunk; the
     compressed formats stream when ffmpeg is installed and are otherwise
-    sent once the clip is complete.  ``speed`` (0.25-4.0) is native on
-    Kokoro and a pitch-preserving time stretch on every other engine.
-    ``max_chunk_chars`` and ``first_chunk_chars`` cap the server-side sentence
-    chunks, which bounds how much audio a cancelled request still renders.
+    sent once the clip is complete.  ``pcm`` is always 24 kHz, as OpenAI
+    documents it; ``wav`` and the compressed formats keep the engine's rate,
+    and ``X-Voicebox-Sample-Rate`` reports the rate of every format.
+    ``speed`` (0.25-4.0) is native on Kokoro and a pitch-preserving time
+    stretch on every other engine.  ``max_chunk_chars`` and
+    ``first_chunk_chars`` cap the server-side sentence chunks, which bounds
+    how much audio a cancelled request still renders.  Disconnecting before
+    the first chunk cancels the job; a failure after audio has started drops
+    the connection before the body ends, so it never passes for a short clip.
     """
     principal = get_principal()
     formats = encode.available_formats()
@@ -166,9 +172,13 @@ async def create_speech(data: models.OpenAISpeechRequest, request: Request, db: 
         raise fail(400, str(first.get("msg", "invalid request")), code="invalid_value") from e
 
     try:
-        opened = await generation_service.open_stream(stream_request, db, principal, voice=preset)
+        opened = await generation_service.open_stream_while_connected(
+            request.receive, stream_request, db, principal, voice=preset
+        )
     except generation_service.GenerationRefused as e:
         raise fail(e.status_code, e.detail, code=e.code, param=e.param, headers=e.headers) from e
+    except generation_service.ClientDisconnectedError as e:
+        return Response(status_code=e.status_code)
 
     fmt = data.response_format
     body = encode.encode_stream(generation_service.stream_frames(opened), opened.sample_rate, fmt)
@@ -182,6 +192,13 @@ async def create_speech(data: models.OpenAISpeechRequest, request: Request, db: 
         "Content-Disposition": f'inline; filename="speech.{encode.EXTENSIONS[fmt]}"',
     }
     return StreamingResponse(body, media_type=encode.MEDIA_TYPES[fmt], headers=headers)
+
+
+@router.get("")
+@router.get("/", include_in_schema=False)
+async def service_info():
+    """Identify the server; OpenAI clients probe ``GET {base_url}/`` to warm the connection."""
+    return {"object": "service", "name": "voicebox", "version": __version__}
 
 
 def _whisper_size(model: str) -> str | None:

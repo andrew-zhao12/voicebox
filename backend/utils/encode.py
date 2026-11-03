@@ -1,12 +1,15 @@
 """Encode streamed PCM into the formats OpenAI clients ask for.
 
 ``wav``, ``pcm`` and ``ulaw_8000`` (G.711 mu-law at 8 kHz, for telephony) are
-produced in Python and stream chunk by chunk.  The
+produced in Python and stream chunk by chunk.  ``pcm`` is always 24 kHz, the
+rate OpenAI documents for it, because raw samples carry no rate a client could
+read; ``wav`` and the compressed formats keep the engine's rate.  The
 compressed formats stream through an ffmpeg pipe when ffmpeg is installed
 (the Docker image ships it).  Without ffmpeg, ``mp3``, ``flac`` and ``opus``
 are encoded with libsndfile once the whole clip exists (soundfile bundles
 those encoders), so they still work on a desktop or dev machine, just not
-incrementally; ``aac`` needs ffmpeg.
+incrementally; ``aac`` needs ffmpeg.  The G.711 decoders turn telephony
+audio that clients send back into 16-bit samples.
 
 Only numpy, soundfile and asyncio are used, so the module stays importable
 without the ML stack.
@@ -24,6 +27,7 @@ from collections.abc import AsyncIterator
 import numpy as np
 import soundfile as sf
 
+from .resample import StreamResampler, resample
 from .wav_stream import float_to_pcm16_bytes, streaming_wav_header
 
 logger = logging.getLogger(__name__)
@@ -50,6 +54,8 @@ EXTENSIONS = {
 # Encoded in this module, so always available and always streamed.
 _PYTHON_FORMATS = ("wav", "pcm", "ulaw_8000")
 TELEPHONY_RATE = 8000
+# OpenAI's ``pcm`` is 24 kHz; clients such as LiveKit's plugin assume that rate and never check it.
+PCM_RATE = 24000
 # G.711 mu-law segment ends for 14-bit magnitudes (ITU-T G.711, as in audioop).
 _ULAW_SEGMENT_ENDS = np.array([0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF])
 
@@ -100,17 +106,12 @@ def streams_incrementally(fmt: str) -> bool:
 
 
 def output_sample_rate(fmt: str, sample_rate: int) -> int:
-    """The rate of the encoded audio: the engine's, except for the telephony format."""
-    return TELEPHONY_RATE if fmt == "ulaw_8000" else sample_rate
-
-
-def _lowpass_kernel(cutoff: float, sample_rate: int, taps: int) -> np.ndarray:
-    """Windowed-sinc FIR low-pass (Hann), unity DC gain."""
-    n = np.arange(taps) - (taps - 1) / 2
-    fc = cutoff / sample_rate
-    kernel = 2 * fc * np.sinc(2 * fc * n)
-    kernel *= np.hanning(taps)
-    return (kernel / kernel.sum()).astype(np.float32)
+    """The rate of the encoded audio: the engine's, except for raw PCM and the telephony format."""
+    if fmt == "ulaw_8000":
+        return TELEPHONY_RATE
+    if fmt == "pcm":
+        return PCM_RATE
+    return sample_rate
 
 
 def linear_to_ulaw(pcm16: np.ndarray) -> bytes:
@@ -124,57 +125,70 @@ def linear_to_ulaw(pcm16: np.ndarray) -> bytes:
     return (code ^ np.where(negative, 0x7F, 0xFF)).astype(np.uint8).tobytes()
 
 
+def _ulaw_table() -> np.ndarray:
+    """The 16-bit sample for each of the 256 mu-law codes (ITU-T G.711, as in audioop)."""
+    code = ~np.arange(256) & 0xFF
+    magnitude = (((code & 0x0F) << 3) + 0x84) << ((code >> 4) & 0x07)
+    return np.where(code & 0x80, 0x84 - magnitude, magnitude - 0x84).astype(np.int16)
+
+
+def _alaw_table() -> np.ndarray:
+    """The 16-bit sample for each of the 256 A-law codes (ITU-T G.711, as in audioop)."""
+    code = np.arange(256) ^ 0x55
+    segment = (code >> 4) & 0x07
+    mantissa = (code & 0x0F) << 4
+    magnitude = np.where(segment == 0, mantissa + 0x08, (mantissa + 0x108) << np.maximum(segment - 1, 0))
+    return np.where(code & 0x80, magnitude, -magnitude).astype(np.int16)
+
+
+_ULAW_TO_LINEAR = _ulaw_table()
+_ALAW_TO_LINEAR = _alaw_table()
+
+
+def ulaw_to_linear(data: bytes) -> np.ndarray:
+    """Signed 16-bit samples for G.711 mu-law bytes, identical to ``audioop.ulaw2lin(data, 2)``."""
+    return _ULAW_TO_LINEAR[np.frombuffer(data, dtype=np.uint8)]
+
+
+def alaw_to_linear(data: bytes) -> np.ndarray:
+    """Signed 16-bit samples for G.711 A-law bytes, identical to ``audioop.alaw2lin(data, 2)``."""
+    return _ALAW_TO_LINEAR[np.frombuffer(data, dtype=np.uint8)]
+
+
+def _float_to_ulaw(samples: np.ndarray) -> bytes:
+    return linear_to_ulaw(np.frombuffer(float_to_pcm16_bytes(samples), dtype="<i2"))
+
+
 class TelephonyEncoder:
     """Stream float PCM at any engine rate into mu-law at 8 kHz.
 
-    A low-pass filter removes everything above the telephone band before the
-    samples are dropped; decimating without it folds sibilants back into the
-    band at full level.  The filter history and the decimation position carry
-    across chunks, so chunked output matches a single pass, and the filter's
-    delay is skipped at the start and flushed at the end so the output keeps
-    the input's timing and length.
+    The band-limited resampler removes everything above the telephone band
+    before the rate drops; dropping samples without it folds sibilants back
+    into the band at full level.  Its state carries across chunks, so chunked
+    output matches a single pass, and it compensates its own delay, so the
+    output keeps the input's timing and length.
     """
 
     def __init__(self, sample_rate: int) -> None:
         if sample_rate < TELEPHONY_RATE:
             raise UnsupportedFormatError(f"ulaw_8000 from {sample_rate} Hz")
-        self.step = sample_rate / TELEPHONY_RATE
-        # The transition band narrows as the rate rises, so the kernel grows with it.
-        taps = max(63, int(63 * self.step / 3) | 1)
-        self.kernel = _lowpass_kernel(0.45 * TELEPHONY_RATE, sample_rate, taps)
-        self.history = np.zeros(taps - 1, dtype=np.float32)
-        self.delay = (taps - 1) // 2
-        self.position = float(self.delay)
-        self._flushed = False
+        self._resampler = StreamResampler(sample_rate, TELEPHONY_RATE)
 
     def feed(self, frame: np.ndarray) -> bytes:
-        samples = np.asarray(frame, dtype=np.float32).reshape(-1)
-        if samples.size == 0:
-            return b""
-        signal = np.concatenate([self.history, samples])
-        filtered = np.convolve(signal, self.kernel, mode="valid")
-        self.history = signal[-(self.kernel.size - 1) :]
-        positions = np.arange(self.position, filtered.size, self.step)
-        if self.step.is_integer():
-            picked = filtered[positions.astype(np.int64)]
-        else:
-            picked = np.interp(positions, np.arange(filtered.size), filtered)
-        self.position += self.step * positions.size - filtered.size
-        return linear_to_ulaw(np.frombuffer(float_to_pcm16_bytes(picked), dtype="<i2"))
+        return _float_to_ulaw(self._resampler.feed(frame))
 
     def flush(self) -> bytes:
-        """Release the last samples, which are still inside the filter."""
-        if self._flushed:
-            return b""
-        self._flushed = True
-        return self.feed(np.zeros(self.delay, dtype=np.float32))
+        """Release the last samples, which are still inside the filter; later calls return nothing."""
+        return _float_to_ulaw(self._resampler.flush())
 
 
 def encode_bytes(audio: np.ndarray, sample_rate: int, fmt: str) -> bytes:
-    """Encode a whole clip with libsndfile (``mp3``, ``flac``, ``opus``, ``wav``)."""
+    """Encode a whole clip (``mp3``, ``flac`` and ``opus`` with libsndfile; ``pcm`` at 24 kHz, as streamed)."""
     if fmt == "wav":
         return streaming_wav_header(sample_rate, data_length=len(audio) * 2) + float_to_pcm16_bytes(audio)
     if fmt == "pcm":
+        if sample_rate != PCM_RATE:
+            audio = resample(audio, sample_rate, PCM_RATE)
         return float_to_pcm16_bytes(audio)
     if fmt == "ulaw_8000":
         encoder = TelephonyEncoder(sample_rate)
@@ -187,6 +201,16 @@ def encode_bytes(audio: np.ndarray, sample_rate: int, fmt: str) -> bytes:
     return buffer.getvalue()
 
 
+async def _resampled(frames: AsyncIterator[np.ndarray], src_rate: int, dst_rate: int) -> AsyncIterator[np.ndarray]:
+    """*frames* at *dst_rate*, through one resampler so chunk edges leave no trace, flushed at the end."""
+    resampler = StreamResampler(src_rate, dst_rate)
+    async for frame in frames:
+        if (out := resampler.feed(frame)).size:
+            yield out
+    if (tail := resampler.flush()).size:
+        yield tail
+
+
 async def encode_stream(frames: AsyncIterator[np.ndarray], sample_rate: int, fmt: str) -> AsyncIterator[bytes]:
     """Turn float PCM frames into encoded bytes, streaming whenever the format allows."""
     if fmt not in FORMATS:
@@ -197,6 +221,8 @@ async def encode_stream(frames: AsyncIterator[np.ndarray], sample_rate: int, fmt
             yield float_to_pcm16_bytes(frame)
         return
     if fmt == "pcm":
+        if sample_rate != PCM_RATE:
+            frames = _resampled(frames, sample_rate, PCM_RATE)
         async for frame in frames:
             yield float_to_pcm16_bytes(frame)
         return

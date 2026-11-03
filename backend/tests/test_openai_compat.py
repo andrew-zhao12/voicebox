@@ -1,31 +1,54 @@
 """``/v1`` routes end to end through the security stack, with the engine faked.
 
+Most tests use Starlette's test client; the ones about what a client sees
+when it hangs up or when a stream breaks run the app under a real uvicorn.
 ``backend.routes`` imports torch transitively, so these run under the
 project venv (``just test``), like ``test_stream_route.py``.
 """
 
 from __future__ import annotations
 
+import ast
+import asyncio
 import io
+import json
+import logging
+import socket
+import struct
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import numpy as np
 import pytest
 import soundfile as sf
+import uvicorn
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from backend import config, database, lifecycle
+from backend import __version__, config, database, lifecycle
 from backend.auth.install import install_security
 from backend.auth.settings import SecuritySettings
+from backend.mcp_server import context as mcp_context
+from backend.observability import metrics
 from backend.routes import register_routers
 from backend.services import generation as generation_service, task_queue
 from backend.utils import encode
+from backend.utils.resample import resample
 from backend.utils.wav_stream import streaming_wav_header
 
 SR = 24000
 TEXT = "Hello from the OpenAI compatible route."
+# Each sentence is over 50 characters, so max_chunk_chars=100 makes each one its own chunk.
+SENTENCES = [
+    "The first sentence of this test text is fairly long.",
+    "The second sentence of this test text is also long.",
+    "The third sentence of this test text ends the run.",
+]
 
 
 GENERATE_PROMPTS: list[dict] = []
@@ -41,18 +64,26 @@ def bearer(key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {key}"}
 
 
-@pytest.fixture
-def api(tmp_path, monkeypatch):
-    previous_data_dir = config.get_data_dir()
-    config.set_data_dir(tmp_path)
-    database.init_db()
-    seen_prompts: list[tuple[str, dict | None]] = []
+def fake_engine(backend, seen_prompts: list | None = None):
+    """A ``prepare_engine`` that hands every job *backend* and records the prompt it was given."""
 
     async def prepare_engine(engine, model_size, profile_id, db, *, on_loading=None, voice_prompt=None):
-        seen_prompts.append((profile_id, voice_prompt))
+        if seen_prompts is not None:
+            seen_prompts.append((profile_id, voice_prompt))
         return generation_service.EnginePrep(
-            backend=FakeBackend(), voice_prompt={}, trim_fn=None, runaway_detector=None, runaway_cut_fn=None
+            backend=backend, voice_prompt={}, trim_fn=None, runaway_detector=None, runaway_cut_fn=None
         )
+
+    return prepare_engine
+
+
+def build_app(tmp_path, monkeypatch, prepare_engine, *, client_id_middleware: bool = False):
+    """The app with the security stack and every router; the queue starts in its lifespan.
+
+    ``client_id_middleware`` adds ``ClientIdMiddleware`` innermost, where ``backend/app.py`` puts it.
+    """
+    config.set_data_dir(tmp_path)
+    database.init_db()
 
     async def ensure_cached(engine, model_size="default"):
         return None
@@ -73,9 +104,19 @@ def api(tmp_path, monkeypatch):
         },
     )
     app = FastAPI(lifespan=lifespan)
+    if client_id_middleware:
+        app.add_middleware(mcp_context.ClientIdMiddleware)
     runtime = install_security(app, settings)
     register_routers(app)
     runtime.startup()
+    return app, runtime
+
+
+@pytest.fixture
+def api(tmp_path, monkeypatch):
+    previous_data_dir = config.get_data_dir()
+    seen_prompts: list[tuple[str, dict | None]] = []
+    app, runtime = build_app(tmp_path, monkeypatch, fake_engine(FakeBackend(), seen_prompts))
     admin_key = (tmp_path / "api_key").read_text().strip()
     _record, client_key = runtime.keystore.create("app", "client", None)
 
@@ -210,6 +251,39 @@ def test_a_voice_made_for_another_engine_is_a_voice_error(api, model, voice):
     assert error["code"] == "voice_engine_mismatch"
     assert error["param"] == "voice"
     assert "engine" in error["message"]
+
+
+def livekit_example_default(name: str) -> str:
+    """The default of a setting in ``integrations/livekit/agent.py``, read rather than imported (it needs LiveKit)."""
+    source = (Path(__file__).resolve().parents[2] / "integrations" / "livekit" / "agent.py").read_text()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and len(node.args) == 2:
+            key, default = node.args
+            if isinstance(key, ast.Constant) and key.value == name:  # os.environ.get(name, default)
+                return ast.literal_eval(default)
+    raise AssertionError(f"agent.py reads no {name}")
+
+
+@pytest.mark.parametrize("voice", ["af_heart", "Aiden", "My Clone"])
+def test_the_livekit_examples_default_model_speaks_every_kind_of_voice(api, voice):
+    """The example takes a preset of any engine or a cloned voice in VOICEBOX_VOICE, so its model must follow the voice."""
+    created = api.client.post(
+        "/profiles",
+        json={"name": "My Clone", "language": "en", "voice_type": "cloned"},
+        headers=bearer(api.admin),
+    )
+    assert created.status_code == 200, created.text
+    response = api.client.post(
+        "/v1/audio/speech",
+        json={
+            "model": livekit_example_default("VOICEBOX_TTS_MODEL"),
+            "voice": voice,
+            "input": TEXT,
+            "response_format": "wav",
+        },
+        headers=bearer(api.key),
+    )
+    assert response.status_code == 200, response.text
 
 
 def test_voice_by_id_works_and_stock_names_need_a_default(api):
@@ -635,3 +709,207 @@ def test_timestamped_transcription_formats(api, monkeypatch):
     )
     assert words.status_code == 400
     assert words.json()["error"]["param"] == "timestamp_granularities"
+
+
+class ToneBackend:
+    """A 1 kHz tone at *rate*, 400 samples per character."""
+
+    def __init__(self, rate: int) -> None:
+        self.rate = rate
+
+    async def generate(self, text, voice_prompt, language="en", seed=None, instruct=None):
+        t = np.arange(len(text) * 400) / self.rate
+        return (0.3 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32), self.rate
+
+
+def joined_length(chunk_samples: list[int], rate: int) -> int:
+    """Samples left once the default 50 ms crossfade has overlapped every seam."""
+    return sum(chunk_samples) - (len(chunk_samples) - 1) * rate * 50 // 1000
+
+
+def dominant_hz(samples: np.ndarray, rate: int) -> float:
+    spectrum = np.abs(np.fft.rfft(samples * np.hanning(len(samples))))
+    return float(np.fft.rfftfreq(len(samples), 1 / rate)[np.argmax(spectrum)])
+
+
+def test_pcm_is_24_khz_whatever_the_engine_rate(api, monkeypatch):
+    """LiveKit's OpenAI plugin plays ``pcm`` as 24 kHz without reading a rate; LuxTTS renders 48 kHz."""
+    monkeypatch.setattr(generation_service, "prepare_engine", fake_engine(ToneBackend(48000)))
+    body = {"model": "kokoro", "input": " ".join(SENTENCES), "voice": "Smoke Voice", "max_chunk_chars": 100}
+
+    wav = api.client.post("/v1/audio/speech", json={**body, "response_format": "wav"}, headers=bearer(api.key))
+    pcm = api.client.post("/v1/audio/speech", json={**body, "response_format": "pcm"}, headers=bearer(api.key))
+
+    assert wav.status_code == 200, wav.text
+    assert pcm.status_code == 200, pcm.text
+    # wav keeps the engine's rate in its header, which clients resample from.
+    assert wav.headers["x-voicebox-sample-rate"] == "48000"
+    assert struct.unpack("<I", wav.content[24:28])[0] == 48000
+    assert pcm.headers["x-voicebox-sample-rate"] == "24000"
+    native = np.frombuffer(wav.content[44:], dtype="<i2").astype(np.float32) / 32768
+    streamed = np.frombuffer(pcm.content, dtype="<i2").astype(np.float32) / 32768
+    assert len(native) == joined_length([400 * len(sentence) for sentence in SENTENCES], 48000)
+    assert len(streamed) == -(-len(native) // 2)
+    # One resampler across the three chunks: a single pass over the clip, to within 16-bit rounding.
+    assert np.max(np.abs(streamed - resample(native, 48000, 24000))) <= 4 / 32768
+    assert abs(dominant_hz(streamed, 24000) - 1000) < 5
+
+
+def test_v1_root_names_the_server_to_any_key(api):
+    """The OpenAI plugin's prewarm fetches ``GET {base_url}/``; a 403 there also counted as an auth failure."""
+    for path in ("/v1", "/v1/"):
+        for key in (api.key, api.admin):
+            response = api.client.get(path, headers=bearer(key))
+            assert response.status_code == 200, response.text
+            assert response.json() == {"object": "service", "name": "voicebox", "version": __version__}
+        assert api.client.get(path).status_code == 401
+
+
+class GatedBackend:
+    """Renders 100 samples per character; a test thread can hold one call or make one fail."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.hold: str | None = None  # a call whose text contains this waits for ``release``
+        self.release = threading.Event()
+        self.fail: str | None = None  # a call whose text contains this raises
+
+    async def generate(self, text, voice_prompt, language="en", seed=None, instruct=None):
+        self.calls.append(text)
+        if self.hold is not None and self.hold in text:
+            await asyncio.to_thread(self.release.wait, 10)
+        if self.fail is not None and self.fail in text:
+            raise RuntimeError("engine exploded")
+        return np.full(len(text) * 100, 0.25, dtype=np.float32), SR
+
+
+def wait_for(condition, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "condition not reached in time"
+        time.sleep(0.01)
+
+
+@pytest.fixture
+def served(tmp_path, monkeypatch, request):
+    """The app under a real uvicorn on an ephemeral port, for tests that need an actual HTTP client.
+
+    The middleware stack is production's, ``ClientIdMiddleware`` included;
+    parametrize indirectly with ``False`` to leave that one out.
+    """
+    previous_data_dir = config.get_data_dir()
+    backend = GatedBackend()
+    with_client_id = getattr(request, "param", True)
+    app, runtime = build_app(tmp_path, monkeypatch, fake_engine(backend), client_id_middleware=with_client_id)
+    _record, client_key = runtime.keystore.create("app", "client", None)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    server = uvicorn.Server(uvicorn.Config(app, log_config=None, access_log=False, timeout_graceful_shutdown=2))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]}, daemon=True)
+    thread.start()
+    wait_for(lambda: server.started or not thread.is_alive())
+    assert server.started, "uvicorn did not start"
+    try:
+        yield SimpleNamespace(url=f"http://127.0.0.1:{listener.getsockname()[1]}", key=client_key, backend=backend)
+    finally:
+        backend.release.set()
+        server.should_exit = True
+        thread.join(timeout=10)
+        listener.close()
+        lifecycle.reset()
+        config.set_data_dir(previous_data_dir)
+
+
+def send_speech_request(url: str, body: dict, key: str) -> socket.socket:
+    """POST to ``/v1/audio/speech`` over a bare socket and read nothing, so the caller can hang up."""
+    payload = json.dumps(body).encode()
+    host, port = url.removeprefix("http://").split(":")
+    connection = socket.create_connection((host, int(port)))
+    head = (
+        f"POST /v1/audio/speech HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {key}\r\n"
+        f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n\r\n"
+    )
+    connection.sendall(head.encode() + payload)
+    return connection
+
+
+def speech_requests_answered(status: str) -> float:
+    from prometheus_client import REGISTRY  # only reached when metrics.ENABLED
+
+    labels = {"method": "POST", "route": "/v1/audio/speech", "status": status}
+    return REGISTRY.get_sample_value("voicebox_http_requests_total", labels) or 0.0
+
+
+def test_a_client_that_hangs_up_before_the_first_byte_gives_up_its_job(served):
+    """Barge-in: a queued request whose caller has gone is skipped, not synthesized."""
+    served.backend.hold = "holds the queue"
+    first = {"model": "kokoro", "voice": "af_heart", "input": "This request holds the queue.", "response_format": "pcm"}
+    second = {**first, "input": "Nobody is left to hear this one."}
+    closed_before = speech_requests_answered("499") if metrics.ENABLED else 0.0
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        held = pool.submit(
+            httpx.post, f"{served.url}/v1/audio/speech", json=first, headers=bearer(served.key), timeout=20
+        )
+        wait_for(lambda: served.backend.calls == [first["input"]])
+        connection = send_speech_request(served.url, second, served.key)
+        wait_for(lambda: task_queue.pending_count() == 2)
+        connection.close()
+        wait_for(lambda: task_queue.pending_count() == 1)  # skipped, and the key's pending slot is back
+        served.backend.release.set()
+        response = held.result(timeout=10)
+
+    assert response.status_code == 200
+    assert len(response.content) == 2 * 100 * len(first["input"])
+    wait_for(lambda: task_queue.pending_count() == 0)
+    assert served.backend.calls == [first["input"]]
+    if metrics.ENABLED:
+        assert speech_requests_answered("499") == closed_before + 1
+
+
+@pytest.mark.parametrize(
+    "served",
+    [pytest.param(False, id="routes"), pytest.param(True, id="production-stack")],
+    indirect=True,
+)
+def test_a_failure_mid_stream_reaches_the_client_as_a_broken_transfer(served, caplog):
+    """A clean end would pass the truncated audio off as the whole clip.
+
+    The production stack catches a ``BaseHTTPMiddleware`` sneaking back in:
+    it ends the body cleanly when the app fails.
+    """
+    body = {
+        "model": "kokoro",
+        "voice": "af_heart",
+        "input": " ".join(SENTENCES),
+        "response_format": "pcm",
+        "max_chunk_chars": 100,
+    }
+    url, headers = f"{served.url}/v1/audio/speech", bearer(served.key)
+    with httpx.stream("POST", url, json=body, headers=headers, timeout=20) as response:
+        complete = b"".join(response.iter_bytes())
+    assert response.status_code == 200
+    assert len(complete) == 2 * joined_length([100 * len(sentence) for sentence in SENTENCES], SR)
+
+    served.backend.fail = "second sentence"
+    received = bytearray()
+
+    def read_to_the_end() -> None:
+        with httpx.stream("POST", url, json=body, headers=headers, timeout=20) as response:
+            assert response.status_code == 200
+            for chunk in response.iter_bytes():
+                received.extend(chunk)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(httpx.RemoteProtocolError):
+        read_to_the_end()
+
+    assert 0 < len(received) < len(complete)
+    wait_for(lambda: task_queue.pending_count() == 0)
+    # The engine's traceback is logged once, by the job; the abort itself is not chained to it.
+    engine_errors = [r for r in caplog.records if r.exc_info and type(r.exc_info[1]) is RuntimeError]
+    assert len(engine_errors) == 1
+    aborts = [
+        r.exc_info[1] for r in caplog.records if r.exc_info and r.exc_info[0] is generation_service.StreamAbortedError
+    ]
+    assert aborts
+    assert all(abort.__cause__ is None and "engine exploded" in str(abort) for abort in aborts)

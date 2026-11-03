@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import itertools
 import shutil
 
 import numpy as np
@@ -170,3 +171,76 @@ async def test_ulaw_8000_streams_the_same_bytes():
     audio = tone()
     streamed = await collect(encode.encode_stream(frames(audio[:5000], audio[5000:]), SR, "ulaw_8000"))
     assert streamed == encode.encode_bytes(audio, SR, "ulaw_8000")
+
+
+@pytest.mark.parametrize("rate", [24000, 44100, 48000])
+def test_ulaw_8000_keeps_the_timing(rate):
+    click = np.zeros(rate, dtype=np.float32)
+    click[rate // 4] = 0.9
+    out = ulaw_decode(encode.encode_bytes(click, rate, "ulaw_8000"))
+    assert abs(int(np.argmax(np.abs(out))) - 2000) <= 1
+
+
+def test_g711_decoders_match_audioop_for_every_code():
+    audioop = pytest.importorskip("audioop")
+    codes = bytes(range(256))
+    assert encode.ulaw_to_linear(codes).tobytes() == audioop.ulaw2lin(codes, 2)
+    assert encode.alaw_to_linear(codes).tobytes() == audioop.alaw2lin(codes, 2)
+
+
+def test_g711_decoders_without_audioop():
+    """audioop is gone from Python 3.13, so its output for a spread of codes is pinned here."""
+    ulaw = {0x00: -32124, 0x01: -31100, 0x0F: -16764, 0x10: -15996, 0x3C: -2364, 0x70: -120, 0x7E: -8}
+    ulaw |= {0x7F: 0, 0x80: 32124, 0xBC: 2364, 0xF0: 120, 0xFE: 8, 0xFF: 0}
+    alaw = {0x00: -5504, 0x01: -5248, 0x2A: -32256, 0x50: -88, 0x55: -8, 0x5A: -248, 0x7F: -848}
+    alaw |= {0x80: 5504, 0xAA: 32256, 0xD0: 88, 0xD5: 8, 0xFF: 848}
+    for decode, known in ((encode.ulaw_to_linear, ulaw), (encode.alaw_to_linear, alaw)):
+        decoded = decode(bytes(known))
+        assert decoded.dtype == np.int16
+        assert decoded.tolist() == list(known.values())
+
+    codes = bytes(range(256))
+    assert np.array_equal(encode.ulaw_to_linear(codes), ulaw_decode(codes))
+    alaw_all = encode.alaw_to_linear(codes).astype(np.int32)
+    assert np.array_equal(alaw_all[:128], -alaw_all[128:])  # the top bit is the sign
+    assert encode.ulaw_to_linear(b"").size == 0
+
+
+def test_ulaw_round_trips_through_linear():
+    codes = np.arange(256, dtype=np.uint8)
+    again = np.frombuffer(encode.linear_to_ulaw(encode.ulaw_to_linear(codes.tobytes())), dtype=np.uint8)
+    # Negative zero (0x7F) decodes to 0, which encodes as positive zero.
+    assert np.array_equal(again, np.where(codes == 0x7F, 0xFF, codes))
+
+    pcm = np.arange(-32124, 32125, dtype=np.int16)  # mu-law clips beyond +-32124
+    decoded = encode.ulaw_to_linear(encode.linear_to_ulaw(pcm)).astype(np.int32)
+    magnitude = np.abs(pcm.astype(np.int32))
+    assert np.all(np.abs(decoded - pcm) <= (magnitude >> 4) + 8)  # within a quantisation step
+
+
+def test_pcm_reports_24_khz_and_the_other_formats_keep_the_engine_rate():
+    assert encode.output_sample_rate("pcm", 48000) == encode.PCM_RATE == 24000
+    for fmt in ("wav", "mp3", "opus", "aac", "flac"):
+        assert encode.output_sample_rate(fmt, 48000) == 48000
+
+
+@pytest.mark.parametrize("rate", [16000, 22050, 44100, 48000])
+async def test_pcm_streams_at_24_khz_from_any_engine_rate(rate):
+    """OpenAI clients play ``pcm`` as 24 kHz without reading a rate, so other rates must be converted."""
+    audio = sine(1000, rate=rate, seconds=1.0)
+    cuts = [0, 1, rate // 50, rate // 3, rate // 3 + 7, rate]  # uneven chunks, one of a single sample
+    pieces = [audio[start:end] for start, end in itertools.pairwise(cuts)]
+
+    streamed = await collect(encode.encode_stream(frames(*pieces), rate, "pcm"))
+
+    assert streamed == encode.encode_bytes(audio, rate, "pcm")  # chunking leaves no trace
+    samples = np.frombuffer(streamed, dtype="<i2").astype(np.float64)
+    assert len(samples) == encode.PCM_RATE  # one second
+    spectrum = np.abs(np.fft.rfft(samples * np.hanning(len(samples))))
+    assert abs(np.fft.rfftfreq(len(samples), 1 / encode.PCM_RATE)[np.argmax(spectrum)] - 1000) <= 1
+
+
+async def test_wav_keeps_the_engine_rate():
+    audio = sine(1000, rate=48000, seconds=0.1)
+    chunks = [chunk async for chunk in encode.encode_stream(frames(audio), 48000, "wav")]
+    assert chunks == [streaming_wav_header(48000), float_to_pcm16_bytes(audio)]

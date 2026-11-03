@@ -13,10 +13,8 @@ import logging
 from contextvars import ContextVar
 from datetime import UTC, datetime
 
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response
-from starlette.types import ASGIApp
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
@@ -68,34 +66,46 @@ def request_is_loopback() -> bool:
 _STAMPED_PATH_PREFIXES: tuple[str, ...] = ("/mcp", "/speak")
 
 
-class ClientIdMiddleware(BaseHTTPMiddleware):
+class ClientIdMiddleware:
     """Copy X-Voicebox-Client-Id into a ContextVar and stamp last_seen_at
-    for requests that act on the caller's MCP bindings."""
+    for requests that act on the caller's MCP bindings.
+
+    Plain ASGI like the security stack: ``BaseHTTPMiddleware`` ends a streamed
+    body cleanly when the app fails mid-stream, which would pass a truncated
+    ``/v1/audio/speech`` clip off as a complete one.
+    """
 
     def __init__(self, app: ASGIApp) -> None:
-        super().__init__(app)
+        self.app = app
 
-    async def dispatch(self, request: Request, call_next) -> Response:
-        client_id = request.headers.get(CLIENT_ID_HEADER)
-        remote_addr = request.client.host if request.client else None
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        client_id = Headers(scope=scope).get(CLIENT_ID_HEADER)
+        client = scope.get("client")
+        stamp = bool(client_id) and _is_stamped_path(scope["path"])
+
+        async def send_and_stamp(message: Message) -> None:
+            if stamp and message["type"] == "http.response.start" and _stampable(scope, client_id):
+                _enqueue_stamp(client_id)
+            await send(message)
+
         client_token = current_client_id.set(client_id)
-        addr_token = current_remote_addr.set(remote_addr)
+        addr_token = current_remote_addr.set(client[0] if client else None)
         try:
-            response = await call_next(request)
+            await self.app(scope, receive, send_and_stamp)
         finally:
             current_client_id.reset(client_token)
             current_remote_addr.reset(addr_token)
 
-        if client_id and _is_stamped_path(request.url.path) and _stampable(request, client_id):
-            _enqueue_stamp(client_id)
-        return response
 
-
-def _stampable(request: Request, client_id: str) -> bool:
+def _stampable(scope: Scope, client_id: str) -> bool:
     """Only authenticated callers with a sane id get a ``mcp_client_bindings`` row."""
     from ..auth.principal import principal_from_scope
 
-    return principal_from_scope(request.scope).authenticated and 1 <= len(client_id) <= 64 and client_id.isprintable()
+    return principal_from_scope(scope).authenticated and 1 <= len(client_id) <= 64 and client_id.isprintable()
 
 
 def _enqueue_stamp(client_id: str) -> None:
