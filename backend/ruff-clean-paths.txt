@@ -1,7 +1,7 @@
 # Paths CI holds to `ruff check` and `ruff format --check` (the rest of the
 # backend predates ruff and is still being brought in line).  Add every new
 # module and test here; remove a path only after cleaning it.
-# integrations/livekit is checked against its own ruff.toml (Python 3.10, width 100).
+# Integrations use their own ruff.toml (LiveKit py310, Pipecat py311; width 100).
 backend/api_errors.py
 backend/auth
 backend/config.py
@@ -73,4 +73,5 @@ backend/utils/subtitles.py
 backend/utils/wav_stream.py
 backend/voices.py
 integrations/livekit
+integrations/pipecat
 scripts/realtime_client.py

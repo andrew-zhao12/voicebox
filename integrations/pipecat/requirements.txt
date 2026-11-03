@@ -1,0 +1,2 @@
+# Tested separately from backend/venv; Pipecat requires Python 3.11+.
+pipecat-ai[openai,silero,webrtc,runner]==1.15.0

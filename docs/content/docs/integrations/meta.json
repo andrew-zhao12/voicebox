@@ -1,5 +1,5 @@
 {
   "title": "Integrations",
   "defaultOpen": true,
-  "pages": ["livekit"]
+  "pages": ["livekit", "pipecat"]
 }

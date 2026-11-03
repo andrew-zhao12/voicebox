@@ -48,3 +48,26 @@ jobs:
 
       - name: Torch-free tests
         run: grep -v '^#' backend/tests/torch-free.txt | xargs python -m pytest -q -p no:cacheprovider
+
+  integration-quality:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        integration: [livekit, pipecat]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: integrations/${{ matrix.integration }}/requirements.txt
+
+      - name: Install integration dependencies
+        run: pip install -r integrations/${{ matrix.integration }}/requirements.txt pytest pytest-asyncio
+
+      - name: Server-free integration checks
+        run: python -m pytest -q -p no:cacheprovider integrations/${{ matrix.integration }}/tests

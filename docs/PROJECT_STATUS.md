@@ -153,6 +153,12 @@ Still open on this track:
 - The MLX no-speech workaround should go upstream to mlx-audio (the bug is still on its main branch, 0.5.9); it is untested in the frozen PyInstaller binary.
 - `scripts/realtime_client.py` has no GA mode.
 
+### Pipecat integration (2026-11-03)
+
+`integrations/pipecat/` adds a browser voice agent on Pipecat 1.15.0, with SmallWebRTC transport, local Silero VAD, realtime or batch Voicebox transcription, streaming speech, and an OpenAI-compatible chat provider or local echo mode. The TTS adapter accepts arbitrary Voicebox preset/cloned voices and streams 24 kHz PCM; thin STT adapters identify completed utterances and close HTTP clients. The worker uses its own Python 3.11+ environment and dedicated Voicebox client key. Guide: `docs/content/docs/integrations/pipecat.mdx`.
+
+Validation on Apple Silicon with Kokoro and MLX Whisper Base: the speech roundtrip passed in both modes with zero word errors; `e2e.py` also passed a complete WebRTC greeting and echo conversation in each mode, with zero word errors and reply latency of 1.057 s realtime and 1.078 s batch. These are one-session local checks with an echo LLM, not capacity measurements. Server-free tests cover credentials, PCM framing, cancellation, transcription protocols, and TTS lifecycle behavior; CI runs LiveKit and Pipecat checks in separate dependency environments. Public signaling authentication, deployed WebRTC connectivity, GPU capacity, telephony, and real-LLM validation remain deployment work.
+
 ### What's Shipped (v0.5.0 — the Capture release)
 
 Shipped 2026-04-25 (PR #544). Voicebox went from a voice-cloning studio to a full voice studio — dictation in, agent speech out, a local LLM in the middle.
