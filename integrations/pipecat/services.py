@@ -11,6 +11,7 @@ from pipecat.services.openai.stt import OpenAIRealtimeSTTService, OpenAISTTServi
 from pipecat.services.tts_service import TTSService
 from pipecat.transcriptions.language import Language
 
+from stt_resampler import VoiceboxSTTResampler
 from tts_settings import VoiceboxTTSSettings, complete_settings, speech_options, validate_settings
 
 SAMPLE_RATE = 24000
@@ -139,6 +140,10 @@ class VoiceboxBatchSTTService(OpenAISTTService):
 
 class VoiceboxRealtimeSTTService(OpenAIRealtimeSTTService):
     """Use stock GA transcription while identifying Voicebox's definitive final events."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._resampler = VoiceboxSTTResampler()
 
     async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
         """Skip the provider-latency safety timer after an explicitly completed utterance."""
