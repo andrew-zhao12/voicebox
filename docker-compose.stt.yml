@@ -1,0 +1,16 @@
+# Optional STT runtimes. Combine with docker-compose.cuda.yml for NVIDIA:
+#   docker compose -f docker-compose.yml -f docker-compose.stt.yml up --build
+#   docker compose -f docker-compose.yml -f docker-compose.cuda.yml -f docker-compose.stt.yml up --build
+# Runtime profiles: faster-whisper, nemotron, all (default). CPU and cu128 only.
+services:
+  voicebox:
+    build:
+      context: .
+      args:
+        VOICEBOX_STT_RUNTIMES: ${VOICEBOX_STT_RUNTIMES:-all}
+    environment:
+      VOICEBOX_FASTER_WHISPER_DEVICE: ${VOICEBOX_FASTER_WHISPER_DEVICE:-auto}
+      VOICEBOX_FASTER_WHISPER_COMPUTE_TYPE: ${VOICEBOX_FASTER_WHISPER_COMPUTE_TYPE:-}
+      VOICEBOX_NEMOTRON_DEVICE: ${VOICEBOX_NEMOTRON_DEVICE:-auto}
+      VOICEBOX_NEMOTRON_DELAY_MS: ${VOICEBOX_NEMOTRON_DELAY_MS:-560}
+      VOICEBOX_REPLICA_THREADS: ${VOICEBOX_REPLICA_THREADS:-4}

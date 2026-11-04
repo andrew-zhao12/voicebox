@@ -20,6 +20,9 @@ on:
       - bun.lock
       - docker-compose*.yml
       - scripts/docker-smoke.sh
+      - scripts/docker-stt-smoke.sh
+      - scripts/install_stt_runtimes.py
+      - scripts/lock-stt-runtimes.sh
       - scripts/rocm-entrypoint.sh
       - .github/workflows/docker.yml
   pull_request:
@@ -30,6 +33,10 @@ on:
       - web/**
       - docker-compose*.yml
       - scripts/docker-smoke.sh
+      - scripts/docker-stt-smoke.sh
+      - scripts/install_stt_runtimes.py
+      - scripts/lock-stt-runtimes.sh
+      - scripts/rocm-entrypoint.sh
       - .github/workflows/docker.yml
   workflow_dispatch:
     inputs:
@@ -43,6 +50,35 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
+  stt-runtimes:
+    # The GPU wheels/libraries are checked on CPU runners. Actual CUDA inference
+    # still needs an NVIDIA host; no weights are fetched by this offline smoke.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cpu, cu128]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space for isolated ML runtimes
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: docker/setup-buildx-action@v3
+      - name: Build optional STT image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: |
+            PYTORCH_VARIANT=${{ matrix.variant }}
+            VOICEBOX_STT_RUNTIMES=all
+          load: true
+          tags: voicebox:stt-ci
+          cache-from: type=gha,scope=stt-${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=stt-${{ matrix.variant }}
+      - name: Offline STT runtime, cache and server smoke
+        run: scripts/docker-stt-smoke.sh voicebox:stt-ci all
+
   cpu:
     if: github.event_name != 'workflow_dispatch' || inputs.variant == 'cpu'
     runs-on: ubuntu-latest
@@ -70,6 +106,9 @@ jobs:
 
       - name: Smoke test (boot, preload Kokoro, stream speech, graceful stop)
         run: scripts/docker-smoke.sh voicebox:ci
+
+      - name: Default image offline readiness and optional-runtime discovery
+        run: scripts/docker-stt-smoke.sh voicebox:ci none
 
       - name: Log in to GHCR
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'

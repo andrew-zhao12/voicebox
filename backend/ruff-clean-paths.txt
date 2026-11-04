@@ -96,3 +96,7 @@ backend/tests/test_speech_stream.py
 backend/tests/test_speech_text.py
 backend/tests/test_transcription_options.py
 scripts/speech_client.py
+backend/stt_preflight.py
+backend/tests/test_stt_preflight.py
+backend/tests/container_stt_smoke.py
+scripts/install_stt_runtimes.py

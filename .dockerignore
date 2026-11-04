@@ -10,6 +10,7 @@ docs/
 mlx-test/
 scripts/*
 !scripts/rocm-entrypoint.sh
+!scripts/install_stt_runtimes.py
 
 # Dependencies & build artifacts (rebuilt in Docker)
 node_modules/

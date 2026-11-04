@@ -1,6 +1,8 @@
 # Install in a SEPARATE Python 3.12 environment; set VOICEBOX_NEMOTRON_PYTHON
 # to its interpreter. Transformers 5 conflicts with the desktop TTS stack.
 transformers==5.13.0
+# The supported cu128 worker uses torch 2.11, whose metadata requires setuptools<82.
+setuptools>=77,<82
 torch>=2.6,<3
 librosa>=0.11,<0.12
 soundfile>=0.12,<1

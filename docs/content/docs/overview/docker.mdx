@@ -178,6 +178,36 @@ Python dependencies are installed from `backend/requirements.lock` in every vari
 
 The default configuration runs on CPU. This works fine but generation will be slower. Kokoro and LuxTTS are the fastest engines on CPU (real-time and better).
 
+### Optional STT runtimes
+
+Build `docker-compose.stt.yml` alongside the base file to install faster-whisper and native Nemotron streaming recognition:
+
+```bash
+# CPU: Linux AMD64 or ARM64
+docker compose -f docker-compose.yml -f docker-compose.stt.yml up --build
+
+# NVIDIA: Linux AMD64, CUDA 12.8 wheels
+docker compose -f docker-compose.yml -f docker-compose.cuda.yml -f docker-compose.stt.yml up --build
+
+# Install only one optional engine
+VOICEBOX_STT_RUNTIMES=faster-whisper docker compose -f docker-compose.yml -f docker-compose.stt.yml up --build
+```
+
+`VOICEBOX_STT_RUNTIMES` is a **build argument**: `none` (the default image), `faster-whisper`, `nemotron`, or `all` (the STT overlay default). Rebuild to change the installed profile. Optional profiles support `cpu` on AMD64/ARM64 and `cu128` on AMD64; ROCm, other CUDA variants and ARM64 CUDA builds fail explicitly. Standard images without optional STT keep their existing GPU variants.
+
+faster-whisper uses CTranslate2 in the main environment, retaining Transformers 4 and the existing TTS dependencies. Nemotron runs in `/opt/stt/nemotron/bin/python` with Transformers 5.13.0; the image sets `VOICEBOX_NEMOTRON_PYTHON` automatically. Its separate Torch pin is `2.14.0+cpu` or `2.11.0+cu128`, independent of the main environment's `TORCH_VERSION` override. Both optional dependency sets have lockfiles; regenerate them with `scripts/lock-stt-runtimes.sh` after changing their requirements.
+
+The CUDA image exposes its wheel-provided cuBLAS 12 and cuDNN 9 libraries through `LD_LIBRARY_PATH`, as required by [faster-whisper's GPU runtime](https://github.com/SYSTRAN/faster-whisper#gpu). Startup checks imports, versions, decoder APIs and native libraries without downloading weights. A missing optional runtime named in `VOICEBOX_PRELOAD_MODELS` also fails before the server starts. Set `VOICEBOX_FASTER_WHISPER_DEVICE=cuda` or `VOICEBOX_NEMOTRON_DEVICE=cuda` to require a GPU for that engine, or `cpu` to keep it on CPU. `auto` uses the available device; with `VOICEBOX_REQUIRE_GPU=1`, an auto-selected optional runtime must find CUDA.
+
+Model downloads still happen on first use or explicit preload. Use the [transcription model IDs and settings](/developer/transcription) to choose an engine. For an offline image check, build a local tag and run:
+
+```bash
+docker build --build-arg VOICEBOX_STT_RUNTIMES=all -t voicebox:stt .
+scripts/docker-stt-smoke.sh voicebox:stt all
+```
+
+This smoke runs with networking disabled and no host port: it checks audio decoding, tiny random-weight English/multilingual Nemotron cache inference, model capability discovery, readiness and graceful shutdown. Docker CI runs it for CPU and cu128 images on AMD64 CPU runners; CUDA inference with real weights requires separate validation on an NVIDIA host. Published `-cpu` and `-cu128` images currently retain the default `none` profile; build the optional profiles locally.
+
 ## Warm-up, Readiness and Graceful Stop
 
 - **Liveness**: `GET /health` answers without a key as soon as the port is open. The image's `HEALTHCHECK` uses it.

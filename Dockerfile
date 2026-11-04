@@ -11,6 +11,7 @@
 
 # Top-level ARG so it is visible to all stages.
 ARG PYTORCH_VARIANT=cpu
+ARG VOICEBOX_STT_RUNTIMES=none
 
 # === Stage 1: Build frontend ===
 FROM oven/bun:1 AS frontend
@@ -39,6 +40,8 @@ FROM python:3.12-slim AS backend-builder
 
 # Re-declare ARGs inside the stage (Docker scoping requirement).
 ARG PYTORCH_VARIANT=cpu
+ARG VOICEBOX_STT_RUNTIMES=none
+ARG TARGETARCH
 # ROCm wheel index. Default 6.3 (RDNA1/2/3); set ROCM_VERSION=7.2 for RDNA4.
 ARG ROCM_VERSION=6.3
 # torch/torchaudio are the only packages requirements.lock does not pin, because
@@ -47,6 +50,11 @@ ARG TORCH_VERSION=
 ARG TORCHAUDIO_VERSION=2.11.0
 
 WORKDIR /build
+
+# Validate opt-in combinations before installing the main dependency stack.
+COPY scripts/install_stt_runtimes.py /build/install_stt_runtimes.py
+RUN python /build/install_stt_runtimes.py --validate-only \
+    --profile "$VOICEBOX_STT_RUNTIMES" --variant "$PYTORCH_VARIANT" --architecture "$TARGETARCH"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -88,9 +96,19 @@ RUN pip install --no-cache-dir -r requirements.lock
 #    dependencies (their real dependencies are already in the lock).
 RUN pip install --no-cache-dir --no-deps chatterbox-tts==0.1.7 hume-tada==0.1.9
 
+# 4. Optional STT: faster-whisper shares only the locked main environment;
+#    Nemotron receives a separate interpreter and Transformers 5 dependency set.
+COPY backend/requirements-faster-whisper.lock backend/requirements-nemotron.lock /build/
+RUN python /build/install_stt_runtimes.py \
+    --profile "$VOICEBOX_STT_RUNTIMES" --variant "$PYTORCH_VARIANT" --architecture "$TARGETARCH" && \
+    if [ -x /opt/stt/nemotron/bin/python ]; then /opt/stt/nemotron/bin/python -m pip check; fi
+
 
 # === Stage 3: Runtime ===
 FROM python:3.12-slim
+
+ARG PYTORCH_VARIANT=cpu
+ARG VOICEBOX_STT_RUNTIMES=none
 
 # Create non-root user; the entrypoint joins GPU device groups at runtime.
 RUN groupadd -r voicebox && \
@@ -107,11 +125,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # The virtualenv from the builder stage (same base image, so its python symlink resolves)
 COPY --from=backend-builder /opt/venv /opt/venv
+COPY --from=backend-builder /opt/stt /opt/stt
+# CTranslate2 loads cuBLAS/cuDNN directly; PyTorch's own wheel loader alone does
+# not make those libraries visible. Missing paths are harmless in CPU images.
 ENV PATH="/opt/venv/bin:$PATH" \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    VOICEBOX_STT_RUNTIMES="${VOICEBOX_STT_RUNTIMES}" \
+    VOICEBOX_STT_VARIANT="${PYTORCH_VARIANT}" \
+    VOICEBOX_NEMOTRON_PYTHON=/opt/stt/nemotron/bin/python \
+    LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/nvidia/cublas/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cudnn/lib:/opt/stt/nemotron/lib/python3.12/site-packages/nvidia/cublas/lib:/opt/stt/nemotron/lib/python3.12/site-packages/nvidia/cudnn/lib
 
 # Copy backend application code
 COPY --chown=voicebox:voicebox backend/ /app/backend/
+# Prove the installed package APIs/shared libraries work, offline and without
+# weights or a GPU. Startup repeats the check for requested runtime devices.
+RUN gosu voicebox python -m backend.stt_preflight --no-device-check
 
 # Copy built frontend from frontend stage
 COPY --from=frontend --chown=voicebox:voicebox /build/web/dist /app/frontend/

@@ -17,4 +17,7 @@ done
 if [ -f /models/.baked ] && [ -z "${VOICEBOX_MODELS_DIR:-}" ]; then
     export VOICEBOX_MODELS_DIR=/models
 fi
+# Optional runtimes fail before the server accepts work. This performs offline
+# imports/API checks only; model downloads remain controlled by normal preloads.
+gosu voicebox python -m backend.stt_preflight --quiet
 exec gosu voicebox "$@"
