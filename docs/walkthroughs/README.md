@@ -93,3 +93,6 @@ emulates a GPU. They may become useful for the deferred shared-state phase
   taught you goes into [`PROJECT_STATUS.md`](../PROJECT_STATUS.md).
 - A recipe under `deploy/` that a walkthrough had to correct gets the fix in
   the recipe, not a note in the walkthrough.
+
+- [Speech accuracy and capacity benchmarks](08-speech-benchmarks.md): real-audio WER/CER, latency, concurrency, cancellation and optional GPU metrics.
+- [Speech validation record](09-speech-validation.md): local model, protocol, and human-audio checks with their limits.

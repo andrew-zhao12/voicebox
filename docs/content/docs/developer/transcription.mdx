@@ -38,10 +38,10 @@ python3.12 -m venv .venv-nemotron
 export VOICEBOX_NEMOTRON_PYTHON="$PWD/.venv-nemotron/bin/python"
 export VOICEBOX_NEMOTRON_DEVICE=cpu  # auto or cuda are also supported
 export VOICEBOX_PRELOAD_MODELS=kokoro,nemotron-streaming-en-0.6b
-backend/venv/bin/python -m backend.main
+backend/venv/bin/python -m backend.main --port 17493
 ```
 
-`VOICEBOX_NEMOTRON_DELAY_MS` selects the model's streaming lookahead (default `560`; supported values are model-specific). Optional dependencies are not installed by the standard desktop/server environment. For containers, install the extra runtime in your derived image and set the same variables. `runtime_available` checks whether the package/interpreter is present; loading performs the full runtime validation.
+`VOICEBOX_NEMOTRON_DELAY_MS` selects the model's streaming lookahead (default `560`; supported values are model-specific). Optional dependencies are not installed by the standard desktop/server environment. A custom frozen build can include faster-whisper with `VOICEBOX_BUNDLE_FASTER_WHISPER=1` after installing its requirements; the Nemotron worker source is bundled, but its separate interpreter remains operator-provided. For containers, install the extra runtime in your derived image and set the same variables. `runtime_available` checks whether the package/interpreter is present; loading performs the full runtime validation.
 
 Administrators download/load models through Model Management or `/models/download` and `/models/load`. Client keys can only use weights already cached. Preload the chosen IDs with `VOICEBOX_PRELOAD_MODELS` and wait for `/health/ready` before accepting calls.
 

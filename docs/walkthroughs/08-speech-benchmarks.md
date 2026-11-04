@@ -58,6 +58,9 @@ sends real inference requests and never creates, unloads, deletes or restarts
 models explicitly. Requests may lazily load models. Multiple engines can remain
 resident, so the model snapshots and the model order matter when comparing VRAM.
 Do not interpret a model's allocator peak as its isolated memory footprint.
+The allocator gauges cover the main server process. The isolated Nemotron worker
+and CTranslate2 allocations require separate host/process GPU telemetry; they are
+not represented by these PyTorch allocator gauges.
 
 Set credentials through environment variables. The client key performs inference;
 the optional admin key performs only `GET /metrics` and `GET /models/status`.
