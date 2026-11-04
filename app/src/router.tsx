@@ -19,6 +19,7 @@ import { GpuPage } from '@/components/ServerTab/GpuPage';
 import { LogsPage } from '@/components/ServerTab/LogsPage';
 import { MCPPage } from '@/components/ServerTab/MCPPage';
 import { SettingsLayout } from '@/components/ServerTab/ServerTab';
+import { SpeechPage } from '@/components/ServerTab/SpeechPage';
 import { Sidebar } from '@/components/Sidebar';
 import { StoriesTab } from '@/components/StoriesTab/StoriesTab';
 import { Toaster } from '@/components/ui/toaster';
@@ -166,6 +167,12 @@ const settingsCapturesRoute = createRoute({
   component: CapturesPage,
 });
 
+const settingsSpeechRoute = createRoute({
+  getParentRoute: () => settingsRoute,
+  path: '/speech',
+  component: SpeechPage,
+});
+
 const settingsMCPRoute = createRoute({
   getParentRoute: () => settingsRoute,
   path: '/mcp',
@@ -216,6 +223,7 @@ const routeTree = rootRoute.addChildren([
   settingsRoute.addChildren([
     settingsGeneralRoute,
     settingsGenerationRoute,
+    settingsSpeechRoute,
     settingsCapturesRoute,
     settingsMCPRoute,
     settingsGpuRoute,

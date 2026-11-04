@@ -6,6 +6,7 @@ import { useForm } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import * as z from 'zod';
 import { EffectsChainEditor } from '@/components/Effects/EffectsChainEditor';
+import { PronunciationEditor } from '@/components/SpeechSettings/PronunciationEditor';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -34,6 +35,7 @@ import {
 } from '@/components/ui/select';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
+import { Toggle } from '@/components/ui/toggle';
 import { useToast } from '@/components/ui/use-toast';
 import { apiClient } from '@/lib/api/client';
 import type { EffectConfig, PresetVoice, VoiceType } from '@/lib/api/types';
@@ -52,6 +54,7 @@ import {
 import { useSystemAudioCapture } from '@/lib/hooks/useSystemAudioCapture';
 import { useTranscription } from '@/lib/hooks/useTranscription';
 import { convertToWav, formatAudioDuration, getAudioDuration } from '@/lib/utils/audio';
+import { type PronunciationEntry, pronunciationDictionary, pronunciationEntries } from '@/lib/utils/speech-settings';
 import { usePlatform } from '@/platform/PlatformContext';
 import { useServerStore } from '@/stores/serverStore';
 import { type ProfileFormDraft, useUIStore } from '@/stores/uiStore';
@@ -78,12 +81,26 @@ function makeProfileSchema(t: (key: string) => string) {
     description: z.string().max(500).optional(),
     language: z.enum(LANGUAGE_CODES as [LanguageCode, ...LanguageCode[]]),
     personality: z.string().max(2000).optional(),
+    inheritPronunciations: z.boolean(),
+    pronunciationEntries: z.array(z.object({ id: z.string(), term: z.string(), spoken: z.string() })),
     sampleFile: z.instanceof(File).optional(),
     referenceText: z.string().max(1000).optional(),
     avatarFile: z.instanceof(File).optional(),
   });
 
-  return baseProfileSchema.refine(
+  return baseProfileSchema.superRefine((data, context) => {
+    if (!data.inheritPronunciations) {
+      try {
+        pronunciationDictionary(data.pronunciationEntries);
+      } catch (error) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['pronunciationEntries'],
+          message: t(`speechSettings.errors.${error instanceof Error ? error.message : 'invalidImport'}`),
+        });
+      }
+    }
+  }).refine(
     (data) => {
       if (data.sampleFile && (!data.referenceText || data.referenceText.trim().length === 0)) {
         return false;
@@ -102,6 +119,8 @@ type ProfileFormValues = {
   description?: string;
   language: LanguageCode;
   personality?: string;
+  inheritPronunciations: boolean;
+  pronunciationEntries: PronunciationEntry[];
   sampleFile?: File;
   referenceText?: string;
   avatarFile?: File;
@@ -169,6 +188,8 @@ export function ProfileForm() {
       description: '',
       language: 'en',
       personality: '',
+      inheritPronunciations: true,
+      pronunciationEntries: [],
       sampleFile: undefined,
       referenceText: '',
       avatarFile: undefined,
@@ -335,6 +356,8 @@ export function ProfileForm() {
         description: editingProfile.description || '',
         language: editingProfile.language as LanguageCode,
         personality: editingProfile.personality || '',
+        inheritPronunciations: editingProfile.pronunciation_replacements == null,
+        pronunciationEntries: pronunciationEntries(editingProfile.pronunciation_replacements),
         sampleFile: undefined,
         referenceText: undefined,
         avatarFile: undefined,
@@ -349,6 +372,8 @@ export function ProfileForm() {
         description: profileFormDraft.description,
         language: profileFormDraft.language as LanguageCode,
         personality: profileFormDraft.personality || '',
+        inheritPronunciations: profileFormDraft.inheritPronunciations ?? true,
+        pronunciationEntries: profileFormDraft.pronunciationEntries ?? [],
         referenceText: profileFormDraft.referenceText,
         sampleFile: undefined,
         avatarFile: undefined,
@@ -374,6 +399,8 @@ export function ProfileForm() {
         description: '',
         language: 'en',
         personality: '',
+        inheritPronunciations: true,
+        pronunciationEntries: [],
         sampleFile: undefined,
         referenceText: undefined,
         avatarFile: undefined,
@@ -490,6 +517,7 @@ export function ProfileForm() {
 
   async function onSubmit(data: ProfileFormValues) {
     try {
+      const pronunciations = data.inheritPronunciations ? null : pronunciationDictionary(data.pronunciationEntries);
       if (editingProfileId) {
         // Editing: update profile
         await updateProfile.mutateAsync({
@@ -500,6 +528,7 @@ export function ProfileForm() {
             language: data.language,
             default_engine: defaultEngine || undefined,
             personality: data.personality?.trim() ? data.personality.trim() : undefined,
+            pronunciation_replacements: pronunciations,
           },
         });
 
@@ -566,6 +595,7 @@ export function ProfileForm() {
           preset_voice_id: selectedPresetVoiceId,
           default_engine: selectedPresetEngine,
           personality: data.personality?.trim() ? data.personality.trim() : undefined,
+          pronunciation_replacements: pronunciations,
         });
 
         // Handle avatar upload if provided
@@ -663,6 +693,7 @@ export function ProfileForm() {
           language: data.language,
           default_engine: defaultEngine || undefined,
           personality: data.personality?.trim() ? data.personality.trim() : undefined,
+          pronunciation_replacements: pronunciations,
         });
 
         // Convert non-WAV uploads to WAV so the backend can always use soundfile.
@@ -758,7 +789,8 @@ export function ProfileForm() {
       // Save draft when closing the create modal
       const values = form.getValues();
       const hasContent =
-        values.name || values.description || values.referenceText || values.sampleFile;
+        values.name || values.description || values.referenceText || values.sampleFile ||
+        !values.inheritPronunciations || values.pronunciationEntries.length;
 
       if (hasContent) {
         const draft: ProfileFormDraft = {
@@ -766,6 +798,8 @@ export function ProfileForm() {
           description: values.description || '',
           language: values.language || 'en',
           personality: values.personality || '',
+          inheritPronunciations: values.inheritPronunciations,
+          pronunciationEntries: values.pronunciationEntries,
           referenceText: values.referenceText || '',
           sampleMode,
         };
@@ -829,6 +863,8 @@ export function ProfileForm() {
                       description: '',
                       language: 'en',
                       personality: '',
+                      inheritPronunciations: true,
+                      pronunciationEntries: [],
                       sampleFile: undefined,
                       referenceText: '',
                       avatarFile: undefined,
@@ -1214,6 +1250,36 @@ export function ProfileForm() {
                       </FormItem>
                     )}
                   />
+
+                  <FormField
+                    control={form.control}
+                    name="inheritPronunciations"
+                    render={({ field }) => (
+                      <FormItem>
+                        <div className="flex items-center justify-between gap-4">
+                          <FormLabel>{t('speechSettings.inherit')}</FormLabel>
+                          <FormControl>
+                            <Toggle checked={field.value} onCheckedChange={field.onChange} />
+                          </FormControl>
+                        </div>
+                        <FormDescription>{t('speechSettings.inheritHint')}</FormDescription>
+                      </FormItem>
+                    )}
+                  />
+                  {!form.watch('inheritPronunciations') && (
+                    <FormField
+                      control={form.control}
+                      name="pronunciationEntries"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t('speechSettings.pronunciations')}</FormLabel>
+                          <PronunciationEditor value={field.value} onChange={field.onChange} />
+                          <FormDescription>{t('speechSettings.emptyVoiceHint')}</FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  )}
 
                   <FormField
                     control={form.control}

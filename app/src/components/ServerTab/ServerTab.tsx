@@ -11,6 +11,7 @@ interface SettingsTab {
   path:
     | '/settings'
     | '/settings/generation'
+    | '/settings/speech'
     | '/settings/captures'
     | '/settings/mcp'
     | '/settings/gpu'
@@ -23,6 +24,7 @@ interface SettingsTab {
 const tabs: SettingsTab[] = [
   { labelKey: 'settings.tabs.general', path: '/settings' },
   { labelKey: 'settings.tabs.generation', path: '/settings/generation' },
+  { labelKey: 'settings.tabs.speech', path: '/settings/speech' },
   { labelKey: 'settings.tabs.captures', path: '/settings/captures' },
   { labelKey: 'settings.tabs.mcp', path: '/settings/mcp' },
   { labelKey: 'settings.tabs.gpu', path: '/settings/gpu', tauriOnly: true },
@@ -39,7 +41,7 @@ export function SettingsLayout() {
 
   return (
     <div className="flex flex-col h-full min-h-0">
-      <nav className="flex gap-1 border-b shrink-0">
+      <nav className="flex gap-1 border-b shrink-0 overflow-x-auto">
         {tabs.map((tab) => {
           if (tab.tauriOnly && !platform.metadata.isTauri) return null;
 

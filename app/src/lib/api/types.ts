@@ -14,6 +14,8 @@ export interface VoiceProfileCreate {
   default_engine?: string;
   /** Free-form character prompt used by compose and the `/generate` personality-rewrite path. */
   personality?: string;
+  /** null inherits the caller's dictionary; an empty object disables replacements. */
+  pronunciation_replacements?: Record<string, string> | null;
 }
 
 export interface VoiceProfileResponse {
@@ -29,6 +31,7 @@ export interface VoiceProfileResponse {
   design_prompt?: string;
   default_engine?: string;
   personality?: string | null;
+  pronunciation_replacements?: Record<string, string> | null;
   /** API key that created the voice through `POST /v1/voices`; absent or null = shared (admin-created). */
   owner_key_id?: string | null;
   generation_count: number;
@@ -579,6 +582,20 @@ export interface WhoAmIResponse {
   via: 'header' | 'token';
   /** Per-minute limits by dimension; null means unlimited. */
   limits: Record<string, number | null>;
+}
+
+export interface ApiKeyInfo {
+  id: string;
+  role: 'admin' | 'client';
+  created_at: string;
+  source: string;
+  limits: Record<string, number | null>;
+}
+
+export interface SpeechSettings {
+  pronunciation_replacements: Record<string, string>;
+  stt_prompt: string;
+  stt_hotwords: string[];
 }
 
 export interface MediaTokenResponse {

@@ -38,6 +38,7 @@ import {
 import { cn } from '@/lib/utils/cn';
 import { usePlayerStore } from '@/stores/playerStore';
 import { useServerStore } from '@/stores/serverStore';
+import { useUIStore } from '@/stores/uiStore';
 
 function makeProfileSchema(t: (key: string) => string) {
   return z.object({
@@ -67,6 +68,8 @@ export function VoiceInspector({ profileId }: VoiceInspectorProps) {
   const deleteAvatar = useDeleteAvatar();
   const mediaToken = useServerStore((state) => state.mediaToken?.token ?? null);
   const { toast } = useToast();
+  const setEditingProfileId = useUIStore((state) => state.setEditingProfileId);
+  const setProfileDialogOpen = useUIStore((state) => state.setProfileDialogOpen);
 
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
   const [avatarError, setAvatarError] = useState(false);
@@ -320,6 +323,27 @@ export function VoiceInspector({ profileId }: VoiceInspectorProps) {
                   </FormItem>
                 )}
               />
+
+              <div className="space-y-2">
+                <FormLabel>{t('speechSettings.pronunciations')}</FormLabel>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full"
+                  disabled={isDirty || updateProfile.isPending}
+                  onClick={() => {
+                    setEditingProfileId(profileId);
+                    setProfileDialogOpen(true);
+                  }}
+                >
+                  {t('speechSettings.editPronunciations')}
+                </Button>
+                {isDirty && (
+                  <p className="text-xs text-muted-foreground">
+                    {t('speechSettings.saveVoiceChangesFirst')}
+                  </p>
+                )}
+              </div>
 
               {/* Effects */}
               <div className="space-y-2">

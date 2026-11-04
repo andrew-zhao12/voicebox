@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import type { PronunciationEntry } from '@/lib/utils/speech-settings';
 
 export type Theme = 'light' | 'dark' | 'system';
 
@@ -20,6 +21,8 @@ export interface ProfileFormDraft {
   description: string;
   language: string;
   personality: string;
+  inheritPronunciations?: boolean;
+  pronunciationEntries?: PronunciationEntry[];
   referenceText: string;
   sampleMode: 'upload' | 'record' | 'system';
   // Note: File objects can't be persisted, so we store metadata

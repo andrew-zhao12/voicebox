@@ -1,6 +1,8 @@
 import type { LanguageCode } from '@/lib/constants/languages';
 import { useServerStore } from '@/stores/serverStore';
 import type {
+  ApiKeyInfo,
+  SpeechSettings,
   ActiveTasksResponse,
   ApplyEffectsRequest,
   AvailableEffectsResponse,
@@ -225,6 +227,23 @@ class ApiClient {
   }
 
   // Profiles
+  async listApiKeys(): Promise<{ keys: ApiKeyInfo[] }> {
+    return this.request<{ keys: ApiKeyInfo[] }>('/auth/keys');
+  }
+
+  async getSpeechSettings(keyId?: string): Promise<SpeechSettings> {
+    const path = keyId ? `/speech/settings/${encodeURIComponent(keyId)}` : '/speech/settings';
+    return this.request<SpeechSettings>(path);
+  }
+
+  async updateSpeechSettings(data: SpeechSettings, keyId?: string): Promise<SpeechSettings> {
+    const path = keyId ? `/speech/settings/${encodeURIComponent(keyId)}` : '/speech/settings';
+    return this.request<SpeechSettings>(path, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    });
+  }
+
   async createProfile(data: VoiceProfileCreate): Promise<VoiceProfileResponse> {
     return this.request<VoiceProfileResponse>('/profiles', {
       method: 'POST',
