@@ -4675,7 +4675,7 @@
           "OpenAI compatible"
         ],
         "summary": "Create Transcription",
-        "description": "Transcribe an uploaded file with Whisper.\n\n``whisper-1`` uses the server's current Whisper size; ``whisper-turbo``,\n``whisper-large`` and the other registry sizes pick one explicitly.\n``response_format`` is ``json`` (default), ``text``, ``verbose_json``\n(segments with timestamps), ``srt`` or ``vtt``; only segment timestamps\nexist, so ``timestamp_granularities[]=word`` is refused.",
+        "description": "Transcribe audio with a registry STT model, optional vocabulary hints and aligned word timestamps.\n\n``whisper-1`` uses the current default Whisper size. Explicit model IDs\nand their capabilities are listed in ``GET /v1/models``. Word timestamps\nrequire ``response_format=verbose_json``. Repeat ``hotwords`` form fields\nto supply domain terms.",
         "operationId": "create_transcription_v1_audio_transcriptions_post",
         "requestBody": {
           "content": {
@@ -5406,6 +5406,31 @@
             "type": "array",
             "title": "Timestamp Granularities[]",
             "default": []
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "hotwords": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hotwords"
           }
         },
         "type": "object",
@@ -5547,6 +5572,31 @@
               }
             ],
             "title": "Model"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "hotwords": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hotwords"
           }
         },
         "type": "object",
@@ -6438,6 +6488,22 @@
       },
       "GenerationRequest": {
         "properties": {
+          "pronunciation_replacements": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object",
+                "maxProperties": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pronunciation Replacements",
+            "description": "Pronunciation dictionary, e.g. {\"API\": \"A P I\"}; literal whole terms, longest match first"
+          },
           "profile_id": {
             "type": "string",
             "title": "Profile Id"
@@ -7495,6 +7561,43 @@
             "type": "string",
             "title": "Display Name"
           },
+          "model_type": {
+            "type": "string",
+            "enum": [
+              "tts",
+              "stt",
+              "llm"
+            ],
+            "title": "Model Type",
+            "default": "tts"
+          },
+          "engine": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine"
+          },
+          "supports_streaming": {
+            "type": "boolean",
+            "title": "Supports Streaming",
+            "default": false
+          },
+          "runtime_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Available"
+          },
           "hf_repo_id": {
             "anyOf": [
               {
@@ -7560,6 +7663,22 @@
       },
       "OpenAISpeechRequest": {
         "properties": {
+          "pronunciation_replacements": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object",
+                "maxProperties": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pronunciation Replacements",
+            "description": "Pronunciation dictionary, e.g. {\"API\": \"A P I\"}; literal whole terms, longest match first"
+          },
           "model": {
             "type": "string",
             "maxLength": 100,
@@ -8394,6 +8513,22 @@
       },
       "StreamGenerationRequest": {
         "properties": {
+          "pronunciation_replacements": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object",
+                "maxProperties": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pronunciation Replacements",
+            "description": "Pronunciation dictionary, e.g. {\"API\": \"A P I\"}; literal whole terms, longest match first"
+          },
           "profile_id": {
             "type": "string",
             "title": "Profile Id"

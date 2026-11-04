@@ -1,0 +1,68 @@
+---
+title: "Incremental speech WebSocket"
+description: "Append text, flush ordered speech, and cancel pending replies"
+---
+
+`WS /v1/audio/speech/stream` accepts text as it arrives from an LLM and synthesizes each explicit flush through Voicebox's normal generation queue. This is a Voicebox protocol; it is separate from the OpenAI realtime transcription protocol. Existing LiveKit and Pipecat examples continue to use HTTP speech requests.
+
+Authenticate with `Authorization: Bearer <client key>`, or a short-lived media token in `?token=` for browsers. A media token comes from `POST /auth/media-token` using the client key. The server emits `session.created` after admission.
+
+## Commands
+
+```json
+{"type":"session.update","session":{"model":"kokoro","voice":"af_heart","language":"en","speed":1,"pronunciation_replacements":{"SQL":"sequel"}}}
+{"type":"input_text.append","text":"The SQL "}
+{"type":"input_text.append","text":"query is ready."}
+{"type":"input_text.flush","flush_id":"reply-1"}
+```
+
+Append does not trigger synthesis. Flush submits all buffered text and snapshots the current settings. Flush IDs must be unique within a session, 1–80 ASCII letters, digits, `.`, `_`, `:` or `-`, beginning with a letter or digit. Multiple flushes synthesize in order.
+
+`session.update` accepts `model`, `voice`, `language`, `speed`, `instructions`, `first_chunk_chars`, `max_chunk_chars` and `pronunciation_replacements`. Voice resolution and supported values match [`POST /v1/audio/speech`](/overview/api-reference).
+
+| Command | Effect |
+|---|---|
+| `input_text.cancel` with `flush_id` | Cancel that queued or active flush |
+| `input_text.cancel` without `flush_id` | Cancel all outstanding flushes and discard unflushed text |
+| `session.close` | Cancel outstanding work and close the socket; wait for `audio.done` first if all speech should finish |
+
+Cancellation stops new audio for the flush. An engine call already running retains its queue slot until it returns; the next synthesis cannot overlap it. A cancelled flush receives `audio.cancelled`, never `audio.done`. Clients should discard queued playback for that flush when interrupted.
+
+## Events and audio
+
+| Event | Important fields |
+|---|---|
+| `session.created` | `session_id`, `session`, `audio_format`, `limits` |
+| `session.updated` | Updated `session` settings |
+| `input_text.accepted` | Buffered character count |
+| `input_text.flushed` | `flush_id` |
+| `audio.started` | `flush_id`, output format |
+| `audio.delta` | `flush_id`, `sequence`, `audio` |
+| `audio.done` | `flush_id`; successful completion only |
+| `audio.cancelled` | `flush_id` |
+| `input_text.cleared` | Unflushed text was discarded |
+| `error` | Optional `flush_id`; `error.code`, `error.message`, optional `error.retry_after_s` |
+| `session.closed` | Session ended |
+
+Decode `audio.delta.audio` from base64 as signed little-endian PCM16, mono, **24 kHz**. Sequence numbers identify chunks within a flush. Audio has no WAV header. A failed flush emits `error`; partial audio must not be mistaken for a complete response. Read events concurrently with sending commands. If the client stops reading, a full outbound queue can delay cancellation and other commands. Each socket write has a five-second deadline; exceeding it closes the connection with reason `slow_consumer` and abandons outstanding work. A stalled or disconnected transport may prevent terminal events from reaching the client.
+
+## Pronunciation dictionaries
+
+The `pronunciation_replacements` object also works on HTTP speech, `/generate` and `/generate/stream` requests. Entries replace whole literal terms, case-sensitively, longest match first, in one nonrecursive pass after personality rewriting. For example, `{"SQL":"sequel"}` changes `SQL` but leaves `NoSQL` alone. This is text substitution, not SSML or phoneme markup.
+
+A request permits 100 entries, keys up to 128 characters, spoken values up to 256 characters, and 8,192 characters across the dictionary. Expanded speech must fit the 50,000-character generation limit. `tts_chars` charges the final spoken text. Keep a dictionary in your application's configuration and send it with each session/request.
+
+## Limits and example client
+
+The socket bounds messages at 64 KiB, combined buffered/pending text at 10,000 characters, outstanding flushes at four and unique flushes at 1,000 per session. Each accepted flush costs one `inference` request; generated text counts against `tts_chars`. Queue, voice ownership and per-key limits are shared with HTTP speech.
+
+`VOICEBOX_SPEECH_MAX_SESSIONS` defaults to four speech sockets per process. A key's `max_realtime_sessions` is shared across speech and transcription sockets. `VOICEBOX_SPEECH_IDLE_S` defaults to 60 seconds without work or messages, and `VOICEBOX_SPEECH_MAX_SESSION_S` to 1,800 seconds total. Inbound and outbound queues are bounded; a stalled receiver is disconnected.
+
+```bash
+export VOICEBOX_CLIENT_KEY=... # a client key for the target server
+backend/venv/bin/python scripts/speech_client.py \
+  --url ws://127.0.0.1:17493 --model kokoro --voice af_heart \
+  --text 'Hello from Voicebox.' --out reply.wav
+```
+
+Use `--stdin` for one explicit flush per input line, or `--pronunciations dictionary.json` to load a dictionary. The client receives concurrently and writes the final WAV only after all flushes complete successfully.

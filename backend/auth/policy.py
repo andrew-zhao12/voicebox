@@ -109,6 +109,7 @@ CLIENT_RULES: tuple[Rule, ...] = (
     # WebSockets (routes/realtime.py); classified as GET like every websocket scope.
     rule("GET", "/v1/realtime"),
     rule("GET", "/v1/realtime/transcription"),
+    rule("GET", "/v1/audio/speech/stream"),
 )
 
 ADMIN_RULES: tuple[Rule, ...] = (
@@ -208,6 +209,7 @@ MEDIA_TOKEN_RULES: tuple[Rule, ...] = (
     # sockets accept ``?token=`` like the media routes.
     rule("GET", "/v1/realtime"),
     rule("GET", "/v1/realtime/transcription"),
+    rule("GET", "/v1/audio/speech/stream"),
     rule("GET", "/generate/{generation_id}/status"),
     rule("GET", "/models/progress/{model_name}"),
     rule("GET", "/models/migrate/progress"),

@@ -1,5 +1,9 @@
 {
   "title": "Integrations",
   "defaultOpen": true,
-  "pages": ["livekit", "pipecat"]
+  "pages": [
+    "livekit",
+    "pipecat",
+    "speech-stream"
+  ]
 }

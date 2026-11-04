@@ -26,6 +26,7 @@ Every request carries `Authorization: Bearer <key>`. Give each application its o
 | `voice` | Resolved in this order: a voice profile **id**, a profile **name**, a built-in **preset voice id** (`af_heart`, `Ryan`, or qualified as `kokoro:af_heart`), then OpenAI's stock names (`alloy`, `nova`, ...), which select the configured default voice (the per-client binding, else the default playback voice from Settings → MCP). `GET /v1/voices` lists every value. Voices another client key created are not visible. |
 | `model` | `tts-1`, `tts-1-hd` or `gpt-4o-mini-tts` use the voice's default engine. Otherwise a model or engine name from `GET /v1/models`: `kokoro`, `qwen-tts-1.7B`, `qwen-tts-0.6B`, `chatterbox-turbo`, `luxtts`, `tada-1b`, ... A preset voice only works with its own engine. |
 | `response_format` | `mp3` (default), `opus`, `aac`, `flac`, `wav`, `pcm` (signed 16-bit little-endian mono at 24 kHz, the rate OpenAI clients assume for raw audio; resampled when the engine's rate differs), `ulaw_8000` (G.711 mu-law at 8 kHz for telephony, band-limited before the sample rate drops). |
+| `pronunciation_replacements` | Voicebox extension: a literal term-to-spoken-text dictionary, such as `{"SQL":"sequel"}`. Applied once after personality rewriting; quotas charge expanded speech. [Rules and limits](/integrations/speech-stream#pronunciation-dictionaries). |
 | `instructions` | Style hint, passed as the engine's `instruct` where the engine supports it (Qwen CustomVoice). |
 | `language` | Voicebox extension: language code of the input. Defaults to the profile's language. |
 | `speed` | `0.25` to `4.0` (default `1.0`). Kokoro speaks at that rate natively; every other engine is time-stretched after synthesis with the pitch preserved, chunk by chunk, so streaming is unaffected. |
@@ -78,12 +79,16 @@ curl -N https://voice.example.com/v1/audio/speech \
   --output hello.wav
 ```
 
+## Incremental speech: `WS /v1/audio/speech/stream`
+
+Append text as it arrives, explicitly flush ordered speech, and cancel queued or active replies over one authenticated socket. Audio events contain base64 PCM16 mono at 24 kHz. See the [complete protocol and example client](/integrations/speech-stream).
+
 ## Transcription: `POST /v1/audio/transcriptions`
 
 Multipart form with `file` (wav, mp3, m4a, ogg, flac, aac, webm, opus; 200 MB cap), `model` and optional `language` and `response_format`.
 
-- `model`: `whisper-1` uses the server's current Whisper size; `whisper-turbo`, `whisper-large`, `whisper-medium`, `whisper-small` or `whisper-base` pick one explicitly.
-- `response_format`: `json` (default, `{"text": "..."}`), `text`, `verbose_json` (OpenAI's shape with `duration`, `language` and `segments[]` carrying `start`, `end` and `text`), `srt` or `vtt` (subtitle cues, one per Whisper segment). `timestamp_granularities[]=segment` is accepted; `word` is refused with `400`, word timestamps do not exist.
+- `model`: `whisper-1` uses the server's current Whisper size; `whisper-turbo`, `whisper-large`, `whisper-medium`, `whisper-small` or `whisper-base` pick one explicitly. Optional `faster-whisper-<size>` and `nemotron-streaming-en-0.6b` / `nemotron-streaming-multilingual-0.6b` select other runtimes; [setup and capabilities](/developer/transcription).
+- `response_format`: `json` (default, `{"text": "..."}`), `text`, `verbose_json` (OpenAI's shape with `duration`, `language` and `segments[]` carrying `start`, `end` and `text`), `srt` or `vtt` (subtitle cues, one per Whisper segment). `timestamp_granularities[]=segment` is accepted; `word` requests actual word alignments with `verbose_json` on Whisper and faster-whisper. Unsupported model capabilities return `400`.
 - The model must already be downloaded; client keys get a `409` otherwise (preload it with `VOICEBOX_PRELOAD_MODELS=whisper-turbo`).
 
 ```python
@@ -97,9 +102,11 @@ for segment in detailed.segments:
     print(f"{segment.start:6.2f}-{segment.end:6.2f}  {segment.text}")
 ```
 
+`prompt` supplies context (up to 4,096 characters); repeat `hotwords` fields for vocabulary terms. Both reach Whisper/faster-whisper inference. Nemotron rejects these unsupported options. `GET /v1/models` reports languages and capability flags.
+
 ## Live transcription: `WS /v1/realtime`
 
-For conversation features, stream microphone audio over a WebSocket and receive partial text while the user speaks and a final transcript per utterance. Whisper is not a streaming model, so "live" means utterances are cut by a server-side voice activity detector (or by your commits) and each one is transcribed as it ends, with partial passes every second in between. Two paths serve the same sessions:
+For conversation features, stream microphone audio over a WebSocket and receive partial text while the user speaks and a final transcript per utterance. Whisper is not a streaming model, so "live" means utterances are cut by a server-side voice activity detector (or by your commits) and each one is transcribed as it ends, with partial passes every second in between. Optional Nemotron models instead feed only new audio into cached native streaming state, with the same utterance boundaries and event shapes. Two paths serve the same sessions:
 
 | Path | Protocol |
 |------|----------|
@@ -132,7 +139,7 @@ Both paths read either shape of session update and take `?model=` (for example `
   |---------|----------------------------------|------|--------|
   | Format | `format.type` | `input_audio_format` | `audio/pcm` or `pcm16` (signed 16-bit little-endian mono); `audio/pcmu` or `g711_ulaw`, `audio/pcma` or `g711_alaw` (G.711 mu-law and A-law, always 8 kHz) |
   | PCM sample rate | `format.rate` | `input_sample_rate` | 8000, 16000, 22050, 24000 (default), 44100 or 48000; OpenAI itself accepts only 24000 |
-  | Model and language | `transcription` | `input_audio_transcription` | `model` as for `/v1/audio/transcriptions`, `language` (up to 32 characters), and `prompt` (up to 4,096 characters), which is stored and echoed but not passed to Whisper yet |
+  | Model and language | `transcription` | `input_audio_transcription` | `model` as for `/v1/audio/transcriptions`, `language` (up to 32 characters), and `prompt` (up to 4,096 characters), which reaches supporting models; optional `hotwords` and `word_timestamps` extensions work on Whisper/faster-whisper. Commit or clear audio before changing transcription settings |
   | Turn detection | `turn_detection` | `turn_detection` | `server_vad` with `threshold` (0–1), `prefix_padding_ms` (0–2000) and `silence_duration_ms` (100–5000), or `null` for manual turns; `semantic_vad` is refused |
   | Partial interval | `partial_interval_ms` (on `session`) | `partial_interval_ms` | 300–10000 ms, default 1000; a Voicebox extension |
 
@@ -147,12 +154,12 @@ Both paths read either shape of session update and take `?model=` (for example `
   | `input_audio_buffer.committed` | `item_id`, `previous_item_id` (`null` for the first utterance) |
   | `input_audio_buffer.cleared` | |
   | `conversation.item.input_audio_transcription.delta` | `item_id`, `content_index` (always `0`), `delta` |
-  | `conversation.item.input_audio_transcription.completed` | `item_id`, `content_index`, `transcript`, `usage` (`{"type": "duration", "seconds": ...}`, the audio sent to Whisper) |
+  | `conversation.item.input_audio_transcription.completed` | `item_id`, `content_index`, `transcript`, `usage` (`{"type": "duration", "seconds": ...}`, audio duration), plus `words` when requested |
   | `conversation.item.input_audio_transcription.failed` | `item_id`, `content_index`, `error` with a `code`: `transcription_failed`, `whisper_busy` or `session_closed` |
   | `error` | `error` with `type`, `code`, `message`, and `event_id` when the client event that caused it had one |
 
   Deltas are append-only: only the words two consecutive passes agree on are sent, and `completed` is the authoritative text (it may revise earlier deltas).
-- **Limits**: messages up to 1 MiB, utterances are cut at 30 s (one Whisper window), sessions end after `VOICEBOX_REALTIME_IDLE_S` seconds without a message (default 60, minimum 15) or after `VOICEBOX_REALTIME_MAX_SESSION_S` (default 1800), at most `VOICEBOX_REALTIME_MAX_SESSIONS` (default 4) sessions per server and `max_realtime_sessions` per key (default 2). At most eight utterances of a session wait for their final pass at once; the next one fails straight away with `whisper_busy`, so audio sent faster than Whisper transcribes it is dropped rather than queued. Every session costs one `inference` request and the audio counts against `uploads_bytes`.
+- **Limits**: messages up to 1 MiB, utterances are cut at 30 s (one Whisper window), sessions end after `VOICEBOX_REALTIME_IDLE_S` seconds without a message (default 60, minimum 15) or after `VOICEBOX_REALTIME_MAX_SESSION_S` (default 1800), at most `VOICEBOX_REALTIME_MAX_SESSIONS` (default 4) sessions per server and `max_realtime_sessions` per key (default 2, shared with incremental speech sockets). At most eight utterances of a session wait for their final pass at once; the next one fails straight away with `whisper_busy`, so audio sent faster than Whisper transcribes it is dropped rather than queued. Every session costs one `inference` request and the audio counts against `uploads_bytes`.
 
 **Closing.** The close reason is the code word in the table. Before an idle, too-long or shutdown close, the server commits the utterance in progress, stops partials, ignores further audio and delivers the pending finals, waiting up to 10 s (and no longer than `VOICEBOX_DRAIN_TIMEOUT_S` while the server stops); a final still missing after that arrives as `...failed` with code `session_closed`. On shutdown this needs `VOICEBOX_SHUTDOWN_DELAY_S` above 0 (see [Deployment](/overview/deployment#5-graceful-stop)); without it the socket closes as soon as the signal arrives and the utterance in progress is lost.
 

@@ -92,7 +92,6 @@ async def generate_speech(
         ensure_capacity(principal.key_id, principal.limits.max_pending_jobs)
     except QueueFullError as e:
         raise _queue_full(e) from e
-    charge("tts_chars", len(data.text))
 
     profile = await profiles.get_profile(data.profile_id, db)
     if not profile or not profiles.is_visible(profile, principal):
@@ -112,6 +111,13 @@ async def generate_speech(
         await ensure_model_cached_or_raise(engine, model_size or "default")
 
     text, source = await _rewrite_for_personality(data, profile)
+    from ..utils.speech_text import apply_pronunciations
+
+    try:
+        text = apply_pronunciations(text, data.pronunciation_replacements)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    charge("tts_chars", len(text))
 
     generation = await history.create_generation(
         profile_id=data.profile_id,

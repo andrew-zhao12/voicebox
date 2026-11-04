@@ -589,7 +589,6 @@ async def open_stream(
         ensure_capacity(principal.key_id, principal.limits.max_pending_jobs)
     except QueueFullError as e:
         raise _refused_queue(e) from e
-    charge("tts_chars", len(data.text))
 
     voice_prompt: dict | None = None
     if voice is not None:
@@ -620,6 +619,13 @@ async def open_stream(
             raise GenerationRefused(400, f"Invalid effects chain: {error_msg}")
 
     text, _source = await rewrite_for_personality(data, profile)
+    from ..utils.speech_text import apply_pronunciations
+
+    try:
+        text = apply_pronunciations(text, data.pronunciation_replacements)
+    except ValueError as e:
+        raise GenerationRefused(400, str(e), code="invalid_value", param="pronunciation_replacements") from e
+    charge("tts_chars", len(text))
 
     first_chunk_chars = data.first_chunk_chars
     if first_chunk_chars is not None:

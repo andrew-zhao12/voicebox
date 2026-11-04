@@ -207,7 +207,7 @@ The other half of the voice I/O loop. Hold a hotkey anywhere on your system, spe
 
 ### Speech-to-Text
 
-Voicebox runs OpenAI Whisper for transcription — the same model that backs dictation, the Captures tab, and the `/transcribe` API. Running on MLX (Apple Silicon) or PyTorch (CUDA / ROCm / DirectML / CPU) depending on your platform.
+Voicebox defaults to OpenAI Whisper for dictation, Captures, and transcription, using MLX on Apple Silicon or PyTorch elsewhere. Optional faster-whisper (CTranslate2) and native streaming Nemotron English/multilingual models work through the upload and realtime APIs. See [runtime setup and capabilities](docs/content/docs/developer/transcription.mdx).
 
 | Size                          | Notes                                              |
 | ----------------------------- | -------------------------------------------------- |
@@ -374,6 +374,8 @@ await voicebox.speak({
 
 Full API documentation available at `http://127.0.0.1:17493/docs`.
 
+Incremental text-to-speech is available at `WS /v1/audio/speech/stream`: append text, flush ordered speech, and cancel interrupted replies. Speech requests support literal pronunciation dictionaries; Whisper/faster-whisper accept vocabulary hints and word timestamps. See the [speech socket protocol](docs/content/docs/integrations/speech-stream.mdx) and [accuracy/capacity benchmark tooling](docs/walkthroughs/08-speech-benchmarks.md).
+
 ### LiveKit Agents
 
 Voicebox can be the speech and transcription of a [LiveKit Agents](https://docs.livekit.io/agents/) voice agent, for calls in LiveKit rooms or over the phone through LiveKit SIP. LiveKit keeps the call, the turn-taking and the LLM; Voicebox speaks and listens through LiveKit's stock OpenAI plugin, so there is nothing extra to install on the Voicebox side:
@@ -405,7 +407,7 @@ Live transcription streams the caller's audio to `/v1/realtime?intent=transcript
 | State         | Zustand, React Query                                                            |
 | Backend       | FastAPI (Python)                                                                |
 | TTS Engines   | Qwen3-TTS, Qwen CustomVoice, LuxTTS, Chatterbox, Chatterbox Turbo, TADA, Kokoro |
-| STT           | Whisper / Whisper Turbo (PyTorch or MLX)                                        |
+| STT           | Whisper (PyTorch/MLX), optional faster-whisper and native streaming Nemotron                                        |
 | Local LLM     | Qwen3 (0.6B / 1.7B / 4B), shared runtime with TTS / STT                         |
 | MCP Server    | FastMCP mounted at `/mcp` (Streamable HTTP) + bundled stdio shim binary         |
 | Native Shim   | Rust (inside Tauri) for global hotkey, paste injection, focus introspection     |

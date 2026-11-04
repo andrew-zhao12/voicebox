@@ -82,13 +82,17 @@ backend/backends/nemotron_backend.py
 backend/backends/nemotron_worker.py
 backend/backends/stt_capabilities.py
 backend/routes/models.py
+backend/routes/speech_stream.py
 backend/services/transcribe.py
 backend/services/native_stt.py
 backend/services/live_sessions.py
+backend/services/speech_stream.py
 backend/utils/speech_text.py
 backend/tests/test_native_stt.py
 backend/tests/test_model_stt_lifecycle.py
 backend/tests/test_optional_stt_backends.py
 backend/tests/test_nemotron_native_runtime.py
+backend/tests/test_speech_stream.py
 backend/tests/test_speech_text.py
 backend/tests/test_transcription_options.py
+scripts/speech_client.py

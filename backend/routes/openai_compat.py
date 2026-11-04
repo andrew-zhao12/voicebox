@@ -165,6 +165,7 @@ async def create_speech(data: models.OpenAISpeechRequest, request: Request, db: 
             instruct=data.instructions,
             format="pcm",
             speed=data.speed,
+            pronunciation_replacements=data.pronunciation_replacements,
             **_chunk_overrides(data),
         )
     except ValidationError as e:

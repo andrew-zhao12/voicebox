@@ -68,6 +68,8 @@ export interface EffectConfig {
 }
 
 export interface GenerationRequest {
+  /** Literal whole-term replacements applied once before synthesis. */
+  pronunciation_replacements?: Record<string, string> | null;
   profile_id: string;
   text: string;
   language: LanguageCode;

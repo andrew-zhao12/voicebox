@@ -2,7 +2,7 @@
 Pydantic models for request/response validation.
 """
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import Literal, Optional, List
 from datetime import datetime
 
@@ -11,6 +11,7 @@ from .utils.capture_chords import (
     default_toggle_to_talk_chord,
 )
 from .utils.chunked_tts import DEFAULT_FIRST_CHUNK_CHARS
+from .utils.speech_text import validate_pronunciations
 
 # Story timelines are bounded so an export can never be asked for an absurd buffer.
 MAX_STORY_MS = 24 * 60 * 60 * 1000
@@ -80,7 +81,23 @@ class ProfileSampleResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class GenerationRequest(BaseModel):
+class PronunciationRequest(BaseModel):
+    """Literal, case-sensitive whole-term substitutions applied once before synthesis."""
+
+    pronunciation_replacements: dict[str, str] | None = Field(
+        None,
+        max_length=100,
+        description="Pronunciation dictionary, e.g. {\"API\": \"A P I\"}; literal whole terms, longest match first",
+    )
+
+    @field_validator("pronunciation_replacements")
+    @classmethod
+    def check_pronunciations(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        """Bound dictionary size and replacement expansion inputs."""
+        return validate_pronunciations(value)
+
+
+class GenerationRequest(PronunciationRequest):
     """Request model for voice generation."""
 
     profile_id: str
@@ -861,7 +878,7 @@ class PruneReportResponse(BaseModel):
     errors: int
 
 
-class OpenAISpeechRequest(BaseModel):
+class OpenAISpeechRequest(PronunciationRequest):
     """Body of ``POST /v1/audio/speech`` (OpenAI's shape plus a ``language`` extension)."""
 
     model: str = Field(default="tts-1", max_length=100)
