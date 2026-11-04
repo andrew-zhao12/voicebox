@@ -7,12 +7,14 @@ is the docs page [LiveKit Agents](../../docs/content/docs/integrations/livekit.m
 [`docs/walkthroughs/07-livekit.md`](../../docs/walkthroughs/07-livekit.md) does everything below
 on one machine, with the output of every command.
 
-The agent uses LiveKit's stock OpenAI plugin pointed at Voicebox's OpenAI-compatible API, so there
-is no Voicebox plugin to install:
+The agent defaults to LiveKit's stock OpenAI plugin pointed at Voicebox's OpenAI-compatible API.
+An optional native adapter sends text incrementally over Voicebox's speech WebSocket; both
+transports use the same installed dependencies:
 
 | Piece | Runs on |
 |---|---|
 | Speech (`openai.TTS`, `response_format="wav"`) | Voicebox `POST /v1/audio/speech` |
+| Speech, incremental (`VoiceboxTTS`) | Voicebox `WS /v1/audio/speech/stream` |
 | Transcription (`openai.STT`, `use_realtime=True`) | Voicebox `WS /v1/realtime?intent=transcription` |
 | Transcription, batch (`use_realtime=False`) | Voicebox `POST /v1/audio/transcriptions`, one call per utterance |
 | Voice activity, end of turn, interruptions | LiveKit, in the worker: Silero VAD and the on-device `v1-mini` end-of-turn model |
@@ -22,14 +24,15 @@ is no Voicebox plugin to install:
 
 | File | What it is |
 |---|---|
-| `agent.py` | The example to copy: an `AgentServer` worker whose session is built by `build_session()` |
+| `agent.py` | The example to copy alongside `voicebox_tts.py`: an `AgentServer` worker whose session is built by `build_session()` |
+| `voicebox_tts.py` | Native LiveKit streaming TTS adapter, including `synthesize()`, cancellation and protocol validation |
 | `requirements.txt` | `livekit-agents[openai,silero]>=1.8.6,<2` |
 | `e2e/run_e2e.py` | The end-to-end check: livekit-server in Docker, the worker, a scripted caller, assertions |
 | `e2e/e2e_agent.py` | The worker the check runs: `agent.build_session()` with an echo LLM |
 | `e2e/participant.py` | The scripted caller: speaks WAVs into the room and records the agent |
 | `e2e/echo.py` | The echo LLM, as a LiveKit LLM and as a tiny OpenAI-compatible chat server; `python e2e/echo.py` serves the latter on its own |
 | `e2e/livekit.yaml` | livekit-server config for a server in Docker with clients on the same host |
-| `tests/` | Checks of `agent.py` and `e2e/run_e2e.py` that need no server: `pip install pytest`, then `python -m pytest tests` |
+| `tests/` | Settings, e2e harness and real SDK lifecycle checks against a local mock WebSocket: `pip install pytest pytest-asyncio`, then `python -m pytest tests` |
 | `ruff.toml` | Lint settings (Python 3.10, line length 100) |
 
 ## Prerequisites
@@ -66,6 +69,11 @@ is no Voicebox plugin to install:
   too). The server also caps realtime sessions at 4 overall: raise `VOICEBOX_REALTIME_MAX_SESSIONS`
   on the server for more simultaneous calls.
 
+  With native WebSocket speech, each active TTS stream uses another realtime session in addition
+  to transcription. For eight simultaneously speaking calls, allow at least 16 sessions on both
+  the key and server, plus headroom for overlapping speech and reconnects. Each phrase flush
+  consumes inference, text and pending-job budgets; shorter phrases increase job frequency.
+
 ## Run the example
 
 ```sh
@@ -94,9 +102,17 @@ LiveKit CLI (`lk agent dev`).
 | `VOICEBOX_CLIENT_KEY` | (required) | the client key. Not `VOICEBOX_API_KEY`, which is the server's own admin key |
 | `VOICEBOX_VOICE` | `af_heart` | a preset voice id, or a cloned voice's name or id (`GET /v1/voices`) |
 | `VOICEBOX_TTS_MODEL` | `tts-1` | speech model or engine (`GET /v1/models`); `tts-1` uses the voice's own engine. A preset voice works only with its engine, a cloned voice only with a cloning engine |
+| `VOICEBOX_TTS_TRANSPORT` | `http` | `http` uses the OpenAI plugin; `websocket` streams text through the native adapter |
+| `VOICEBOX_TTS_SPEED` | `1` | speech speed, `0.25` to `4`, on either transport |
+| `VOICEBOX_TTS_INSTRUCTIONS` | unset | delivery instructions, up to 500 characters, on either transport; only supporting engines use them |
+| `VOICEBOX_PRONUNCIATIONS_FILE` | unset | WebSocket only: path to a JSON object of literal text-to-spoken replacements |
+| `VOICEBOX_FIRST_CHUNK_CHARS` | server default | WebSocket only: first backend chunk target, `20` to `1000` |
+| `VOICEBOX_MAX_CHUNK_CHARS` | server default | WebSocket only: backend chunk target, `100` to `5000` |
+| `VOICEBOX_TEXT_FLUSH_CHARS` | `160` | WebSocket only: maximum client phrase size, `20` to `2000` |
+| `VOICEBOX_TTS_TIMEOUT` | `120` | WebSocket only: seconds without speech progress before failure; connect/handshake use the SDK timeout |
 | `VOICEBOX_STT_MODEL` | `whisper-1` | Whisper model; `whisper-1` is the server's current one |
 | `VOICEBOX_STT_REALTIME` | `1` | `1`: realtime socket; `0`: batch transcription of each VAD-cut utterance |
-| `VOICEBOX_LANGUAGE` | `en` | the user's language |
+| `VOICEBOX_LANGUAGE` | `en` | transcription language and, with native WebSocket TTS, speech language |
 | `LLM_BASE_URL` | OpenAI | OpenAI-compatible chat API, e.g. `http://127.0.0.1:11434/v1` for Ollama |
 | `LLM_MODEL` | `gpt-4.1-mini` | chat model |
 | `LLM_API_KEY` | `OPENAI_API_KEY` | key for that API (any value for servers that ignore it) |
@@ -123,6 +139,40 @@ Things the example does on purpose:
 `python agent.py start` uses LiveKit's production defaults: one idle process per CPU, a health
 server on port 8081, and a one-hour drain on shutdown.
 
+## Incremental speech
+
+```sh
+export VOICEBOX_TTS_TRANSPORT=websocket
+export VOICEBOX_TEXT_FLUSH_CHARS=160
+export VOICEBOX_FIRST_CHUNK_CHARS=80
+# Optional JSON file, for example {"LiveKit": "Live Kit", "SDK": "ess dee kay"}:
+export VOICEBOX_PRONUNCIATIONS_FILE=/absolute/path/pronunciations.json
+python agent.py dev
+```
+
+Copy `voicebox_tts.py` alongside `agent.py` when deploying the example. The adapter implements
+LiveKit `stream()` and `synthesize()` and was checked against SDK 1.8.6 and 1.8.10. It sends
+bounded phrases as the LLM supplies text, flushing at sentence endings after 20 characters or
+at the configured phrase limit. The SDK's final flush sends any remaining text. Each phrase
+is one Voicebox generation job; this is phrase-based synthesis, not generation from every LLM
+token. The backend's chunk settings further divide those phrases during synthesis.
+
+One socket belongs to one SDK stream. The adapter awaits each flush's complete audio before
+submitting the next, so it holds at most one backend job and keeps pending text below the
+server's 10,000-character cap. SDK input is capped at 10,000 characters per stream and received
+audio at ten minutes; these bounds also limit SDK buffering when a consumer falls behind.
+Audio must be mono PCM16 at 24 kHz with matching flush IDs, sequence numbers and completion
+counts. Errors and partial output fail the stream without automatic replay. Interrupting or
+closing the SDK stream sends `input_text.cancel` and closes its socket; an engine call already
+running finishes before backend resources can be released.
+
+Pronunciation JSON allows at most 100 nonempty entries (keys up to 128 characters, values up
+to 256, 8,192 characters total). Unsupported settings fail startup: the installed OpenAI TTS
+plugin exposes speed and instructions over HTTP, but no extra request body for pronunciation
+or chunk fields. HTTP remains the default; compare both transports with your models and LLM
+before choosing one. Smaller phrases can reduce first-audio latency but increase inference
+jobs and change pauses or pronunciation at phrase boundaries.
+
 ## End-to-end check
 
 `e2e/run_e2e.py` runs the example's session in a real LiveKit room against a running Voicebox.
@@ -138,6 +188,8 @@ python run_e2e.py --stt realtime --sessions 3
 python run_e2e.py --stt batch --sessions 3
 python run_e2e.py --barge-in --sessions 2
 python run_e2e.py --agent example        # the unmodified agent.py, with an echo LLM server
+python run_e2e.py --tts-transport websocket --stt realtime
+python run_e2e.py --tts-transport websocket --barge-in
 ```
 
 Each run starts `livekit/livekit-server:v1.13.10` as container `lk-e2e` on ports 7880, 7881 and

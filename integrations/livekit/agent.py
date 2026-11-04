@@ -3,8 +3,8 @@
 LiveKit carries the call and decides when the user has finished speaking
 (Silero VAD plus LiveKit's on-device end-of-turn model, so turn-taking never
 calls LiveKit Cloud). Voicebox transcribes the user and speaks the replies
-through its OpenAI-compatible API, using LiveKit's stock OpenAI plugin, and
-any OpenAI-compatible LLM writes the replies.
+through its OpenAI-compatible API. Speech can also use the native incremental-text
+WebSocket adapter in voicebox_tts.py. Any OpenAI-compatible LLM writes the replies.
 
 Run it (Python 3.10 or newer):
 
@@ -29,6 +29,14 @@ Environment:
     VOICEBOX_TTS_MODEL     speech model or engine, default tts-1: the voice's own engine
                            (GET /v1/models lists the others; a preset voice works only with
                            its engine, a cloned voice only with a cloning engine)
+    VOICEBOX_TTS_TRANSPORT http (default), or websocket for incremental-text speech
+    VOICEBOX_TTS_SPEED     speech speed, 0.25 to 4, default 1
+    VOICEBOX_TTS_INSTRUCTIONS delivery hint for supporting engines, up to 500 characters
+    VOICEBOX_PRONUNCIATIONS_FILE JSON literal replacement dictionary (websocket only)
+    VOICEBOX_FIRST_CHUNK_CHARS first backend chunk target, 20 to 1000 (websocket only)
+    VOICEBOX_MAX_CHUNK_CHARS backend chunk target, 100 to 5000 (websocket only)
+    VOICEBOX_TEXT_FLUSH_CHARS client phrase limit, 20 to 2000, default 160 (websocket only)
+    VOICEBOX_TTS_TIMEOUT   audio progress timeout in seconds, default 120 (websocket only)
     VOICEBOX_STT_MODEL     Whisper model, default whisper-1 (the server's current Whisper)
     VOICEBOX_STT_REALTIME  1 (default) streams the user's audio to Voicebox's realtime
                            transcription socket; 0 sends each utterance, cut by the VAD,
@@ -43,9 +51,11 @@ Environment:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
+from pathlib import Path
 
 from livekit.agents import (
     NOT_GIVEN,
@@ -59,8 +69,11 @@ from livekit.agents import (
     inference,
 )
 from livekit.agents.llm import LLM
+from livekit.agents.tts import TTS
 from livekit.agents.vad import VAD
 from livekit.plugins import openai, silero
+
+from voicebox_tts import VoiceboxTTS, pronunciation_dictionary
 
 logger = logging.getLogger("voicebox-agent")
 
@@ -68,6 +81,7 @@ VOICEBOX_URL = os.environ.get("VOICEBOX_URL", "http://127.0.0.1:17493").rstrip("
 VOICEBOX_CLIENT_KEY = os.environ.get("VOICEBOX_CLIENT_KEY", "")
 VOICEBOX_VOICE = os.environ.get("VOICEBOX_VOICE", "af_heart")
 VOICEBOX_TTS_MODEL = os.environ.get("VOICEBOX_TTS_MODEL", "tts-1")
+VOICEBOX_TTS_TRANSPORT = os.environ.get("VOICEBOX_TTS_TRANSPORT", "http").strip().lower()
 VOICEBOX_STT_MODEL = os.environ.get("VOICEBOX_STT_MODEL", "whisper-1")
 VOICEBOX_STT_REALTIME = os.environ.get("VOICEBOX_STT_REALTIME", "1").strip().lower() not in {
     "0",
@@ -110,21 +124,62 @@ def settings_problem() -> str | None:
         return MISSING_KEY
     if not (LLM_API_KEY or LLM_BASE_URL):
         return MISSING_LLM
+    try:
+        options = speech_options()
+        # This validates options without opening a socket or allocating an HTTP client.
+        VoiceboxTTS(base_url=VOICEBOX_URL, api_key=VOICEBOX_CLIENT_KEY, **options)
+    except (OSError, ValueError) as exc:
+        return f"Invalid Voicebox speech settings: {exc}"
     return None
 
 
-def voicebox_tts() -> openai.TTS:
-    """Speech from Voicebox's ``/v1/audio/speech``.
+def speech_options() -> dict:
+    """Read bounded speech options; refuse settings the chosen transport cannot send."""
+    if VOICEBOX_TTS_TRANSPORT not in {"http", "websocket"}:
+        raise ValueError("VOICEBOX_TTS_TRANSPORT must be http or websocket")
+    options = {"model": VOICEBOX_TTS_MODEL, "voice": VOICEBOX_VOICE}
+    for variable, name, convert in (
+        ("VOICEBOX_TTS_SPEED", "speed", float),
+        ("VOICEBOX_TTS_INSTRUCTIONS", "instructions", str),
+        ("VOICEBOX_FIRST_CHUNK_CHARS", "first_chunk_chars", int),
+        ("VOICEBOX_MAX_CHUNK_CHARS", "max_chunk_chars", int),
+        ("VOICEBOX_TEXT_FLUSH_CHARS", "text_flush_chars", int),
+        ("VOICEBOX_TTS_TIMEOUT", "speech_timeout", float),
+    ):
+        if os.environ.get(variable):
+            try:
+                options[name] = convert(os.environ[variable])
+            except ValueError as exc:
+                raise ValueError(f"Invalid {variable}") from exc
+    dictionary_file = os.environ.get("VOICEBOX_PRONUNCIATIONS_FILE")
+    if dictionary_file:
+        with Path(dictionary_file).open(encoding="utf-8") as handle:
+            content = handle.read(65537)
+        if len(content) > 65536:
+            raise ValueError("Pronunciations JSON file exceeds 64 KiB of text")
+        options["pronunciation_replacements"] = pronunciation_dictionary(json.loads(content))
+    if VOICEBOX_TTS_TRANSPORT == "http":
+        if set(options) - {"model", "voice", "speed", "instructions"}:
+            raise ValueError(
+                "Pronunciations, chunk controls and speech timeout require "
+                "VOICEBOX_TTS_TRANSPORT=websocket"
+            )
+    else:
+        options["language"] = VOICEBOX_LANGUAGE
+    return options
+
+
+def voicebox_tts() -> TTS:
+    """Speech from Voicebox over HTTP (default) or incremental-text WebSocket.
 
     ``wav`` streams chunk by chunk without ffmpeg on the server, and its
     header carries the sample rate, so every engine plays at the right speed.
     """
+    options = speech_options()
+    if VOICEBOX_TTS_TRANSPORT == "websocket":
+        return VoiceboxTTS(base_url=VOICEBOX_URL, api_key=voicebox_key(), **options)
     return openai.TTS(
-        base_url=f"{VOICEBOX_URL}/v1",
-        api_key=voicebox_key(),
-        model=VOICEBOX_TTS_MODEL,
-        voice=VOICEBOX_VOICE,
-        response_format="wav",
+        base_url=f"{VOICEBOX_URL}/v1", api_key=voicebox_key(), response_format="wav", **options
     )
 
 

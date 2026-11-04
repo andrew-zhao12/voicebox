@@ -426,6 +426,7 @@ class Session:
         summary = {
             "session": self.index,
             "room": self.room,
+            "tts_transport": args.tts_transport,
             "pass": not self.failures,
             "wall_s": round(wall_s, 2),
             "timings": {k: None if v is None else round(v, 3) for k, v in self.timings.items()},
@@ -606,6 +607,7 @@ class Run:
             VOICEBOX_CLIENT_KEY=args.client_key,
             VOICEBOX_VOICE=args.voice,
             VOICEBOX_TTS_MODEL=args.tts_model,
+            VOICEBOX_TTS_TRANSPORT=args.tts_transport,
             VOICEBOX_STT_MODEL=args.stt_model,
             VOICEBOX_STT_REALTIME="1" if args.stt == "realtime" else "0",
             VOICEBOX_LANGUAGE=args.language,
@@ -677,7 +679,7 @@ class Run:
 
     def print_summary(self, results: list[dict[str, Any]]) -> None:
         barge = " barge-in" if self.args.barge_in else ""
-        mode = f"stt={self.args.stt} agent={self.args.agent}{barge}"
+        mode = f"stt={self.args.stt} tts={self.args.tts_transport} agent={self.args.agent}{barge}"
         print(f"\n{len(results)} session(s), {mode}; timings in seconds (min / median / max):")
         for name in sorted({k for r in results for k in r["timings"]}):
             values = [r["timings"][name] for r in results if r["timings"].get(name) is not None]
@@ -720,6 +722,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--user-voice", default="am_adam", help="voice of the user's lines")
     ap.add_argument(
         "--tts-model", default=env("VOICEBOX_TTS_MODEL", "tts-1"), help="as ../agent.py's default"
+    )
+    ap.add_argument(
+        "--tts-transport",
+        choices=["http", "websocket"],
+        default=env("VOICEBOX_TTS_TRANSPORT", "http"),
     )
     ap.add_argument("--stt-model", default=env("VOICEBOX_STT_MODEL", "whisper-1"))
     ap.add_argument("--language", default=env("VOICEBOX_LANGUAGE", "en"))

@@ -1,5 +1,6 @@
 # LiveKit Agents 1.8 with the stock OpenAI plugin (it talks to Voicebox's /v1 API)
-# and Silero VAD. The on-device end-of-turn model comes with livekit-agents itself
+# and Silero VAD. The native voicebox_tts.py adapter uses the SDK's aiohttp dependency.
+# The on-device end-of-turn model comes with livekit-agents itself
 # (livekit-local-inference). The upper bound keeps pip off 2.0.0b1, where the
 # 1.8 OpenAI plugin fails to import.
 livekit-agents[openai,silero]>=1.8.6,<2

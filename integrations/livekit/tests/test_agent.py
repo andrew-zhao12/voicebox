@@ -89,3 +89,55 @@ def test_turn_taking_stays_local_under_livekits_dev_defaults(monkeypatch):
     session = asyncio.run(build())
     assert session.turn_detection.model == "turn-detector-v1-mini"
     assert session.interruption_detection == "vad"
+
+
+def test_native_transport_reads_pronunciations_and_speech_controls(monkeypatch, tmp_path):
+    dictionary = tmp_path / "pronunciations.json"
+    dictionary.write_text('{"SDK": "ess dee kay"}')
+    monkeypatch.setattr(agent, "VOICEBOX_TTS_TRANSPORT", "websocket")
+    monkeypatch.setattr(agent, "VOICEBOX_CLIENT_KEY", "vbx_test")
+    monkeypatch.setenv("VOICEBOX_PRONUNCIATIONS_FILE", str(dictionary))
+    monkeypatch.setenv("VOICEBOX_TTS_SPEED", "1.2")
+    monkeypatch.setenv("VOICEBOX_TTS_INSTRUCTIONS", "Speak softly")
+    monkeypatch.setenv("VOICEBOX_FIRST_CHUNK_CHARS", "40")
+    monkeypatch.setenv("VOICEBOX_MAX_CHUNK_CHARS", "300")
+    monkeypatch.setenv("VOICEBOX_TEXT_FLUSH_CHARS", "150")
+    monkeypatch.setenv("VOICEBOX_TTS_TIMEOUT", "180")
+    tts = agent.voicebox_tts()
+    assert isinstance(tts, agent.VoiceboxTTS)
+    assert tts.text_flush_chars == 150
+    assert tts.speech_timeout == 180
+    assert tts.settings["pronunciation_replacements"] == {"SDK": "ess dee kay"}
+    assert tts.settings["speed"] == 1.2
+    assert tts.settings["instructions"] == "Speak softly"
+    assert tts.settings["first_chunk_chars"] == 40
+    assert tts.settings["max_chunk_chars"] == 300
+
+
+@pytest.mark.parametrize(
+    ("transport", "variable", "value", "problem"),
+    [
+        ("websocket", "VOICEBOX_TTS_SPEED", "nan", "Speech speed"),
+        ("websocket", "VOICEBOX_FIRST_CHUNK_CHARS", "5", "first_chunk_chars"),
+        ("websocket", "VOICEBOX_TEXT_FLUSH_CHARS", "oops", "VOICEBOX_TEXT_FLUSH_CHARS"),
+        ("websocket", "VOICEBOX_TTS_TIMEOUT", "0", "Speech progress timeout"),
+        ("http", "VOICEBOX_FIRST_CHUNK_CHARS", "40", "require"),
+        ("invalid", "VOICEBOX_TTS_SPEED", "1", "http or websocket"),
+    ],
+)
+def test_invalid_speech_settings_fail_at_startup(monkeypatch, transport, variable, value, problem):
+    monkeypatch.setattr(agent, "VOICEBOX_TTS_TRANSPORT", transport)
+    monkeypatch.setattr(agent, "VOICEBOX_CLIENT_KEY", "vbx_test")
+    monkeypatch.setattr(agent, "LLM_API_KEY", "llm_test")
+    monkeypatch.setenv(variable, value)
+    assert problem in agent.settings_problem()
+
+
+def test_invalid_dictionary_is_reported_at_startup(monkeypatch, tmp_path):
+    dictionary = tmp_path / "pronunciations.json"
+    dictionary.write_text("invalid json")
+    monkeypatch.setattr(agent, "VOICEBOX_TTS_TRANSPORT", "websocket")
+    monkeypatch.setattr(agent, "VOICEBOX_CLIENT_KEY", "vbx_test")
+    monkeypatch.setattr(agent, "LLM_API_KEY", "llm_test")
+    monkeypatch.setenv("VOICEBOX_PRONUNCIATIONS_FILE", str(dictionary))
+    assert agent.settings_problem().startswith("Invalid Voicebox speech settings:")

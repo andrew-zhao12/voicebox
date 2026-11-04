@@ -41,6 +41,11 @@ def test_the_worker_runs_with_livekits_dev_defaults_under_this_runs_name(tmp_pat
     assert env["LIVEKIT_AGENT_NAME"] == run.agent_name == f"e2e-agent-{run.run_id}"
 
 
+def test_native_tts_flag_reaches_the_worker(tmp_path):
+    run = make_run(tmp_path, "--tts-transport", "websocket")
+    assert run.worker_env()["VOICEBOX_TTS_TRANSPORT"] == "websocket"
+
+
 def test_the_caller_dispatches_this_runs_worker(tmp_path, monkeypatch):
     """A worker left over from a killed run never takes this run's calls."""
     run = make_run(tmp_path)

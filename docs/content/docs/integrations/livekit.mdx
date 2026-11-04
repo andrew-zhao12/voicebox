@@ -1,11 +1,13 @@
 ---
 title: "LiveKit Agents"
-description: "Use a self-hosted Voicebox as the speech and transcription of a LiveKit voice agent, through LiveKit's stock OpenAI plugin"
+description: "Use Voicebox for LiveKit speech and transcription, with HTTP or native incremental speech streaming"
 ---
 
 ## Overview
 
 [LiveKit Agents](https://docs.livekit.io/agents/) builds voice agents that join LiveKit rooms and phone calls. Voicebox can be their speech and their transcription: LiveKit's own OpenAI plugin (`livekit-plugins-openai`) pointed at Voicebox's [OpenAI-compatible `/v1` API](/overview/api-reference) is all it takes, so there is no Voicebox package to install.
+
+The repository example also includes an optional native `VoiceboxTTS` adapter for [incremental-text speech](/integrations/speech-stream). HTTP remains its default; set `VOICEBOX_TTS_TRANSPORT=websocket` to send phrases while the LLM is still writing its reply.
 
 | Job | Done by |
 |-----|---------|
@@ -13,6 +15,7 @@ description: "Use a self-hosted Voicebox as the speech and transcription of a Li
 | Voice activity detection, end of turn, interruptions | The agent worker: Silero VAD and LiveKit's turn detector model, both running locally |
 | The conversation | Any OpenAI-compatible chat API through `openai.LLM` (Voicebox has no chat endpoint) |
 | Speech | Voicebox `POST /v1/audio/speech`, through `openai.TTS` |
+| Incremental speech (optional) | Voicebox `WS /v1/audio/speech/stream`, through the example's `VoiceboxTTS` |
 | Transcription | Voicebox `WS /v1/realtime?intent=transcription`, through `openai.STT(use_realtime=True)`, or one `POST /v1/audio/transcriptions` per utterance through `openai.STT()` |
 
 <Callout type="info">
@@ -32,7 +35,7 @@ The example and six real-room sessions were revalidated on 2026-11-03 with LiveK
   | `inference` per minute | 30 | One per sentence spoken, one per utterance transcribed in batch mode, one per live transcription session and per reconnect |
   | `requests` per minute | 300 | One per sentence spoken and per batch utterance (the transcription socket is not counted) |
   | `max_pending_jobs` | 4 | One while a sentence is being synthesized; two for a moment after the caller interrupts |
-  | `max_realtime_sessions` | 2 | One per call with `use_realtime=True` |
+  | `max_realtime_sessions` | 2 | One per call with `use_realtime=True`, plus one per active native TTS stream |
   | `tts_chars` per minute | 60,000 | The text the agent speaks |
   | `uploads_bytes` per minute | 256 MiB | The caller's audio, about 2.9 MB per minute of call |
 
@@ -45,6 +48,8 @@ The example and six real-room sessions were revalidated on 2026-11-03 with LiveK
   ```
 
   Give the worker its own key rather than the admin key, so its limits can be tuned and it can be revoked alone (see [API Keys](/overview/api-keys)). Raise the server-wide `VOICEBOX_REALTIME_MAX_SESSIONS` (default 4) to the number of calls as well; with Docker Compose, set it under `environment:` in an override file.
+
+  Native speech sockets share those session limits with transcription. For eight calls speaking at once, allow at least 16 sessions on the key and server, with headroom for overlapping speech and reconnects. Each native phrase flush consumes inference, text and pending-job budgets; a shorter phrase limit creates more jobs.
 - **The models in memory before the first call.** Set `VOICEBOX_PRELOAD_MODELS` to the speech model and the Whisper size the agent uses (for example `kokoro,whisper-base`) and dispatch agents only once `GET /health/ready` answers `200`. A client key never downloads a model, and the plugin gives up on a sentence that has not started arriving after 30 seconds, which a cold model load can exceed.
 
 ## Quick start
@@ -149,7 +154,7 @@ python agent.py start     # or serve rooms on the LiveKit server in LIVEKIT_URL,
 </Step>
 </Steps>
 
-The repository has a complete worker in `integrations/livekit/agent.py` (install its dependencies with `pip install -r integrations/livekit/requirements.txt`): the same pipeline with the VAD loaded once per worker process, a greeting, transcript logging and a configuration check. It reads:
+The repository has a complete worker in `integrations/livekit/agent.py` (copy `voicebox_tts.py` alongside it and install its dependencies with `pip install -r integrations/livekit/requirements.txt`): the same pipeline with the VAD loaded once per worker process, a greeting, transcript logging and a configuration check. It reads:
 
 | Variable | Meaning | Default |
 |----------|---------|---------|
@@ -157,9 +162,17 @@ The repository has a complete worker in `integrations/livekit/agent.py` (install
 | `VOICEBOX_CLIENT_KEY` | The worker's client key | required |
 | `VOICEBOX_VOICE` | The agent's voice: a preset id, or a voice profile's name or id | `af_heart` |
 | `VOICEBOX_TTS_MODEL` | Speech engine or model; `tts-1` uses the voice's own engine, so it serves preset and cloned voices alike | `tts-1` |
+| `VOICEBOX_TTS_TRANSPORT` | `http` for the OpenAI plugin, `websocket` for the native incremental-text adapter | `http` |
+| `VOICEBOX_TTS_SPEED` | Speech speed on either transport, `0.25` to `4` | `1` |
+| `VOICEBOX_TTS_INSTRUCTIONS` | Delivery hint on either transport, up to 500 characters; only supporting engines use it | unset |
+| `VOICEBOX_PRONUNCIATIONS_FILE` | WebSocket only: JSON file of literal text-to-spoken replacements | unset |
+| `VOICEBOX_FIRST_CHUNK_CHARS` | WebSocket only: backend first-chunk target, `20` to `1000` | server default |
+| `VOICEBOX_MAX_CHUNK_CHARS` | WebSocket only: backend chunk target, `100` to `5000` | server default |
+| `VOICEBOX_TEXT_FLUSH_CHARS` | WebSocket only: client phrase limit, `20` to `2000` | `160` |
+| `VOICEBOX_TTS_TIMEOUT` | WebSocket only: seconds without speech progress before failure | `120` |
 | `VOICEBOX_STT_MODEL` | Whisper model | `whisper-1` |
 | `VOICEBOX_STT_REALTIME` | `1` streams to the live transcription socket, `0` uploads each utterance | `1` |
-| `VOICEBOX_LANGUAGE` | Language the caller speaks | `en` |
+| `VOICEBOX_LANGUAGE` | Transcription language and, for native WebSocket TTS, speech language | `en` |
 | `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` | The chat API; `LLM_API_KEY` falls back to `OPENAI_API_KEY` | OpenAI, `gpt-4.1-mini` |
 | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | The LiveKit server, for `dev` and `start` | |
 
@@ -179,7 +192,47 @@ The key variable is deliberately not `VOICEBOX_API_KEY`: that name is the server
 | `speed` | `0.25` to `4.0`. Native on Kokoro, a pitch-preserving time stretch on the other engines. |
 | `instructions` | A delivery hint for the engines that take one (Qwen CustomVoice); the others ignore it. |
 
-The plugin sends nothing else, so Voicebox's own speech fields are out of reach: `language` (set it on the voice profile; a preset voice speaks its own language), `max_chunk_chars` and `first_chunk_chars` (the server defaults apply).
+The stock plugin sends nothing else, so Voicebox's own speech fields are out of reach over this HTTP path: `language` (set it on the voice profile; a preset voice speaks its own language), `pronunciation_replacements`, `max_chunk_chars` and `first_chunk_chars`. Use the native adapter below for those fields. The example rejects WebSocket-only settings at startup when HTTP is selected.
+
+### Native incremental-text speech
+
+In the repository example:
+
+```bash
+export VOICEBOX_TTS_TRANSPORT=websocket
+export VOICEBOX_TEXT_FLUSH_CHARS=160
+export VOICEBOX_FIRST_CHUNK_CHARS=80
+export VOICEBOX_PRONUNCIATIONS_FILE=/absolute/path/pronunciations.json
+python agent.py dev
+```
+
+The optional dictionary file is a JSON object, for example `{"LiveKit": "Live Kit", "SDK": "ess dee kay"}`. It accepts at most 100 nonempty entries, keys up to 128 characters, values up to 256, and 8,192 characters across keys and values. Omit the file setting if no replacements are needed. Engine support and voice/model compatibility are the same as for HTTP speech.
+
+For a custom worker, copy `integrations/livekit/voicebox_tts.py` into its Python import path and replace `openai.TTS(...)` with:
+
+```python
+from voicebox_tts import VoiceboxTTS
+
+speech = VoiceboxTTS(
+    base_url="http://127.0.0.1:17493",
+    api_key=os.environ["VOICEBOX_CLIENT_KEY"],
+    model="kokoro",
+    voice="af_heart",
+    language="en",
+    text_flush_chars=160,
+    first_chunk_chars=80,
+    pronunciation_replacements={"SDK": "ess dee kay"},
+)
+# Pass speech as AgentSession(tts=speech, ...).
+```
+
+Both SDK `stream()` and `synthesize()` are supported and tested against LiveKit Agents 1.8.6 and 1.8.10. Text is buffered until a sentence ending after 20 characters, the configured phrase limit, or the SDK's final flush. The adapter then sends `input_text.append` and `input_text.flush`; one phrase is one Voicebox generation job. Audio can arrive before the LLM finishes its reply, but synthesis still operates on phrases rather than individual tokens. Backend chunk controls further divide each phrase.
+
+One SDK stream owns one socket and one active generation job at a time. The adapter waits for each phrase's `audio.done` before submitting the next and retains one SDK transcript segment across those phrases. It caps total input at 10,000 characters and received audio at ten minutes per SDK stream, bounding queued data if a consumer falls behind. Audio is validated as mono PCM16 at 24 kHz, including flush IDs, consecutive sequence numbers and final sample/chunk counts. The speech progress timeout defaults to 120 seconds; connection and configuration use LiveKit's connect timeout. Preload models as usual.
+
+Interruption or `aclose()` sends `input_text.cancel` and closes the socket, using short cleanup deadlines. Backend work already inside an engine call ends when that call returns. The adapter never automatically reconnects or replays text after a protocol, inference or transport error, including after partial audio. The caller can decide whether to start a new utterance.
+
+Compare with `python e2e/run_e2e.py --tts-transport http` and `python e2e/run_e2e.py --tts-transport websocket`; add `--barge-in` to check interruption. HTTP remains the default pending workload-specific measurements. Smaller native phrases may improve time to first audio but increase job frequency and affect pauses or pronunciation across phrase boundaries. The HTTP behavior described in the following sections remains available.
 
 ### One request per sentence
 

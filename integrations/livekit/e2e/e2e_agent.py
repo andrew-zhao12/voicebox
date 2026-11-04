@@ -103,6 +103,7 @@ async def entrypoint(ctx: JobContext) -> None:
         turn_detector=getattr(detector, "model", detector),
         interruption=str(session.interruption_detection),  # "vad", or NOT_GIVEN for the default
         stt_realtime=example.VOICEBOX_STT_REALTIME,
+        tts_transport=example.VOICEBOX_TTS_TRANSPORT,
         greeting=example.GREETING,
     )
     # With participant_identity set, 1.8.8's RoomIO needs the room connected before start().
