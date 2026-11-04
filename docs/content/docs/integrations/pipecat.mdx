@@ -10,10 +10,10 @@ description: "Build a browser voice agent with Pipecat and self-hosted Voicebox 
 | Browser audio | Pipecat SmallWebRTC transport and development runner |
 | Turn detection | Local Silero VAD |
 | Transcription | Small adapters over Pipecat's `OpenAIRealtimeSTTService` and `OpenAISTTService` |
-| Speech | `VoiceboxTTSService`, a small Pipecat adapter for streaming 24 kHz PCM |
+| Speech | `VoiceboxTTSService` (HTTP default) or `VoiceboxStreamingTTSService` (incremental WebSocket), both 24 kHz PCM |
 | Replies | Any OpenAI-compatible chat server, or the example's local echo mode |
 
-Pipecat 1.15's stock OpenAI TTS service validates voices against OpenAI's catalog. The example's adapter allows Voicebox preset IDs such as `af_heart` and cloned voice names or IDs. It uses Pipecat's sentence aggregation and interruption handling, closes interrupted HTTP streams, and disables automatic SDK retries to avoid replaying speech.
+Pipecat 1.15's stock OpenAI TTS service validates voices against OpenAI's catalog. Both adapters allow Voicebox preset IDs such as `af_heart` and cloned voice names or IDs. The default HTTP adapter uses Pipecat's sentence aggregation, closes interrupted streams, and disables automatic SDK retries. The optional WebSocket adapter consumes tokens and flushes bounded phrases. Neither replays speech after a failure.
 
 The transcription adapters mark completed Voicebox utterances as final for Pipecat's turn handling and close the batch service's HTTP pool when a call ends. The underlying HTTP and realtime protocols remain Pipecat's OpenAI implementations.
 
@@ -52,6 +52,14 @@ For a conversational LLM, set `VOICEBOX_LLM=openai` and `OPENAI_API_KEY`, or con
 | `VOICEBOX_CLIENT_KEY` | Required | Voicebox client key; separate from LLM credentials |
 | `VOICEBOX_VOICE` | `af_heart` | Preset voice ID or cloned voice name/ID |
 | `VOICEBOX_TTS_MODEL` | `tts-1` | Uses the voice's engine; explicit model IDs are also accepted |
+| `VOICEBOX_TTS_TRANSPORT` | `http` | HTTP sentence synthesis or `websocket` incremental phrase synthesis |
+| `VOICEBOX_PRONUNCIATIONS_FILE` | Unset | JSON object of literal pronunciation replacements |
+| `VOICEBOX_TTS_SPEED` | Server default | Speech rate from 0.25 to 4 |
+| `VOICEBOX_TTS_INSTRUCTIONS` | Unset | Engine-supported delivery instructions, maximum 500 characters |
+| `VOICEBOX_FIRST_CHUNK_CHARS` | Server default | Backend first chunk text budget, 20–1000 characters |
+| `VOICEBOX_MAX_CHUNK_CHARS` | Server default | Backend later chunk text budget, 100–5000 characters |
+| `VOICEBOX_TEXT_FLUSH_CHARS` | `120` | WebSocket only: phrase text budget, 20–1000 characters |
+| `VOICEBOX_TTS_TIMEOUT` | `120` | WebSocket only: speech progress timeout in seconds, 1–1800 |
 | `VOICEBOX_STT_MODEL` | `whisper-1` | Uses the server's current Whisper model |
 | `VOICEBOX_LANGUAGE` | `en` | Transcription language |
 | `VOICEBOX_STT_REALTIME` | `1` | `1` streams transcription; `0` uploads each utterance |
@@ -59,6 +67,16 @@ For a conversational LLM, set `VOICEBOX_LLM=openai` and `OPENAI_API_KEY`, or con
 | `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` | OpenAI, `gpt-4.1-mini`, `OPENAI_API_KEY` | Chat provider; custom endpoints use an explicit key or a local placeholder |
 
 Realtime mode streams audio to `/v1/realtime?intent=transcription`. Pipecat's local VAD commits utterances. Whisper and faster-whisper produce rolling partial passes; optional Nemotron uses cached native streaming state between chunks. Set `VOICEBOX_STT_MODEL` to a model ID from `/v1/models` after [installing and preloading its runtime](/developer/transcription). Batch mode posts VAD-cut recordings to `/v1/audio/transcriptions`.
+
+## Incremental speech
+
+Set `VOICEBOX_TTS_TRANSPORT=websocket` to use `/v1/audio/speech/stream`. This adapter consumes Pipecat LLM **tokens**, flushing at sentence punctuation or a word boundary near `VOICEBOX_TEXT_FLUSH_CHARS`, and flushes the remainder when the LLM response ends. It can start speech before the full sentence arrives. Each phrase is held locally, then appended and flushed atomically; the server only synthesizes flushed text.
+
+At most four phrases of 1000 characters are outstanding, keeping long LLM responses below Voicebox's 10000-character pending text limit. Audio queued ahead of SDK playback is bounded to 64 frames; a consumer stalled for five seconds fails. An interruption cancels the affected flushes and drops unsent text while preserving SDK speech explicitly marked uninterruptible. A model chunk already executing may finish. Connection loss or malformed or partial audio produces a pipeline error, without replaying submitted speech.
+
+Both transports support speed, engine-supported instructions, pronunciation dictionaries, and backend chunk controls. A pronunciation file looks like `{"API":"A P I","Voicebox":"Voice box"}` and allows at most 100 entries, 128-character keys, 256-character values, and 8192 total characters. Replacement matches stay within each phrase. Pipecat `TTSUpdateSettingsFrame` can update `VoiceboxStreamingTTSService.Settings`; streaming settings take effect on the next LLM turn.
+
+WebSocket TTS holds one additional socket per call. With realtime STT, each call uses **two** slots from the client's shared `max_realtime_sessions` quota. Speech sockets also count against `VOICEBOX_SPEECH_MAX_SESSIONS` (default four). Each flushed phrase consumes an inference request. HTTP remains the default because shorter phrases trade speech continuity and inference volume for earlier audio; measure this tradeoff with your selected voice and LLM.
 
 ## Validation and deployment
 
@@ -68,6 +86,8 @@ The integration pins Pipecat 1.15.0 and includes server-free contract tests, a s
 python integrations/pipecat/smoke.py --stt both
 python integrations/pipecat/e2e.py --stt realtime
 python integrations/pipecat/e2e.py --stt batch
+python integrations/pipecat/smoke.py --tts websocket --stt both
+python integrations/pipecat/e2e.py --tts websocket --stt realtime
 ```
 
 Run these in the example's environment with `VOICEBOX_URL` and `VOICEBOX_CLIENT_KEY` set. The WebRTC check starts its own local agent and scripted caller, records the greeting and reply, verifies their transcripts, and stops its runner. It needs no browser, microphone, or paid LLM.

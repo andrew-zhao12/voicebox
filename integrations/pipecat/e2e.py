@@ -190,11 +190,13 @@ def stop_worker(proc: subprocess.Popen):
 
 
 async def check(args) -> dict:
+    if args.tts:
+        os.environ["VOICEBOX_TTS_TRANSPORT"] = args.tts
     settings = Settings.from_env(require_llm=False)
     out = Path(args.out_dir or tempfile.mkdtemp(prefix="voicebox-pipecat-e2e-")).resolve()
     out.mkdir(parents=True, exist_ok=True)
     print(f"Artifacts: {out}", flush=True)
-    result = {"stt": args.stt, "pass": False}
+    result = {"stt": args.stt, "tts": settings.tts_transport, "pass": False}
     headers = {"Authorization": f"Bearer {settings.voicebox_key}"}
     proc = None
     try:
@@ -225,6 +227,7 @@ async def check(args) -> dict:
                 os.environ,
                 VOICEBOX_LLM="echo",
                 VOICEBOX_STT_REALTIME="1" if args.stt == "realtime" else "0",
+                VOICEBOX_TTS_TRANSPORT=settings.tts_transport,
             )
             with (out / "bot.log").open("w") as log:
                 proc = subprocess.Popen(
@@ -291,6 +294,9 @@ async def main(args) -> int:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stt", choices=["batch", "realtime"], default="realtime")
+    parser.add_argument(
+        "--tts", choices=["http", "websocket"], help="Override VOICEBOX_TTS_TRANSPORT"
+    )
     parser.add_argument("--timeout", type=float, default=90)
     parser.add_argument("--max-wer", type=float, default=0.25)
     parser.add_argument("--max-reply-latency", type=float, default=5)

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import io
 import json
+import os
 import re
 import time
 import wave
@@ -11,7 +12,12 @@ import wave
 from pipecat.frames.frames import (
     ErrorFrame,
     InputAudioRawFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMTextFrame,
     TranscriptionFrame,
+    TTSAudioRawFrame,
+    TTSStoppedFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
@@ -19,8 +25,8 @@ from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.workers.runner import WorkerRunner
 
-from bot import Settings
-from services import SAMPLE_RATE, VoiceboxTTSService, voicebox_stt
+from bot import Settings, voicebox_tts
+from services import SAMPLE_RATE, voicebox_stt
 
 DEFAULT_TEXT = "The quick brown fox jumps over the lazy dog."
 
@@ -99,32 +105,59 @@ def word_error_rate(expected: str, actual: str) -> float:
     return row[-1] / max(1, len(reference))
 
 
-async def check(*, mode: str, text: str, timeout: float, max_wer: float):
-    """Synthesize with the real adapter, transcribe with stock services, and assert content."""
-    settings = Settings.from_env(require_llm=False)
-    tts = VoiceboxTTSService(
-        api_key=settings.voicebox_key,
-        base_url=settings.voicebox_url,
-        voice=settings.voice,
-        model=settings.tts_model,
-    )
-    started = time.monotonic()
-    try:
-        async with asyncio.timeout(timeout):
-            chunks = []
-            async for frame in tts.run_tts(text, "smoke"):
-                if isinstance(frame, ErrorFrame):
-                    raise RuntimeError(frame.error)
+async def synthesize(tts, text: str, timeout: float) -> bytes:
+    """Exercise either transport using real LLM token and audio-context lifecycle frames."""
+    chunks = []
+    done = asyncio.get_running_loop().create_future()
+
+    class AudioCollector(FrameProcessor):
+        async def process_frame(self, frame, direction):
+            await super().process_frame(frame, direction)
+            if isinstance(frame, TTSAudioRawFrame):
                 chunks.append(frame.audio)
+            elif isinstance(frame, TTSStoppedFrame) and not done.done():
+                done.set_result(None)
+            await self.push_frame(frame, direction)
+
+    @tts.event_handler("on_error")
+    async def on_error(service, error):
+        if not done.done():
+            done.set_exception(RuntimeError(error.error))
+
+    worker = PipelineWorker(Pipeline([tts, AudioCollector()]), enable_rtvi=False)
+    runner = WorkerRunner(handle_sigint=False)
+    await runner.add_workers(worker)
+    running = asyncio.create_task(runner.run())
+    try:
+        await worker.queue_frames(
+            [
+                LLMFullResponseStartFrame(),
+                *(LLMTextFrame(token) for token in re.findall(r"\S+\s*", text)),
+                LLMFullResponseEndFrame(),
+            ]
+        )
+        await asyncio.wait_for(done, timeout)
+        return b"".join(chunks)
     finally:
-        await tts.cleanup()
-    pcm = b"".join(chunks)
+        await runner.cancel()
+        await running
+
+
+async def check(*, mode: str, text: str, timeout: float, max_wer: float, tts_transport=None):
+    """Synthesize with the real adapter, transcribe with stock services, and assert content."""
+    if tts_transport:
+        os.environ["VOICEBOX_TTS_TRANSPORT"] = tts_transport
+    settings = Settings.from_env(require_llm=False)
+    tts = voicebox_tts(settings)
+    started = time.monotonic()
+    pcm = await synthesize(tts, text, timeout)
     if not pcm:
         raise RuntimeError("Voicebox produced no speech")
     print(
         json.dumps(
             {
                 "tts_seconds": round(time.monotonic() - started, 3),
+                "tts": settings.tts_transport,
                 "audio_seconds": len(pcm) / SAMPLE_RATE / 2,
             }
         )
@@ -170,8 +203,19 @@ async def check(*, mode: str, text: str, timeout: float, max_wer: float):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stt", choices=["batch", "realtime", "both"], default="both")
+    parser.add_argument(
+        "--tts", choices=["http", "websocket"], help="Override VOICEBOX_TTS_TRANSPORT"
+    )
     parser.add_argument("--text", default=DEFAULT_TEXT)
     parser.add_argument("--timeout", type=float, default=90)
     parser.add_argument("--max-wer", type=float, default=0.25)
     args = parser.parse_args()
-    asyncio.run(check(mode=args.stt, text=args.text, timeout=args.timeout, max_wer=args.max_wer))
+    asyncio.run(
+        check(
+            mode=args.stt,
+            text=args.text,
+            timeout=args.timeout,
+            max_wer=args.max_wer,
+            tts_transport=args.tts,
+        )
+    )

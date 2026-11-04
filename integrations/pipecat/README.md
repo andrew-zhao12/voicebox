@@ -27,7 +27,11 @@ backend/venv/bin/python -m backend.keys create --id pipecat-agent --role client 
 The server's global realtime session limit defaults to four; increase
 `VOICEBOX_REALTIME_MAX_SESSIONS` on the server for more simultaneous realtime calls.
 Warm models before accepting calls. Batch STT consumes one inference request per
-utterance; speech consumes one per sentence. Realtime STT holds one socket per call.
+utterance; HTTP speech consumes one per sentence and WebSocket speech one per
+flushed phrase. Realtime STT holds one socket per call. WebSocket TTS adds one
+speech socket, so a call using both consumes **two** of the client's shared
+`max_realtime_sessions` allowance. Speech sockets also count against the server's
+`VOICEBOX_SPEECH_MAX_SESSIONS` limit (default four).
 
 From `integrations/pipecat`, with the integration environment active:
 
@@ -49,6 +53,14 @@ an LLM account, use `export VOICEBOX_LLM=echo`; it answers “You said: …”.
 | `VOICEBOX_CLIENT_KEY` | required | Dedicated Voicebox client key; never the server's `VOICEBOX_API_KEY` |
 | `VOICEBOX_VOICE` | `af_heart` | Preset voice or cloned profile ID/name from `/v1/voices` |
 | `VOICEBOX_TTS_MODEL` | `tts-1` | Voice's own engine, or an explicit compatible engine |
+| `VOICEBOX_TTS_TRANSPORT` | `http` | `http` sentence synthesis or `websocket` incremental phrase synthesis |
+| `VOICEBOX_PRONUNCIATIONS_FILE` | unset | JSON object of literal whole-term replacements, e.g. `{"API":"A P I"}` |
+| `VOICEBOX_TTS_SPEED` | server default | Speech rate, 0.25–4 |
+| `VOICEBOX_TTS_INSTRUCTIONS` | unset | Engine-supported delivery instructions, at most 500 characters |
+| `VOICEBOX_FIRST_CHUNK_CHARS` | server default | Backend first audio chunk text budget, 20–1000 characters |
+| `VOICEBOX_MAX_CHUNK_CHARS` | server default | Backend subsequent chunk text budget, 100–5000 characters |
+| `VOICEBOX_TEXT_FLUSH_CHARS` | `120` | WebSocket only: flush at a word boundary near this many characters, 20–1000 |
+| `VOICEBOX_TTS_TIMEOUT` | `120` | WebSocket only: seconds allowed for speech progress, 1–1800 |
 | `VOICEBOX_STT_MODEL` | `whisper-1` | Server's current Whisper model, or a specific Whisper model |
 | `VOICEBOX_STT_REALTIME` | `1` | `1`: GA transcription WebSocket; `0`: one HTTP WAV upload per utterance |
 | `VOICEBOX_LANGUAGE` | `en` | Pipecat language code |
@@ -83,6 +95,36 @@ transport, even though Pipecat's shared CLI lists other transports.
   context stays open during that wait; empty responses, malformed PCM, and HTTP
   errors produce pipeline errors and close the context promptly.
 
+For incremental input, set `VOICEBOX_TTS_TRANSPORT=websocket`. The optional
+`VoiceboxStreamingTTSService` in `streaming_tts.py` uses Pipecat's **token**
+aggregation, flushes at sentence punctuation or the configured phrase length,
+and flushes the final remainder at the LLM response boundary. It can start audio
+while the LLM is still producing a sentence. Text is held locally until each
+phrase can be appended and flushed atomically; Voicebox only synthesizes flushed
+text. A long word is split only at the 1000-character safety bound.
+
+The adapter keeps at most four 1000-character phrases outstanding, under the
+server's shared 10000-character buffer limit. It limits audio queued ahead of SDK
+playback to 64 frames and fails a consumer stalled for five seconds. Interruptions
+cancel the affected flush IDs and discard their unsent text, preserving explicitly
+uninterruptible SDK speech contexts. A backend chunk already executing may finish.
+Connection loss, invalid audio, and partial synthesis failures fail the pipeline;
+submitted text is never replayed. Idle sockets may reconnect for subsequent work.
+Both transports output PCM16 mono at 24 kHz and close their resources at teardown.
+
+`VoiceboxTTSService.Settings` and `VoiceboxStreamingTTSService.Settings` support
+Pipecat `TTSUpdateSettingsFrame` updates for model, voice, language, speed,
+instructions, pronunciation replacements, and backend chunk sizes. Streaming
+settings are snapshotted per LLM turn; `text_flush_chars` sets its phrase budget.
+Pronunciation maps allow at most 100 entries, keys of 128 characters, values of
+256 characters, and 8192 total characters. Matches are evaluated within a phrase;
+keep multiword replacement terms away from a forced phrase boundary.
+
+HTTP remains the default: phrase size trades startup latency against prosody and
+inference request volume. Validate voices and phrase budgets for your workload
+before changing it. HTTP accepts backend chunk controls, but rejects the two
+WebSocket-only environment settings instead of silently ignoring them.
+
 ## Checks
 
 Contract tests run without Voicebox, model downloads, or external services. They
@@ -101,6 +143,7 @@ actual services without a browser or paid LLM:
 ```sh
 python smoke.py                     # TTS -> batch STT and realtime STT
 python smoke.py --stt realtime      # or --stt batch
+python smoke.py --tts websocket --stt both
 ```
 
 The smoke synthesizes a sentence with the adapter, passes it through Pipecat's
@@ -115,6 +158,7 @@ it for a content check. It uses an available local port and stops its own worker
 ```sh
 python e2e.py --stt realtime
 python e2e.py --stt batch
+python e2e.py --tts websocket --stt realtime
 ```
 
 Use `--out-dir /path/to/results` to retain WAV recordings and worker logs. These

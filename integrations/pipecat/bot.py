@@ -1,6 +1,7 @@
 """Run a browser voice agent with Voicebox speech: python bot.py -t webrtc."""
 
 import os
+import re
 from dataclasses import dataclass, field
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -28,6 +29,8 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
 from services import SAMPLE_RATE, VoiceboxTTSService, api_url, require_key, voicebox_stt
+from streaming_tts import VoiceboxStreamingTTSService
+from tts_settings import VoiceboxTTSSettings, complete_settings, pronunciation_file
 
 GREETING = "Hello! I'm a voice assistant. How can I help you today?"
 INSTRUCTIONS = (
@@ -44,6 +47,9 @@ class Settings:
     voicebox_key: str = field(repr=False)
     voice: str = "af_heart"
     tts_model: str = "tts-1"
+    tts_transport: str = "http"
+    tts_settings: VoiceboxTTSSettings | None = None
+    tts_timeout: float = 120
     stt_model: str = "whisper-1"
     language: str = "en"
     realtime: bool = True
@@ -70,11 +76,46 @@ class Settings:
         stt_mode = os.getenv("VOICEBOX_STT_REALTIME", "1").strip().lower()
         if stt_mode not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
             raise ValueError("VOICEBOX_STT_REALTIME must be 1 or 0")
+        tts_transport = os.getenv("VOICEBOX_TTS_TRANSPORT", "http").strip().lower()
+        if tts_transport not in {"http", "websocket"}:
+            raise ValueError("VOICEBOX_TTS_TRANSPORT must be http or websocket")
+        if tts_transport == "http" and (
+            os.getenv("VOICEBOX_TEXT_FLUSH_CHARS") or os.getenv("VOICEBOX_TTS_TIMEOUT")
+        ):
+            raise ValueError(
+                "VOICEBOX_TEXT_FLUSH_CHARS and VOICEBOX_TTS_TIMEOUT require websocket TTS"
+            )
+        tts_settings = complete_settings(
+            os.getenv("VOICEBOX_TTS_MODEL", "tts-1"),
+            os.getenv("VOICEBOX_VOICE", "af_heart"),
+            VoiceboxTTSSettings(
+                speed=float(os.environ["VOICEBOX_TTS_SPEED"])
+                if os.getenv("VOICEBOX_TTS_SPEED")
+                else None,
+                instructions=os.getenv("VOICEBOX_TTS_INSTRUCTIONS") or None,
+                pronunciation_replacements=pronunciation_file(
+                    os.getenv("VOICEBOX_PRONUNCIATIONS_FILE")
+                ),
+                first_chunk_chars=int(os.environ["VOICEBOX_FIRST_CHUNK_CHARS"])
+                if os.getenv("VOICEBOX_FIRST_CHUNK_CHARS")
+                else None,
+                max_chunk_chars=int(os.environ["VOICEBOX_MAX_CHUNK_CHARS"])
+                if os.getenv("VOICEBOX_MAX_CHUNK_CHARS")
+                else None,
+                text_flush_chars=int(os.getenv("VOICEBOX_TEXT_FLUSH_CHARS", "120")),
+            ),
+        )
+        tts_timeout = float(os.getenv("VOICEBOX_TTS_TIMEOUT", "120"))
+        if not 1 <= tts_timeout <= 1800:
+            raise ValueError("VOICEBOX_TTS_TIMEOUT must be between 1 and 1800 seconds")
         return cls(
             voicebox_url=url,
             voicebox_key=key,
             voice=os.getenv("VOICEBOX_VOICE", "af_heart"),
             tts_model=os.getenv("VOICEBOX_TTS_MODEL", "tts-1"),
+            tts_transport=tts_transport,
+            tts_settings=tts_settings,
+            tts_timeout=tts_timeout,
             stt_model=os.getenv("VOICEBOX_STT_MODEL", "whisper-1"),
             language=os.getenv("VOICEBOX_LANGUAGE", "en"),
             realtime=stt_mode in {"1", "true", "yes", "on"},
@@ -100,7 +141,9 @@ class EchoLLM(FrameProcessor):
             if isinstance(text, list):
                 text = " ".join(p.get("text", "") for p in text if p.get("type") == "text")
             await self.push_frame(LLMFullResponseStartFrame())
-            await self.push_frame(LLMTextFrame(f"You said: {text}"))
+            # Exercise incremental text in the local smoke just as an LLM streams tokens.
+            for token in re.findall(r"\S+\s*", f"You said: {text}"):
+                await self.push_frame(LLMTextFrame(token))
             await self.push_frame(LLMFullResponseEndFrame())
         else:
             await self.push_frame(frame, direction)
@@ -117,6 +160,20 @@ class ChatService(OpenAILLMService):
             await super().cleanup()
 
 
+def voicebox_tts(settings: Settings):
+    """Select speech transport explicitly; HTTP remains the default."""
+    options = dict(
+        api_key=settings.voicebox_key,
+        base_url=settings.voicebox_url,
+        voice=settings.voice,
+        model=settings.tts_model,
+        settings=settings.tts_settings,
+    )
+    if settings.tts_transport == "websocket":
+        return VoiceboxStreamingTTSService(**options, timeout=settings.tts_timeout)
+    return VoiceboxTTSService(**options)
+
+
 def build_pipeline(transport: BaseTransport, settings: Settings) -> Pipeline:
     """Build local VAD -> Voicebox STT -> conversation -> Voicebox TTS."""
     stt = voicebox_stt(
@@ -126,12 +183,7 @@ def build_pipeline(transport: BaseTransport, settings: Settings) -> Pipeline:
         language=settings.language,
         realtime=settings.realtime,
     )
-    tts = VoiceboxTTSService(
-        api_key=settings.voicebox_key,
-        base_url=settings.voicebox_url,
-        voice=settings.voice,
-        model=settings.tts_model,
-    )
+    tts = voicebox_tts(settings)
     llm = (
         EchoLLM()
         if settings.echo

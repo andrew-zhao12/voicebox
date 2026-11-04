@@ -1,15 +1,17 @@
 """Pipecat speech services using Voicebox's OpenAI-compatible HTTP and WebSocket APIs."""
 
 from collections.abc import AsyncGenerator
+from copy import deepcopy
 from urllib.parse import urlsplit, urlunsplit
 
 from openai import AsyncOpenAI
 from pipecat.frames.frames import ErrorFrame, Frame, TranscriptionFrame, TTSAudioRawFrame
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.openai.stt import OpenAIRealtimeSTTService, OpenAISTTService
-from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 from pipecat.transcriptions.language import Language
+
+from tts_settings import VoiceboxTTSSettings, complete_settings, speech_options, validate_settings
 
 SAMPLE_RATE = 24000
 
@@ -42,6 +44,8 @@ class VoiceboxTTSService(TTSService):
     sentence aggregation, audio contexts, interruption handling, and metrics.
     """
 
+    Settings = VoiceboxTTSSettings
+
     def __init__(
         self,
         *,
@@ -49,6 +53,7 @@ class VoiceboxTTSService(TTSService):
         base_url: str,
         voice: str = "af_heart",
         model: str = "tts-1",
+        settings: VoiceboxTTSSettings | None = None,
     ):
         """Create a service with explicit Voicebox credentials and its fixed PCM rate."""
         api_key = require_key(api_key)
@@ -60,11 +65,17 @@ class VoiceboxTTSService(TTSService):
             push_stop_frames=True,
             # Queued or cold synthesis can exceed Pipecat's three-second idle default.
             stop_frame_timeout_s=130,
-            settings=TTSSettings(model=model, voice=voice, language=None),
+            settings=complete_settings(model, voice, settings),
         )
         self._client = AsyncOpenAI(
             api_key=api_key, base_url=api_url(base_url), timeout=120, max_retries=0
         )
+
+    async def _update_settings(self, delta):
+        candidate = deepcopy(self._settings)
+        candidate.apply_update(delta)
+        validate_settings(candidate)
+        return await super()._update_settings(delta)
 
     def can_generate_metrics(self) -> bool:
         """Expose Pipecat's time-to-first-byte and usage measurements."""
@@ -86,6 +97,7 @@ class VoiceboxTTSService(TTSService):
                 voice=self._settings.voice,
                 input=text,
                 response_format="pcm",
+                extra_body=speech_options(self._settings),
             ) as response:
                 await self.start_tts_usage_metrics(text)
                 # A 100 ms chunk keeps frames aligned without buffering whole sentences.
