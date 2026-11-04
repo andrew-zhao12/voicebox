@@ -1,6 +1,6 @@
 # Voicebox Project Status & Roadmap
 
-> Last updated: 2026-09-27 | Current version: **v0.5.0** | 402 open issues | 88 open PRs | 1.3M downloads · 34.8k stars
+> Repository snapshot updated: 2026-11-03 | Current version: **v0.5.0**. Upstream issue, PR, and download counts below are historical snapshots, not current queue state.
 
 ---
 
@@ -143,9 +143,7 @@ Revalidated 2026-11-03 with LiveKit Agents/OpenAI plugin 1.8.10 on Python 3.12 a
 Still open on this track:
 - Measurements beyond Kokoro: time to first audio for Qwen, Chatterbox and LuxTTS on a GPU, and how many simultaneous calls one replica carries (serial queue, one Whisper slot).
 - A custom `livekit-plugins-voicebox` package (optional): it could send `language`, `max_chunk_chars` and `first_chunk_chars`, pipeline sentences, and avoid replaying a sentence after a mid-stream failure.
-- An incremental-text TTS WebSocket, so agents can stream LLM tokens instead of one HTTP request per sentence.
-- `prompt` and keyterms passed to Whisper (accepted and echoed on the socket, ignored on uploads).
-- Confidences and word timings in realtime events.
+- Recognition confidence reporting across runtimes. Word timings and vocabulary hints are implemented where the selected backend supports them (see the speech additions below).
 - `tts_chars` is not refunded when a job is abandoned before its first chunk.
 - Realtime finals survive a shutdown only with `VOICEBOX_SHUTDOWN_DELAY_S` above 0; without it uvicorn closes the sockets first (needs `lifecycle.py` work). A `uploads_bytes` rate-limit close does not flush finals either.
 - Each realtime reconnect (idle close, LiveKit's 10-minute refresh) costs one `inference`.
@@ -158,6 +156,16 @@ Still open on this track:
 `integrations/pipecat/` adds a browser voice agent on Pipecat 1.15.0, with SmallWebRTC transport, local Silero VAD, realtime or batch Voicebox transcription, streaming speech, and an OpenAI-compatible chat provider or local echo mode. The TTS adapter accepts arbitrary Voicebox preset/cloned voices and streams 24 kHz PCM; thin STT adapters identify completed utterances and close HTTP clients. The worker uses its own Python 3.11+ environment and dedicated Voicebox client key. Guide: `docs/content/docs/integrations/pipecat.mdx`.
 
 Validation on Apple Silicon with Kokoro and MLX Whisper Base: the speech roundtrip passed in both modes with zero word errors; `e2e.py` also passed a complete WebRTC greeting and echo conversation in each mode, with zero word errors and reply latency of 1.057 s realtime and 1.078 s batch. These are one-session local checks with an echo LLM, not capacity measurements. Server-free tests cover credentials, PCM framing, cancellation, transcription protocols, and TTS lifecycle behavior; CI runs LiveKit and Pipecat checks in separate dependency environments. Public signaling authentication, deployed WebRTC connectivity, GPU capacity, telephony, and real-LLM validation remain deployment work.
+
+### Speech API and runtime additions (2026-11-03)
+
+- **Optional STT runtimes:** faster-whisper/CTranslate2 exposes five Whisper sizes, and an isolated Transformers 5 runtime serves native cached Nemotron English and multilingual streaming. Existing MLX/PyTorch Whisper remains the default. Registry metadata includes actual languages and supported streaming, hint, and timing capabilities.
+- **Incremental TTS:** `WS /v1/audio/speech/stream` accepts text appends, explicit ordered flushes, and cancellation. It uses the existing synthesis queue, client auth, bounded buffers, and shared per-key live-session limits. `scripts/speech_client.py` demonstrates the protocol.
+- **Speech control:** upload and realtime transcription pass prompts/hotwords to supporting backends and can return actual word alignments. HTTP and WebSocket speech accept literal pronunciation dictionaries and charge expanded spoken text.
+- **Benchmark tooling:** `scripts/speech_benchmark.py` records WER/CER, latency, first PCM payload, real-time factor, concurrency/error rates, cancellation, and optional server metrics. It keeps real and synthetic recordings separate. Main-process PyTorch allocator metrics exclude CTranslate2 and the isolated Nemotron worker.
+- **Validation:** full English Nemotron, faster-whisper Base, PyTorch Whisper, MLX Whisper, and the speech socket passed local CPU/Apple Silicon checks. The multilingual architecture passed small-model API/cache/parity tests; its full checkpoint was not evaluated. Human-speech, lifecycle, and interruption results are in [the validation record](walkthroughs/09-speech-validation.md).
+
+Remaining deployment evidence includes CUDA execution, representative noisy/telephone/multilingual recordings, full multilingual checkpoint accuracy, and capacity limits on the intended hardware. Shared Postgres/object-storage/queue state remains deferred. The [benchmark walkthrough](walkthroughs/08-speech-benchmarks.md) provides the repeatable measurement path.
 
 ### What's Shipped (v0.5.0 — the Capture release)
 

@@ -425,7 +425,7 @@ Live transcription streams the caller's audio to `/v1/realtime?intent=transcript
 | **Windows / Linux auto-paste**     | Dictation paste parity — `SendInput` on Windows, `uinput` / AT-SPI on Linux |
 | **STT engine expansion**           | Parakeet v3 and Qwen3-ASR joining Whisper — 50+ languages, better non-English quality |
 | **Pipeline routing**               | Configurable source → transform → sink chains with webhook + MCP sinks and a preset editor |
-| **Streaming transcription**        | WebSocket `/transcribe/stream` for partial transcripts as you speak      |
+| **GPU deployment validation**     | Measure speech quality, latency, memory, and concurrent calls on deployment hardware |
 | **End-to-end speech LLMs**         | Moshi, GLM-4-Voice, Qwen2.5 Omni — real voice-to-voice, no text between  |
 | **Voice Design**                   | Create new voices from text descriptions                                 |
 | **Long-form capture**              | Dual-stream recorder (mic + system audio) with summary LLM transform     |
