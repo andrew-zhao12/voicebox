@@ -29,3 +29,4 @@ backend/tests/test_task_queue_caps.py
 backend/tests/test_task_queue_concurrency.py
 backend/tests/test_task_queue_lanes.py
 backend/tests/test_wav_stream.py
+backend/tests/test_speech_benchmark.py

@@ -75,3 +75,5 @@ backend/voices.py
 integrations/livekit
 integrations/pipecat
 scripts/realtime_client.py
+scripts/speech_benchmark.py
+backend/tests/test_speech_benchmark.py

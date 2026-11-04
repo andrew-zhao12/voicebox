@@ -43,9 +43,7 @@ async def run(args: argparse.Namespace) -> int:
     settled = asyncio.Event()  # set whenever pending becomes empty
     started = time.monotonic()
 
-    async with websockets.connect(
-        url, additional_headers={"Authorization": f"Bearer {args.key}"}
-    ) as socket:
+    async with websockets.connect(url, additional_headers={"Authorization": f"Bearer {args.key}"}) as socket:
         print("<", json.loads(await socket.recv())["type"])
         session = {
             "input_sample_rate": int(rate),
@@ -55,9 +53,7 @@ async def run(args: argparse.Namespace) -> int:
             },
             "turn_detection": None if args.no_vad else {"type": "server_vad"},
         }
-        await socket.send(
-            json.dumps({"type": "transcription_session.update", "session": session})
-        )
+        await socket.send(json.dumps({"type": "transcription_session.update", "session": session}))
 
         async def reader() -> None:
             async for message in socket:
@@ -67,9 +63,7 @@ async def run(args: argparse.Namespace) -> int:
                     print(event["delta"], end="", flush=True)
                 elif kind.endswith(("transcription.completed", "transcription.failed")):
                     if kind.endswith("completed"):
-                        print(
-                            f"\n< completed [{event['item_id']}]: {event['transcript']}"
-                        )
+                        print(f"\n< completed [{event['item_id']}]: {event['transcript']}")
                         transcripts.append(event["transcript"])
                     else:
                         print(f"\n< failed [{event['item_id']}]: {event['error']}")
@@ -86,11 +80,7 @@ async def run(args: argparse.Namespace) -> int:
                     print(
                         "<",
                         kind,
-                        {
-                            k: v
-                            for k, v in event.items()
-                            if k not in ("type", "session")
-                        },
+                        {k: v for k, v in event.items() if k not in ("type", "session")},
                     )
 
         reader_task = asyncio.create_task(reader())
@@ -112,9 +102,7 @@ async def run(args: argparse.Namespace) -> int:
             try:
                 await asyncio.wait_for(settled.wait(), timeout=args.wait)
             except TimeoutError:
-                print(
-                    f"\n! gave up after {args.wait:.0f} s with {len(pending)} utterance(s) still pending"
-                )
+                print(f"\n! gave up after {args.wait:.0f} s with {len(pending)} utterance(s) still pending")
         reader_task.cancel()
     print(f"\n{len(transcripts)} utterance(s) in {time.monotonic() - started:.1f} s")
     return 0 if transcripts else 1
@@ -127,9 +115,7 @@ def main() -> int:
     parser.add_argument("--key", required=True)
     parser.add_argument("--model", default="whisper-1")
     parser.add_argument("--language", default=None)
-    parser.add_argument(
-        "--no-vad", action="store_true", help="manual turn: commit once at the end"
-    )
+    parser.add_argument("--no-vad", action="store_true", help="manual turn: commit once at the end")
     parser.add_argument(
         "--speed",
         type=float,

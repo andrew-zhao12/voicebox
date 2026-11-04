@@ -1,0 +1,2 @@
+# Standalone speech clients and benchmarks use the backend's Python conventions.
+extend = "../backend/pyproject.toml"

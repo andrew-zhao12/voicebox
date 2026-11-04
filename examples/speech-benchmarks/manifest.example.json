@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "name": "my-real-speech-corpus-with-synthetic-control",
+  "audio": [
+    {
+      "id": "real-clear-001",
+      "path": "recordings/real-clear-001.wav",
+      "source": "real",
+      "language": "en",
+      "text": "Replace this sentence with the exact words in your recording."
+    },
+    {
+      "id": "real-noisy-001",
+      "path": "recordings/real-noisy-001.wav",
+      "source": "real",
+      "language": "en",
+      "text": "Replace this sentence with the exact words in your noisy recording."
+    },
+    {
+      "id": "synthetic-control-001",
+      "path": "recordings/synthetic-control-001.wav",
+      "source": "synthetic",
+      "language": "en",
+      "text": "Our meeting begins at nine tomorrow morning."
+    }
+  ],
+  "tts": [
+    {
+      "id": "short-reply",
+      "model": "kokoro",
+      "voice": "af_heart",
+      "text": "Our meeting begins at nine tomorrow morning."
+    },
+    {
+      "id": "long-reply",
+      "model": "kokoro",
+      "voice": "af_heart",
+      "text": "The first part of this deliberately long answer describes how the meeting will begin, including introductions and a brief review of the questions that everyone brought with them. The second part explains how the group will compare the available options and record the reasons for each decision before moving to the next topic. The final part sets aside enough time for questions, assigns each follow-up task to one person, and confirms when the group will meet again to review the results."
+    }
+  ]
+}
