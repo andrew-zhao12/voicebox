@@ -585,6 +585,95 @@ def test_manual_turns_and_the_thirty_second_cap():
     assert session.buffered_ms == 0
 
 
+@pytest.mark.parametrize("sample_rate", [16000, 24000, 48000])
+def test_manual_silent_pcm_does_not_schedule_background_partials(sample_rate):
+    session = TranscriptionSession(SessionConfig(input_sample_rate=sample_rate, vad=False))
+    packet = bytes(sample_rate * 20 // 1000 * 2)
+    for _ in range(500):
+        assert session.append(packet) == []
+        assert session.take_work() == []
+    assert 9900 <= session.buffered_ms <= 10000
+
+
+def test_manual_partials_accept_quiet_pcm_and_wait_for_new_signal():
+    session = _session(vad=False, threshold=1.0)
+    # One PCM16 quantization step is far below the server VAD speech threshold.
+    quiet = tone(1.0, 16000, amplitude=2 / 32768)
+    assert _events_of(session, quiet) == []
+    [first] = session.take_work()
+    assert first.kind == "partial"
+    assert np.max(np.abs(first.audio)) == 1 / 32768
+
+    assert _events_of(session, np.zeros(2 * 16000, dtype=np.float32)) == []
+    assert session.take_work() == []
+    assert _events_of(session, quiet) == []
+    [second] = session.take_work()
+    assert second.kind == "partial"
+    assert second.item_id == first.item_id
+    assert second.audio.size == 4 * 16000
+    assert np.count_nonzero(second.audio) == 2 * np.count_nonzero(first.audio)
+
+    session.commit()
+    [final] = session.take_work()
+    assert final.kind == "final"
+    np.testing.assert_array_equal(final.audio, second.audio)
+
+
+def test_manual_commit_still_transcribes_all_buffered_silent_pcm():
+    session = _session(vad=False)
+    assert session.append(bytes(16000 * 2)) == []
+    assert session.take_work() == []
+    assert strip(session.commit()) == [
+        {"type": "input_audio_buffer.committed", "item_id": "item_1", "previous_item_id": None}
+    ]
+    [final] = session.take_work()
+    assert final.kind == "final"
+    assert final.audio.size == 16000
+    assert not np.any(final.audio)
+    assert session.pending_finals == 1
+    assert session.final_text(final.item_id, "")[-1]["usage"] == {"type": "duration", "seconds": 1.0}
+    assert session.pending_finals == 0
+
+
+def test_automatic_caps_complete_silent_pcm_without_inference_and_keep_item_chain():
+    session = _session(vad=False)
+    events = []
+    for _ in range(49):
+        events.extend(session.append(bytes(16000 * 2)))
+        assert session.take_work() == []
+    assert [event["type"] for event in events] == [
+        "input_audio_buffer.speech_stopped",
+        "input_audio_buffer.committed",
+        rt.COMPLETED_EVENT,
+    ] * 2
+    for index in range(2):
+        stopped, committed, completed = events[index * 3 : index * 3 + 3]
+        item_id = f"item_{index + 1}"
+        assert stopped["item_id"] == committed["item_id"] == completed["item_id"] == item_id
+        assert committed["previous_item_id"] == ("item_1" if index else None)
+        assert completed["transcript"] == ""
+        assert completed["usage"] == {"type": "duration", "seconds": rt.SOFT_CAP_S}
+    assert session.pending_finals == 0
+    assert session.buffered_ms == 1000
+
+    _events_of(session, tone(0.3, 16000))
+    [committed] = session.commit()
+    assert committed["item_id"] == "item_3"
+    assert committed["previous_item_id"] == "item_2"
+    [final] = session.take_work()
+    assert final.kind == "final"
+    assert final.audio.size == 20800
+    assert np.any(final.audio)
+
+
+def test_clear_resets_manual_signal_detection():
+    session = _session(vad=False)
+    _events_of(session, tone(0.3, 16000))
+    session.clear()
+    assert session.append(bytes(16000 * 2)) == []
+    assert session.take_work() == []
+
+
 def test_failed_and_error_events():
     session = _session()
     assert session.failed("item_9", "busy", "Whisper is busy")[0]["type"] == rt.FAILED_EVENT

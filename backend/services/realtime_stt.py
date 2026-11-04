@@ -434,6 +434,8 @@ class _Utterance:
     samples: int = 0
     start_ms: int = 0
     since_partial: int = 0  # samples added since the last partial was cut
+    has_signal: bool = False
+    signal_since_partial: bool = False
     quiet_frames: int = 0  # consecutive non-speech frames at the tail
     agreement: LocalAgreement = field(default_factory=LocalAgreement)
 
@@ -570,6 +572,12 @@ class TranscriptionSession:
         utterance.audio.append(frame)
         utterance.samples += frame.size
         utterance.since_partial += frame.size
+        # A client with its own VAD may keep sending zero-filled microphone frames.
+        # Do not apply the server's speech threshold to these manual turns: even
+        # very quiet nonzero PCM must remain eligible for transcription.
+        signal = bool(np.any(frame))
+        utterance.has_signal |= signal
+        utterance.signal_since_partial |= signal
         utterance.quiet_frames = 0 if speech else utterance.quiet_frames + 1
         events: list[dict] = []
         at_pause = utterance.quiet_frames * FRAME_MS >= 60 and utterance.samples >= SOFT_CAP_S * TARGET_RATE
@@ -579,7 +587,7 @@ class TranscriptionSession:
             events.append(
                 _event("input_audio_buffer.speech_stopped", item_id=utterance.item_id, audio_end_ms=self._total_ms)
             )
-            events.extend(self._finish_utterance())
+            events.extend(self._finish_utterance(skip_silence=not self.config.vad))
             if not self.config.vad:
                 self._utterance = _Utterance(item_id=self._new_id(), start_ms=self._total_ms)
             else:
@@ -589,6 +597,9 @@ class TranscriptionSession:
         interval = self.config.partial_interval_ms * TARGET_RATE // 1000
         if utterance.since_partial >= interval:
             utterance.since_partial = 0
+            if not self.config.vad and not utterance.signal_since_partial:
+                return events
+            utterance.signal_since_partial = False
             self._queue(
                 Work(
                     "partial",
@@ -603,7 +614,7 @@ class TranscriptionSession:
             )
         return events
 
-    def _finish_utterance(self, trim_samples: int = 0) -> list[dict]:
+    def _finish_utterance(self, trim_samples: int = 0, *, skip_silence: bool = False) -> list[dict]:
         utterance = self._utterance
         self._utterance = None
         if utterance is None or utterance.samples == 0:
@@ -612,6 +623,11 @@ class TranscriptionSession:
         self.work = [w for w in self.work if not (w.kind == "partial" and w.item_id == utterance.item_id)]
         previous, self._last_committed = self._last_committed, utterance.item_id
         committed = _event("input_audio_buffer.committed", item_id=utterance.item_id, previous_item_id=previous)
+        if skip_silence and not utterance.has_signal:
+            # Automatic caps must not turn a silent mic into a hallucinated turn.
+            # Explicit commits still send every buffered sample to the transcriber.
+            self._finals[utterance.item_id] = (utterance.agreement, utterance.samples / TARGET_RATE)
+            return [committed, *self.final_text(utterance.item_id, "")]
         if len(self._finals) >= MAX_PENDING_FINALS:
             message = f"{MAX_PENDING_FINALS} utterances of this session are already waiting for Whisper"
             return [committed, *self.failed(utterance.item_id, "whisper_busy", message)]
