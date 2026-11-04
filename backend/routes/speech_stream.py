@@ -10,6 +10,7 @@ import os
 import uuid
 from collections import deque
 from dataclasses import dataclass
+from time import perf_counter
 
 from fastapi import APIRouter, HTTPException, WebSocket
 
@@ -17,6 +18,8 @@ from .. import lifecycle, models
 from ..auth import Principal, charge, get_principal
 from ..auth.ratelimit import RateLimited
 from ..database import get_db
+from ..observability import metrics
+from ..observability.trace import flush_id_var, session_id_var
 from ..services import generation as generation_service, live_sessions, profiles
 from ..services.speech_stream import (
     MAX_PENDING_FLUSHES,
@@ -38,6 +41,35 @@ MAX_OUTBOUND_MESSAGES = 16
 PCM_CHUNK_BYTES = 4800
 SEND_TIMEOUT_S = 5.0
 STOP_POLL_S = 0.25
+ERROR_CODES = frozenset(
+    {
+        "server_shutting_down",
+        "session_limit_reached",
+        "message_too_large",
+        "invalid_message",
+        "invalid_json",
+        "invalid_session",
+        "invalid_text",
+        "text_limit_exceeded",
+        "invalid_flush_id",
+        "duplicate_flush_id",
+        "flush_limit_exceeded",
+        "pending_limit_exceeded",
+        "empty_text",
+        "flush_not_pending",
+        "unknown_event",
+        "rate_limit_exceeded",
+        "synthesis_failed",
+        "voice_engine_mismatch",
+        "invalid_value",
+        "http_400",
+        "http_404",
+        "http_422",
+        "http_429",
+        "http_500",
+        "http_503",
+    }
+)
 
 
 def _setting(name: str, default: float, minimum: float) -> float:
@@ -70,6 +102,15 @@ class _End:
     close_code: int = 1000
 
 
+@dataclass
+class _FlushTrace:
+    """Keep metrics pending until a terminal event is actually handed to the transport."""
+
+    accepted_at: float
+    first_audio_sent: bool = False
+    job_id: str | None = None
+
+
 def error_event(code: str, message: str, *, flush_id: str | None = None, retry_after_s: int | None = None) -> dict:
     """Create an explicit protocol error, optionally identifying one failed flush."""
     event = {"type": "error", "error": {"code": code, "message": message}}
@@ -96,13 +137,68 @@ class _Connection:
         self.outbound = asyncio.Queue(maxsize=MAX_OUTBOUND_MESSAGES)
         self.last_message = asyncio.get_running_loop().time()
         self.closing = False
+        self.session_id = str(uuid.uuid4())
+        self.flush_traces: dict[str, _FlushTrace] = {}
+        self.terminal_events: dict[str, dict] = {}
+
+    def log(self, event: str, *, flush_id: str | None = None, job_id: str | None = None) -> None:
+        """Log identifiers only; speech text, dictionaries, audio and errors stay out of traces."""
+        logger.info(
+            "Speech lifecycle: %s",
+            event,
+            extra={"event": event, "session_id": self.session_id, "flush_id": flush_id, "job_id": job_id},
+        )
+
+    async def _put(self, queue: asyncio.Queue, event: dict, direction: str) -> None:
+        if not queue.full():
+            queue.put_nowait(event)
+            return
+        started = perf_counter()
+        metrics.SPEECH_BACKPRESSURE.labels(direction).inc()
+        try:
+            await queue.put(event)
+        finally:
+            metrics.SPEECH_BACKPRESSURE_SECONDS.labels(direction).observe(perf_counter() - started)
 
     async def emit(self, event: dict) -> None:
-        await self.outbound.put(event)
+        if event["type"] == "error":
+            code = event["error"]["code"]
+            metrics.SPEECH_ERRORS.labels(code if code in ERROR_CODES else "other").inc()
+        await self._put(self.outbound, event, "outbound")
+
+    def _terminal_trace(self, flush_id: str, status: str) -> None:
+        trace = self.flush_traces.pop(flush_id, None)
+        self.terminal_events.pop(flush_id, None)
+        if trace is not None:
+            metrics.SPEECH_PENDING_FLUSHES.dec()
+            metrics.SPEECH_FLUSHES.labels(status).inc()
+            metrics.SPEECH_FLUSH_SECONDS.labels(status).observe(perf_counter() - trace.accepted_at)
+            self.log(f"speech.flush.{status}", flush_id=flush_id, job_id=trace.job_id)
+
+    def delivered(self, event: dict) -> None:
+        """Record transport delivery, keeping slow-reader failures distinct from completion."""
+        flush_id = event.get("flush_id")
+        trace = self.flush_traces.get(flush_id)
+        if trace is None:
+            return
+        kind = event["type"]
+        if kind == "audio.delta" and not trace.first_audio_sent:
+            trace.first_audio_sent = True
+            metrics.SPEECH_FIRST_AUDIO_SECONDS.observe(perf_counter() - trace.accepted_at)
+            self.log("speech.flush.first_audio", flush_id=flush_id, job_id=trace.job_id)
+        elif self.terminal_events.get(flush_id) is event:
+            status = {"audio.done": "completed", "audio.cancelled": "cancelled", "error": "failed"}[kind]
+            self._terminal_trace(flush_id, status)
+
+    def abandon_traces(self) -> None:
+        """Settle each accepted flush once when its socket leaves without terminal delivery."""
+        for flush_id in list(self.flush_traces):
+            self._terminal_trace(flush_id, "abandoned")
 
     async def finish(self, flush: Flush, event: dict) -> None:
         """Keep accepted work tracked until its terminal event has entered the send queue."""
         await self.emit(event)
+        self.terminal_events[flush.flush_id] = event
         self.buffer.finish(flush)
         self.unsettled.pop(flush.flush_id, None)
 
@@ -110,11 +206,11 @@ class _Connection:
         try:
             while True:
                 message = await self.websocket.receive()
-                await self.inbound.put(message)
+                await self._put(self.inbound, message, "inbound")
                 if message["type"] == "websocket.disconnect":
                     return
         except Exception:
-            await self.inbound.put({"type": "websocket.disconnect"})
+            await self._put(self.inbound, {"type": "websocket.disconnect"}, "inbound")
 
     async def sender(self) -> None:
         while True:
@@ -122,6 +218,10 @@ class _Connection:
             try:
                 async with asyncio.timeout(SEND_TIMEOUT_S):
                     await self.websocket.send_json(event)
+                self.delivered(event)
+            except TimeoutError:
+                metrics.SPEECH_SEND_TIMEOUTS.inc()
+                raise
             finally:
                 self.outbound.task_done()
 
@@ -190,6 +290,10 @@ class _Connection:
             flush = self.buffer.prepare(payload.get("flush_id"))
             charge("inference")
             self.buffer.commit(flush)
+            self.flush_traces[flush.flush_id] = _FlushTrace(perf_counter())
+            metrics.SPEECH_PENDING_FLUSHES.inc()
+            metrics.SPEECH_FLUSHES.labels("accepted").inc()
+            self.log("speech.flush.accepted", flush_id=flush.flush_id)
             self.unsettled[flush.flush_id] = flush
             self.pending.append(flush)
             await self.emit({"type": "input_text.flushed", "flush_id": flush.flush_id})
@@ -285,6 +389,7 @@ class _Connection:
         frames = None
         encoded = None
         finished = False
+        trace_token = flush_id_var.set(flush.flush_id)
         try:
             with contextlib.closing(get_db()) as database:
                 db = next(database)
@@ -308,6 +413,10 @@ class _Connection:
                 opened = await generation_service.open_stream(
                     stream_data, db, self.principal, voice=voice if isinstance(voice, profiles.PresetVoice) else None
                 )
+            trace = self.flush_traces.get(flush.flush_id)
+            if trace is not None:
+                trace.job_id = opened.session.job_id
+            self.log("speech.flush.started", flush_id=flush.flush_id, job_id=opened.session.job_id)
             await self.emit(
                 {
                     "type": "audio.started",
@@ -346,6 +455,7 @@ class _Connection:
                 await frames.aclose()
             if opened is not None and not finished:
                 generation_service.abandon_stream(opened.session)
+            flush_id_var.reset(trace_token)
 
 
 @router.websocket("/v1/audio/speech/stream")
@@ -354,18 +464,23 @@ async def speech_stream(websocket: WebSocket) -> None:
     principal = get_principal()
     await websocket.accept()
     if lifecycle.is_stopping():
+        metrics.SPEECH_ERRORS.labels("server_shutting_down").inc()
         await websocket.send_json(error_event("server_shutting_down", "the server is restarting; reconnect"))
         await websocket.close(code=1012, reason="server_shutting_down")
         return
     if not live_sessions.reserve(
         KIND, principal.key_id, per_key=principal.limits.max_realtime_sessions, max_global=max_sessions()
     ):
+        metrics.SPEECH_ERRORS.labels("session_limit_reached").inc()
         await websocket.send_json(
             error_event("session_limit_reached", "too many live speech/transcription sessions; retry later")
         )
         await websocket.close(code=1013, reason="session_limit_reached")
         return
     connection = _Connection(websocket, principal)
+    trace_token = session_id_var.set(connection.session_id)
+    if hasattr(websocket, "scope"):
+        websocket.scope.setdefault("state", {})["session_id"] = connection.session_id
     tasks = []
     end = None
     sender = None
@@ -374,7 +489,7 @@ async def speech_stream(websocket: WebSocket) -> None:
         await connection.emit(
             {
                 "type": "session.created",
-                "session_id": str(uuid.uuid4()),
+                "session_id": connection.session_id,
                 "session": connection.buffer.settings,
                 "audio_format": {"format": "pcm_s16le", "sample_rate": 24000, "channels": 1},
                 "limits": {
@@ -427,3 +542,5 @@ async def speech_stream(websocket: WebSocket) -> None:
                 async with asyncio.timeout(SEND_TIMEOUT_S):
                     await websocket.close(code=end.close_code, reason=end.reason)
         live_sessions.release(KIND, principal.key_id)
+        connection.abandon_traces()
+        session_id_var.reset(trace_token)

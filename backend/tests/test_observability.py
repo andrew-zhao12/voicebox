@@ -6,11 +6,14 @@ import json
 import logging
 
 import pytest
+from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from backend.auth.principal import KeyLimits, Principal, principal_var
 from backend.observability import logs, metrics
-from backend.observability.requestid import request_id_var
+from backend.observability.requestid import RequestIdMiddleware, current_request_id, request_id_var
+from backend.observability.trace import flush_id_var, job_id_var, session_id_var
 from backend.tests.security_testapp import build_test_app
 
 
@@ -159,3 +162,115 @@ def test_rate_limit_rejections_are_counted(tmp_path):
     assert client.get("/profiles", headers=bearer(key)).status_code == 429
     text = metrics.render()[0].decode()
     assert 'voicebox_rate_limited_total{dimension="requests"}' in text
+
+
+@pytest.mark.skipif(not metrics.ENABLED, reason="prometheus_client not installed")
+def test_socket_trace_covers_handshakes_transcription_and_fixed_close_labels(caplog):
+    app = FastAPI()
+    app.add_middleware(RequestIdMiddleware)
+    seen = []
+
+    @app.websocket("/v1/realtime")
+    async def socket(ws: WebSocket):
+        seen.append(current_request_id())
+        if ws.query_params.get("reject"):
+            await ws.close(code=1008, reason="Bearer SECRET")
+            return
+        await ws.accept()
+        await ws.receive_text()
+        # Arbitrary application/peer close text must not become a metric label.
+        await ws.close(code=1000, reason="user supplied secret reason")
+
+    def sample(name, **labels):
+        return metrics.REGISTRY.get_sample_value(name, labels) or 0
+
+    active = sample("voicebox_websocket_sessions", kind="transcription")
+    accepted = sample("voicebox_websocket_accepted_total", kind="transcription")
+    other = sample("voicebox_websocket_closed_total", kind="transcription", reason="other")
+    refused = sample("voicebox_websocket_closed_total", kind="transcription", reason="handshake_rejected")
+    with caplog.at_level(logging.INFO), TestClient(app) as client:
+        with client.websocket_connect("/v1/realtime?token=SECRET", headers={"X-Request-Id": "socket-123"}) as ws:
+            assert dict(ws.extra_headers)[b"x-request-id"] == b"socket-123"
+            assert sample("voicebox_websocket_sessions", kind="transcription") == active + 1
+            ws.send_text("PRIVATE TRANSCRIPT")
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_text()
+        with pytest.raises(WebSocketDisconnect), client.websocket_connect("/v1/realtime?reject=1"):
+            pass
+    assert seen[0] == "socket-123"
+    assert seen[1]
+    assert seen[1] != "socket-123"
+    assert current_request_id() is None
+    assert sample("voicebox_websocket_sessions", kind="transcription") == active
+    assert sample("voicebox_websocket_accepted_total", kind="transcription") == accepted + 1
+    assert sample("voicebox_websocket_closed_total", kind="transcription", reason="other") == other + 1
+    assert sample("voicebox_websocket_closed_total", kind="transcription", reason="handshake_rejected") == refused + 1
+    assert "SECRET" not in caplog.text
+    assert "PRIVATE TRANSCRIPT" not in caplog.text
+    assert "user supplied secret reason" not in caplog.text
+
+
+async def test_queued_jobs_capture_caller_trace_without_leaking_between_jobs():
+    import asyncio
+
+    from backend import lifecycle
+    from backend.services import task_queue
+
+    lifecycle.reset()
+    task_queue.init_queue(force=True)
+    observed = []
+    completed = asyncio.Event()
+
+    async def record():
+        principal = principal_var.get()
+        observed.append(
+            (
+                current_request_id(),
+                session_id_var.get(),
+                flush_id_var.get(),
+                job_id_var.get(),
+                principal.key_id if principal else None,
+            )
+        )
+        if len(observed) == 2:
+            completed.set()
+
+    request_token = request_id_var.set("request-one")
+    session_token = session_id_var.set("session-one")
+    flush_token = flush_id_var.set("flush-one")
+    principal_token = principal_var.set(Principal("caller-one", "client", "header", KeyLimits.defaults_for("client")))
+    try:
+        task_queue.enqueue_generation("job-one", record())
+    finally:
+        principal_var.reset(principal_token)
+        flush_id_var.reset(flush_token)
+        session_id_var.reset(session_token)
+        request_id_var.reset(request_token)
+    task_queue.enqueue_generation("job-two", record())
+    try:
+        await asyncio.wait_for(completed.wait(), 2)
+        assert observed == [
+            ("request-one", "session-one", "flush-one", "job-one", "caller-one"),
+            (None, None, None, "job-two", None),
+        ]
+        assert job_id_var.get() is None
+    finally:
+        await task_queue.shutdown(2)
+        lifecycle.reset()
+
+
+def test_json_formatter_emits_explicit_trace_fields_only():
+    record = logging.LogRecord("voicebox.test", logging.INFO, __file__, 1, "Speech accepted", (), None)
+    record.session_id = "session-1"
+    record.flush_id = "flush-1"
+    record.job_id = "job-1"
+    record.event = "speech.flush.started"
+    record.input = "PRIVATE INPUT"
+    record.audio = "PRIVATE AUDIO"
+    record.authorization = "PRIVATE KEY"
+    payload = json.loads(logs.JsonFormatter().format(record))
+    assert payload["session_id"] == "session-1"
+    assert payload["flush_id"] == "flush-1"
+    assert payload["job_id"] == "job-1"
+    assert payload["event"] == "speech.flush.started"
+    assert "PRIVATE" not in json.dumps(payload)

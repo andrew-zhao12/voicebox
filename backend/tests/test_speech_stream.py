@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import logging
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ from backend.auth.install import install_security
 from backend.auth.principal import KeyLimits, Principal
 from backend.auth.ratelimit import RateLimiter
 from backend.auth.settings import SecuritySettings
+from backend.observability import metrics
 from backend.routes import openai_compat, speech_stream as route
 from backend.services import generation, live_sessions, task_queue
 from backend.services.speech_stream import MAX_PENDING_FLUSHES, MAX_TEXT_CHARS, ProtocolError, SpeechBuffer
@@ -64,6 +66,9 @@ class Socket:
 
 
 class FakeDb:
+    def get(self, *_args):
+        return None
+
     def query(self, *_args):
         return self
 
@@ -376,6 +381,7 @@ async def test_cancel_all_removes_pending_targets_before_waiting_for_output(monk
         if worker is not None:
             worker.cancel()
         await asyncio.gather(cancelling, *([worker] if worker is not None else []), return_exceptions=True)
+        connection.abandon_traces()
 
 
 async def test_close_reports_terminal_when_completed_flush_is_waiting_for_output(engine, monkeypatch):
@@ -476,3 +482,177 @@ def test_speech_socket_auth_header_and_browser_token(tmp_path):
                 socket.send_json({"type": "session.close"})
                 assert socket.receive_json() == {"type": "session.closed", "reason": "client_closed"}
     assert live_sessions.open_sessions("speech") == 0
+
+
+def metric(name, **labels):
+    return metrics.REGISTRY.get_sample_value(name, labels) or 0
+
+
+@pytest.mark.skipif(not metrics.ENABLED, reason="prometheus_client not installed")
+async def test_flush_metrics_and_content_free_job_correlation(engine, caplog):
+    accepted = metric("voicebox_speech_flushes_total", status="accepted")
+    completed = metric("voicebox_speech_flushes_total", status="completed")
+    first = metric("voicebox_speech_first_audio_seconds_count")
+    pending = metric("voicebox_speech_pending_flushes")
+    with caplog.at_level(logging.INFO):
+        socket, task = await connect()
+        submit(socket, "Private text must never enter lifecycle logs.", "trace-flush")
+        await socket.until("audio.done")
+        await close(socket, task)
+    assert metric("voicebox_speech_flushes_total", status="accepted") == accepted + 1
+    assert metric("voicebox_speech_flushes_total", status="completed") == completed + 1
+    assert metric("voicebox_speech_first_audio_seconds_count") == first + 1
+    assert metric("voicebox_speech_pending_flushes") == pending
+    records = [record for record in caplog.records if getattr(record, "event", "") == "speech.flush.started"]
+    assert len(records) == 1
+    assert records[0].flush_id == "trace-flush"
+    assert records[0].job_id.startswith("stream-")
+    assert records[0].session_id
+    assert "Private text" not in caplog.text
+
+
+@pytest.mark.skipif(not metrics.ENABLED, reason="prometheus_client not installed")
+async def test_slow_reader_records_abandonment_and_balances_pending_gauge(engine, monkeypatch):
+    monkeypatch.setattr(route, "SEND_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(route, "MAX_OUTBOUND_MESSAGES", 1)
+    abandoned = metric("voicebox_speech_flushes_total", status="abandoned")
+    completed = metric("voicebox_speech_flushes_total", status="completed")
+    pending = metric("voicebox_speech_pending_flushes")
+    blocked = metric("voicebox_speech_backpressure_total", direction="outbound")
+    timeouts = metric("voicebox_speech_send_timeouts_total")
+    socket, task = await connect()
+    socket.block_audio = True
+    submit(socket, "This audio cannot be handed to the transport.", "slow-trace")
+    await asyncio.wait_for(task, 2)
+    assert metric("voicebox_speech_flushes_total", status="abandoned") == abandoned + 1
+    assert metric("voicebox_speech_flushes_total", status="completed") == completed
+    assert metric("voicebox_speech_pending_flushes") == pending
+    assert metric("voicebox_speech_backpressure_total", direction="outbound") > blocked
+    assert metric("voicebox_speech_send_timeouts_total") == timeouts + 1
+
+
+@pytest.mark.skipif(not metrics.ENABLED, reason="prometheus_client not installed")
+async def test_cancelled_and_failed_flushes_have_distinct_terminal_metrics(engine):
+    cancelled = metric("voicebox_speech_flushes_total", status="cancelled")
+    failed = metric("voicebox_speech_flushes_total", status="failed")
+    pending = metric("voicebox_speech_pending_flushes")
+    engine.gate.clear()
+    socket, task = await connect()
+    submit(socket, "Cancel this audio.", "cancel-trace")
+    await eventually(lambda: bool(engine.calls))
+    socket.send("input_text.cancel", flush_id="cancel-trace")
+    await socket.until("audio.cancelled")
+    engine.gate.set()
+    await eventually(lambda: task_queue.pending_count() == 0)
+    engine.fail_after = 1
+    submit(socket, "This generation fails.", "failed-trace")
+    await socket.until("error")
+    await close(socket, task)
+    assert metric("voicebox_speech_flushes_total", status="cancelled") == cancelled + 1
+    assert metric("voicebox_speech_flushes_total", status="failed") == failed + 1
+    assert metric("voicebox_speech_pending_flushes") == pending
+
+
+@pytest.mark.skipif(not metrics.ENABLED, reason="prometheus_client not installed")
+async def test_inbound_queue_backpressure_and_unknown_errors_have_fixed_labels():
+    connection = route._Connection(Socket(), CLIENT)
+    queue = asyncio.Queue(maxsize=1)
+    queue.put_nowait({"occupied": True})
+    blocked = metric("voicebox_speech_backpressure_total", direction="inbound")
+    putting = asyncio.create_task(connection._put(queue, {}, "inbound"))
+    await asyncio.sleep(0)
+    assert not putting.done()
+    queue.get_nowait()
+    await putting
+    assert metric("voicebox_speech_backpressure_total", direction="inbound") == blocked + 1
+    other = metric("voicebox_speech_errors_total", code="other")
+    await connection.emit(route.error_event("untrusted-code", "private error detail"))
+    assert metric("voicebox_speech_errors_total", code="other") == other + 1
+    assert metric("voicebox_speech_errors_total", code="untrusted-code") == 0
+
+
+@pytest.mark.skipif(not metrics.ENABLED, reason="prometheus_client not installed")
+async def test_recoverable_command_error_does_not_finish_active_flush_metrics(engine):
+    engine.gate.clear()
+    failed = metric("voicebox_speech_flushes_total", status="failed")
+    completed = metric("voicebox_speech_flushes_total", status="completed")
+    pending = metric("voicebox_speech_pending_flushes")
+    socket, task = await connect()
+    submit(socket, "Keep this active.", "same-id")
+    await eventually(lambda: bool(engine.calls))
+    submit(socket, "Duplicate command.", "same-id")
+    assert (await socket.until("error"))[-1]["error"]["code"] == "duplicate_flush_id"
+    assert metric("voicebox_speech_pending_flushes") == pending + 1
+    assert metric("voicebox_speech_flushes_total", status="failed") == failed
+    engine.gate.set()
+    await socket.until("audio.done")
+    await close(socket, task)
+    assert metric("voicebox_speech_flushes_total", status="completed") == completed + 1
+    assert metric("voicebox_speech_pending_flushes") == pending
+
+
+@pytest.mark.parametrize(
+    ("voice_dictionary", "request_dictionary", "expected"),
+    [
+        (None, None, "Client pronunciation is ready."),
+        ({"API": "Voice pronunciation"}, None, "Voice pronunciation is ready."),
+        ({"API": "Voice pronunciation"}, {}, "API is ready."),
+        ({"API": "Voice pronunciation"}, {"API": "SDK", "SDK": "S D K"}, "SDK is ready."),
+    ],
+)
+async def test_socket_saved_pronunciations_resolve_once_with_explicit_override(
+    engine, monkeypatch, voice_dictionary, request_dictionary, expected
+):
+    profile = await generation.profiles.get_profile(None)
+    profile.pronunciation_replacements = voice_dictionary
+    monkeypatch.setattr(
+        FakeDb,
+        "get",
+        lambda *_args: SimpleNamespace(
+            pronunciation_replacements={"API": "Client pronunciation"}, stt_prompt="", stt_hotwords=[]
+        ),
+    )
+    socket, task = await connect()
+    if request_dictionary is not None:
+        socket.send("session.update", session={"pronunciation_replacements": request_dictionary})
+    submit(socket, "API is ready.", "saved")
+    await socket.until("audio.done")
+    await close(socket, task)
+    assert engine.calls == [expected]
+
+
+async def test_cancelled_socket_override_does_not_leak_to_another_clients_defaults(engine, monkeypatch):
+    monkeypatch.setattr(
+        FakeDb,
+        "get",
+        lambda _self, _model, key_id: SimpleNamespace(
+            pronunciation_replacements={"API": "First caller" if key_id == CLIENT.key_id else "Second caller"},
+            stt_prompt="",
+            stt_hotwords=[],
+        ),
+    )
+    first, first_task = await connect()
+    first.send("session.update", session={"pronunciation_replacements": {"API": "Cancelled override"}})
+    engine.gate.clear()
+    submit(first, "API is active.", "first")
+    await eventually(lambda: bool(engine.calls))
+    first.send("input_text.cancel", flush_id="first")
+    await first.until("audio.cancelled")
+    engine.gate.set()
+    await eventually(lambda: task_queue.pending_count() == 0)
+    other = replace(CLIENT, key_id="other-speech-client")
+    monkeypatch.setattr(route, "get_principal", lambda: other)
+    second, second_task = await connect()
+    submit(second, "API is ready.", "second")
+    await second.until("audio.done")
+    first.send("session.update", session={"pronunciation_replacements": None})
+    submit(first, "API is restored.", "third")
+    await first.until("audio.done")
+    second.disconnect()
+    await asyncio.wait_for(second_task, 2)
+    await close(first, first_task)
+    assert engine.calls == [
+        "Cancelled override is active.",
+        "Second caller is ready.",
+        "First caller is restored.",
+    ]

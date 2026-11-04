@@ -81,6 +81,20 @@ Generated audio and captures stay forever by default. With `VOICEBOX_RETENTION_D
 - **Metrics.** `GET /metrics` (admin key) serves Prometheus metrics: HTTP requests and latency by route, queue depth and wait, synthesis duration and characters per engine, time to the first streamed chunk, Whisper/LLM slot waits, model load times, rate-limit rejections, CUDA memory. `VOICEBOX_METRICS_PORT=9464` additionally serves them on a separate unauthenticated port for scrapers that cannot send a bearer; keep that port on a private network.
 - **Load test.** `scripts/load_test.py --url ... --key ... --voice ... --model kokoro --concurrency 4 --requests 20` streams through `/v1/audio/speech` and prints time to first byte, total time, realtime factor and the 429 count. Run it once per engine on the target hardware before choosing rate limits. For scale: Kokoro on an Apple M-series CPU serves sentence-length requests with the first byte after about one second and produces roughly six seconds of audio per wall second per request.
 
+WebSocket upgrades also echo `X-Request-Id`. Speech lifecycle logs add `session_id`, `flush_id`, and `job_id` as those identifiers become available; queued jobs retain the submitting request's context. These trace records contain identifiers and outcomes, never speech text, pronunciation dictionaries, audio, or credentials. Identifiers stay in logs and do not become Prometheus labels.
+
+| Metric | Meaning |
+|---|---|
+| `voicebox_websocket_sessions{kind}` / `voicebox_websocket_accepted_total{kind}` | Open upgrades and total upgrades for `speech`, `transcription`, or `other`; a connection can be upgraded and then refused by an application limit |
+| `voicebox_websocket_closed_total{kind,reason}` / `voicebox_websocket_session_seconds{kind}` | Bounded close reasons (including rejected handshakes, idle expiry, shutdown, and slow readers) and accepted-connection lifetime |
+| `voicebox_speech_flushes_total{status}` / `voicebox_speech_pending_flushes` | Accepted flushes and their `completed`, `cancelled`, `failed`, or `abandoned` outcomes; pending includes terminal events still waiting to be sent |
+| `voicebox_speech_first_audio_seconds` / `voicebox_speech_flush_seconds{status}` | Acceptance to first PCM transport write and to terminal delivery/disconnection, including queueing and output backpressure |
+| `voicebox_speech_errors_total{code}` | Protocol, admission, and synthesis errors using a fixed code vocabulary |
+| `voicebox_speech_backpressure_total{direction}` / `voicebox_speech_backpressure_seconds{direction}` | Full inbound/outbound queues that blocked producers, and time blocked |
+| `voicebox_speech_send_timeouts_total` | Writes exceeding the speech socket's send deadline |
+
+A completed flush means its `audio.done` was handed to the ASGI transport, not that a remote speaker played it. If the connection ends before a terminal event can be handed off, the flush is `abandoned`, even if synthesis finished. A recoverable command error does not finish an already accepted flush. Rates of `failed`/`abandoned` flushes and `slow_consumer` closes help distinguish inference failures from client delivery problems. GPU memory metrics still cover only the main process's PyTorch allocator; the isolated Nemotron worker and CTranslate2 require separate process/device telemetry.
+
 ## 8. Throughput
 
 One process serves one request at a time per lane. By default there is one lane, so synthesis is strictly serial: the right choice for a single GPU, where two engines would only fight over memory.

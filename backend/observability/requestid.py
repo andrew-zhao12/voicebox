@@ -1,10 +1,11 @@
-"""A request id on every request and response, plus HTTP metrics.
+"""A request id on HTTP requests and WebSocket handshakes, plus lifecycle metrics.
 
 ``X-Request-Id`` is echoed when the client sends a well-formed one and
 generated otherwise.  It rides on ``scope["state"]["request_id"]``, on the
 ``request_id_var`` ContextVar (read by the JSON log formatter and the 500
 handler, whose ``error_id`` is the same value) and on the response header.
-The middleware sits outermost so even the auth middleware's 401s carry it.
+The middleware sits outermost so even HTTP auth failures carry it. Socket
+tasks and rejected handshakes share the context; accepted upgrades echo it.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import metrics
+from .websocket import observe_websocket
 
 HEADER = "x-request-id"
 _VALID = re.compile(r"^[A-Za-z0-9._:/-]{1,64}$")
@@ -45,7 +47,7 @@ class RequestIdMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        if scope["type"] not in {"http", "websocket"}:
             await self.app(scope, receive, send)
             return
 
@@ -53,6 +55,19 @@ class RequestIdMiddleware:
         request_id = incoming if incoming and _VALID.match(incoming) else new_request_id()
         scope.setdefault("state", {})["request_id"] = request_id
         token = request_id_var.set(request_id)
+        if scope["type"] == "websocket":
+
+            async def send_socket_with_id(message: Message) -> None:
+                if message["type"] in {"websocket.accept", "websocket.http.response.start"}:
+                    MutableHeaders(scope=message).append(HEADER, request_id)
+                await send(message)
+
+            try:
+                await observe_websocket(self.app, scope, receive, send_socket_with_id)
+            finally:
+                request_id_var.reset(token)
+            return
+
         status = 500
         started = perf_counter()
         metrics.HTTP_IN_FLIGHT.inc()

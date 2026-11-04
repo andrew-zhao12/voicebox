@@ -86,6 +86,34 @@ MODEL_LOAD_SECONDS = _histogram(
 RATE_LIMITED = _counter("voicebox_rate_limited_total", "Requests refused by a limit", ("dimension",))
 REALTIME_SESSIONS = _gauge("voicebox_realtime_sessions", "Live transcription sessions open")
 REALTIME_UTTERANCES = _counter("voicebox_realtime_utterances_total", "Utterances transcribed over live sessions")
+WEBSOCKET_SESSIONS = _gauge("voicebox_websocket_sessions", "Upgraded WebSocket connections open", ("kind",))
+WEBSOCKET_ACCEPTED = _counter("voicebox_websocket_accepted_total", "WebSocket upgrades accepted", ("kind",))
+WEBSOCKET_CLOSED = _counter(
+    "voicebox_websocket_closed_total", "WebSocket attempts ended, including rejected handshakes", ("kind", "reason")
+)
+WEBSOCKET_SECONDS = _histogram(
+    "voicebox_websocket_session_seconds", "Accepted WebSocket connection lifetime", ("kind",)
+)
+SPEECH_FLUSHES = _counter(
+    "voicebox_speech_flushes_total", "Speech flushes accepted and their delivered terminal outcomes", ("status",)
+)
+SPEECH_PENDING_FLUSHES = _gauge(
+    "voicebox_speech_pending_flushes", "Accepted speech flushes awaiting a delivered terminal event"
+)
+SPEECH_FIRST_AUDIO_SECONDS = _histogram(
+    "voicebox_speech_first_audio_seconds", "Accepted flush to first PCM event handed to the socket transport"
+)
+SPEECH_FLUSH_SECONDS = _histogram(
+    "voicebox_speech_flush_seconds", "Accepted flush to delivered terminal event or disconnection", ("status",)
+)
+SPEECH_ERRORS = _counter("voicebox_speech_errors_total", "Speech protocol or synthesis errors", ("code",))
+SPEECH_BACKPRESSURE = _counter(
+    "voicebox_speech_backpressure_total", "Speech socket queues that blocked a producer", ("direction",)
+)
+SPEECH_BACKPRESSURE_SECONDS = _histogram(
+    "voicebox_speech_backpressure_seconds", "Time producers waited for a full socket queue", ("direction",)
+)
+SPEECH_SEND_TIMEOUTS = _counter("voicebox_speech_send_timeouts_total", "Speech writes exceeding the send deadline")
 
 
 def observe_http(method: str, route: str, status: int, seconds: float) -> None:

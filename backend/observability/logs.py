@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 
 from ..auth.principal import principal_var
 from .requestid import request_id_var
+from .trace import flush_id_var, job_id_var, session_id_var
 
 ENV_VAR = "VOICEBOX_LOG_FORMAT"
 # Loggers uvicorn configures with its own handlers (they do not propagate to the root).
@@ -32,7 +33,11 @@ class JsonFormatter(logging.Formatter):
         principal = principal_var.get()
         if principal is not None and principal.authenticated:
             payload["key_id"] = principal.key_id
-        for attr in ("error_id",):
+        for attr, variable in (("session_id", session_id_var), ("flush_id", flush_id_var), ("job_id", job_id_var)):
+            value = variable.get()
+            if value is not None:
+                payload[attr] = value
+        for attr in ("error_id", "event", "socket_kind", "reason", "session_id", "flush_id", "job_id"):
             value = getattr(record, attr, None)
             if value is not None:
                 payload[attr] = value

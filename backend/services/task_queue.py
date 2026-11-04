@@ -22,6 +22,7 @@ import os
 import time
 import traceback
 from collections.abc import Coroutine, Mapping
+from contextvars import Context, copy_context
 from dataclasses import dataclass, field
 from functools import partial
 from time import perf_counter
@@ -29,6 +30,7 @@ from typing import Literal
 
 from .. import lifecycle
 from ..observability import metrics
+from ..observability.trace import job_id_var
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,7 @@ class GenerationJob:
     lane: str = LANE_ALL
     engine: str | None = None
     exclusive: bool = False
+    context: Context = field(default_factory=copy_context, repr=False)
 
 
 @dataclass
@@ -268,7 +271,9 @@ async def _lane_worker(lane: _Lane):
                 if _gate is not None:
                     await _gate.enter(job.exclusive)
                     entered = True
-                task = asyncio.create_task(_run_job(lane, job, entered))
+                # A lane worker was created at startup; use the submitting request's
+                # context so auth and socket trace fields do not become that worker's.
+                task = asyncio.create_task(_run_job(lane, job, entered), context=job.context)
                 lane.running[job.generation_id] = task
                 lane.running_engine = job.engine
                 lane.running_exclusive = job.exclusive
@@ -293,6 +298,7 @@ async def _lane_worker(lane: _Lane):
 
 async def _run_job(lane: _Lane, job: GenerationJob, entered: bool) -> None:
     """Await one job and do the lane's bookkeeping when it ends, however it ends."""
+    token = job_id_var.set(job.generation_id)
     try:
         await job.coro
     except asyncio.CancelledError:
@@ -317,6 +323,7 @@ async def _run_job(lane: _Lane, job: GenerationJob, entered: bool) -> None:
         metrics.QUEUE_PENDING.set(pending_count())
         async with lane.changed:
             lane.changed.notify_all()
+        job_id_var.reset(token)
 
 
 async def _force_fail_if_active(generation_id: str, error: str) -> None:
@@ -418,6 +425,7 @@ def enqueue_generation(
         )
     )
     metrics.QUEUE_PENDING.set(pending_count())
+    logger.info("Generation queued", extra={"event": "generation.queued", "job_id": generation_id})
 
 
 def _release(generation_id: str) -> None:
