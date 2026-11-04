@@ -113,12 +113,15 @@ discard unsaved voice edits and that row creation works without
 Thirteen frontend validation tests passed, including Unicode limits, imports
 larger than 64 KiB and special object keys. App/web type checking and the web
 production build passed, as did the documentation site build. The backend CI
-test list passed 520 tests with five optional tests skipped; 106 additional route,
+test list passed 526 tests with five optional tests skipped; 106 additional route,
 speech socket, transcription and voice-bundle checks also passed. Targeted
 regressions cover saved-default precedence,
 concurrent settings updates, WebSocket delivery outcomes, trace propagation and
-silent microphone audio. The existing queue test emitted an unawaited-coroutine
-warning; there were no test failures.
+silent microphone audio. An existing unawaited-coroutine warning exposed a queue
+race: cancellation before the job wrapper's first instruction left its slot
+occupied. The fix closes that coroutine and releases the associated state;
+shutdown waits for cleanup. The final full run treated runtime and unraisable
+coroutine warnings as errors and passed.
 
 See [conversation reliability](10-speech-reliability.md) for repeated real-room and
 WebRTC measurements, interruption cycles and the container restart check. These

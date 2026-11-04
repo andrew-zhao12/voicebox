@@ -115,9 +115,7 @@ stt = voicebox_stt(
 )
 user_params = LLMUserAggregatorParams(
     vad_analyzer=SileroVADAnalyzer(),
-    user_turn_strategies=UserTurnStrategies(
-        stop=[VoiceboxSpeechTimeoutUserTurnStopStrategy(stt)]
-    ),
+    user_turn_strategies=UserTurnStrategies(stop=[VoiceboxSpeechTimeoutUserTurnStopStrategy(stt)]),
 )
 ```
 
