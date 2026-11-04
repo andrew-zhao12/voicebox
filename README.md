@@ -392,9 +392,13 @@ stt = openai.STT(base_url=VOICEBOX, api_key=KEY, model="whisper-1", language="en
 
 Live transcription streams the caller's audio to `/v1/realtime?intent=transcription` and returns interim and final transcripts; each sentence the agent says is one `/v1/audio/speech` request, stopped when the caller interrupts. Requires `livekit-agents>=1.8.6,<2`. The [LiveKit guide](https://docs.voicebox.sh/integrations/livekit) covers keys and limits, turn detection, phone calls, sizing and troubleshooting, and [`integrations/livekit/`](integrations/livekit/) holds a complete worker.
 
+The worker also supports `VOICEBOX_TTS_TRANSPORT=websocket` for incremental text, bounded phrase flushing, pronunciation dictionaries, and cancellation over the speech socket. HTTP remains the default.
+
 ### Pipecat
 
 [`integrations/pipecat/`](integrations/pipecat/) provides a browser voice agent using Pipecat's SmallWebRTC transport, local Silero VAD, and Voicebox for realtime or batch transcription and streaming speech. A small TTS adapter supports Voicebox preset and cloned voices; the example also includes an echo mode for testing without an LLM account. Install the pinned dependencies in a separate Python 3.11+ environment, set `VOICEBOX_URL` and `VOICEBOX_CLIENT_KEY`, and run `VOICEBOX_LLM=echo python integrations/pipecat/bot.py -t webrtc`. The [Pipecat guide](docs/content/docs/integrations/pipecat.mdx) covers setup and provider settings.
+
+Set `VOICEBOX_TTS_TRANSPORT=websocket` to synthesize phrases as LLM tokens arrive, with cancellation tied to Pipecat's audio contexts. Both HTTP and WebSocket adapters support pronunciation dictionaries and speech tuning.
 
 ---
 
