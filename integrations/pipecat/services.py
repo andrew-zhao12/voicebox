@@ -1,5 +1,9 @@
 """Pipecat speech services using Voicebox's OpenAI-compatible HTTP and WebSocket APIs."""
 
+import asyncio
+import math
+import time
+import uuid
 from collections.abc import AsyncGenerator
 from copy import deepcopy
 from urllib.parse import urlsplit, urlunsplit
@@ -10,6 +14,8 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.openai.stt import OpenAIRealtimeSTTService, OpenAISTTService
 from pipecat.services.tts_service import TTSService
 from pipecat.transcriptions.language import Language
+from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+from pipecat.utils.time import time_now_iso8601
 
 from stt_resampler import VoiceboxSTTResampler
 from tts_settings import VoiceboxTTSSettings, complete_settings, speech_options, validate_settings
@@ -139,18 +145,152 @@ class VoiceboxBatchSTTService(OpenAISTTService):
 
 
 class VoiceboxRealtimeSTTService(OpenAIRealtimeSTTService):
-    """Use stock GA transcription while identifying Voicebox's definitive final events."""
+    """Keep local speech fragments pending until every committed result arrives."""
 
-    def __init__(self, **kwargs):
+    def __init__(self, *, commit_timeout_s=120, **kwargs):
+        if not math.isfinite(commit_timeout_s) or commit_timeout_s <= 0:
+            raise ValueError("commit_timeout_s must be positive and finite")
         super().__init__(**kwargs)
         self._resampler = VoiceboxSTTResampler()
+        self._commit_timeout_s = commit_timeout_s
+        self._pending_commits = {}
+        self._automatic_items = set()
+        self._next_commit = None
+        self._commit_watchdog = None
+
+    @property
+    def pending_transcriptions(self):
+        return bool(self._pending_commits)
+
+    async def _reserve_commit(self):
+        if len(self._pending_commits) >= 32:
+            await self.push_error(
+                "Too many pending Voicebox transcription commits", force_treat_as_permanent=True
+            )
+            return None
+        event_id = "voicebox_commit_" + uuid.uuid4().hex
+        self._pending_commits[event_id] = time.monotonic() + self._commit_timeout_s
+        if self._commit_watchdog is None:
+            self._commit_watchdog = self.create_task(self._watch_commits())
+        return event_id
+
+    async def _watch_commits(self):
+        try:
+            while self._pending_commits:
+                deadline = next(iter(self._pending_commits.values()))
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                    continue
+                await self.push_error(
+                    "Voicebox transcription commit timed out", force_treat_as_permanent=True
+                )
+                self._pending_commits.clear()
+                self._next_commit = None
+                return
+        finally:
+            self._commit_watchdog = None
+
+    async def _handle_vad_user_stopped_speaking(self, frame):
+        # Reserve before the parent's awaits: an older final can arrive during VAD handling.
+        if not self._server_vad_enabled:
+            self._next_commit = await self._reserve_commit()
+        await super()._handle_vad_user_stopped_speaking(frame)
+
+    async def _commit_audio_buffer(self):
+        if not self.is_usable:
+            return
+        event_id = self._next_commit or await self._reserve_commit()
+        self._next_commit = None
+        if event_id:
+            await self._ws_send({"type": "input_audio_buffer.commit", "event_id": event_id})
+
+    async def _handle_speech_stopped(self, evt):
+        if self._server_vad_enabled:
+            await super()._handle_speech_stopped(evt)
+        elif item_id := evt.get("item_id"):
+            # Manual-mode server caps emit this before their final; local commits do not.
+            if len(self._automatic_items) >= 32:
+                await self.push_error(
+                    "Too many pending Voicebox automatic transcripts", force_treat_as_permanent=True
+                )
+                return
+            self._automatic_items.add(item_id)
+
+    def _finish_commit(self, evt):
+        item_id = evt.get("item_id")
+        if item_id in self._automatic_items:
+            self._automatic_items.remove(item_id)
+            return False
+        if self._pending_commits:
+            self._pending_commits.pop(next(iter(self._pending_commits)))
+            return True
+        return False
+
+    async def _empty_final(self, evt):
+        if not self.pending_transcriptions and not self._user_speaking:
+            # Empty or failed final fragments still release earlier words held by the turn barrier.
+            await self.push_frame(
+                TranscriptionFrame(
+                    "", self._user_id, time_now_iso8601(), result=evt, finalized=True
+                )
+            )
+
+    async def _handle_transcription_completed(self, evt):
+        local = self._finish_commit(evt)
+        await super()._handle_transcription_completed(evt)
+        if local and not evt.get("transcript"):
+            await self._empty_final(evt)
+
+    async def _handle_transcription_failed(self, evt):
+        local = self._finish_commit(evt)
+        await super()._handle_transcription_failed(evt)
+        if local:
+            await self._empty_final(evt)
+
+    async def _handle_error(self, evt):
+        event_id = evt.get("error", {}).get("event_id")
+        local = self._pending_commits.pop(event_id, None) is not None
+        try:
+            await super()._handle_error(evt)
+        finally:
+            if local:
+                await self._empty_final(evt)
+
+    async def _disconnect_websocket(self):
+        try:
+            await super()._disconnect_websocket()
+        finally:
+            self._pending_commits.clear()
+            self._automatic_items.clear()
+            self._next_commit = None
+            if self._commit_watchdog:
+                await self.cancel_task(self._commit_watchdog)
+                self._commit_watchdog = None
 
     async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
-        """Skip the provider-latency safety timer after an explicitly completed utterance."""
+        """Only the last result of the current local utterance can finalize its turn."""
         if isinstance(frame, TranscriptionFrame) and isinstance(frame.result, dict):
             if frame.result.get("type") == "conversation.item.input_audio_transcription.completed":
-                frame.finalized = True
+                frame.finalized = not self.pending_transcriptions and not self._user_speaking
         await super().push_frame(frame, direction)
+
+
+class VoiceboxSpeechTimeoutUserTurnStopStrategy(SpeechTimeoutUserTurnStopStrategy):
+    """Keep normal VAD timing, but wait for committed Voicebox fragments to finish."""
+
+    def __init__(self, stt, **kwargs):
+        super().__init__(**kwargs)
+        self._stt = stt
+
+    @property
+    def decision_scheduled(self):
+        # The service watchdog bounds this wait; also prevents the controller's 5 s fallback.
+        return self._stt.pending_transcriptions
+
+    async def _maybe_report_user_turn_stopped(self):
+        if not self._stt.pending_transcriptions:
+            await super()._maybe_report_user_turn_stopped()
 
 
 def voicebox_stt(

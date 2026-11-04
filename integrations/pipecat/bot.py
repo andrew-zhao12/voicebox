@@ -28,7 +28,14 @@ from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
-from services import SAMPLE_RATE, VoiceboxTTSService, api_url, require_key, voicebox_stt
+from services import (
+    SAMPLE_RATE,
+    VoiceboxSpeechTimeoutUserTurnStopStrategy,
+    VoiceboxTTSService,
+    api_url,
+    require_key,
+    voicebox_stt,
+)
 from streaming_tts import VoiceboxStreamingTTSService
 from tts_settings import VoiceboxTTSSettings, complete_settings, pronunciation_file
 
@@ -200,7 +207,13 @@ def build_pipeline(transport: BaseTransport, settings: Settings) -> Pipeline:
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(),
             # Explicit silence-based turns avoid Pipecat's optional smart-turn model download.
-            user_turn_strategies=UserTurnStrategies(stop=[SpeechTimeoutUserTurnStopStrategy()]),
+            user_turn_strategies=UserTurnStrategies(
+                stop=[
+                    VoiceboxSpeechTimeoutUserTurnStopStrategy(stt)
+                    if settings.realtime
+                    else SpeechTimeoutUserTurnStopStrategy()
+                ]
+            ),
         ),
     )
     return Pipeline([transport.input(), stt, user, llm, tts, transport.output(), assistant])
