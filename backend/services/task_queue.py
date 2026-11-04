@@ -16,7 +16,6 @@ Model loading is serialized separately by ``services/generation.prepare_engine``
 """
 
 import asyncio
-import contextlib
 import logging
 import os
 import time
@@ -83,6 +82,7 @@ class GenerationJob:
     engine: str | None = None
     exclusive: bool = False
     context: Context = field(default_factory=copy_context, repr=False)
+    started: bool = field(default=False, init=False, repr=False)
 
 
 @dataclass
@@ -97,6 +97,7 @@ class _Lane:
     running_engine: str | None = None
     running_exclusive: bool = False
     changed: asyncio.Condition = field(default_factory=asyncio.Condition)
+    cleanups: set[asyncio.Task] = field(default_factory=set)
 
 
 class _ExclusiveGate:
@@ -267,13 +268,13 @@ async def _lane_worker(lane: _Lane):
                     continue
 
                 metrics.QUEUE_WAIT_SECONDS.observe(perf_counter() - job.enqueued_at)
-                entered = False
-                if _gate is not None:
-                    await _gate.enter(job.exclusive)
-                    entered = True
+                gate = _gate
+                if gate is not None:
+                    await gate.enter(job.exclusive)
                 # A lane worker was created at startup; use the submitting request's
                 # context so auth and socket trace fields do not become that worker's.
-                task = asyncio.create_task(_run_job(lane, job, entered), context=job.context)
+                task = asyncio.create_task(_run_job(lane, job, gate), context=job.context)
+                task.add_done_callback(partial(_close_unstarted_job, lane, job, gate), context=job.context)
                 lane.running[job.generation_id] = task
                 lane.running_engine = job.engine
                 lane.running_exclusive = job.exclusive
@@ -290,14 +291,27 @@ async def _lane_worker(lane: _Lane):
             task.cancel()
         if held is not None:
             held.coro.close()
-            _queued_generation_ids.discard(held.generation_id)
-            _release(held.generation_id)
-            metrics.QUEUE_PENDING.set(pending_count())
+            if _lanes.get(lane.name) is lane:
+                _queued_generation_ids.discard(held.generation_id)
+                _release(held.generation_id)
+                metrics.QUEUE_PENDING.set(pending_count())
         raise
 
 
-async def _run_job(lane: _Lane, job: GenerationJob, entered: bool) -> None:
+def _close_unstarted_job(lane: _Lane, job: GenerationJob, gate: _ExclusiveGate | None, task: asyncio.Task) -> None:
+    if job.started:
+        return
+    # Cancelling a task before its first step bypasses the coroutine's finally.
+    # Keep this cleanup awaitable so shutdown cannot return with a slot held.
+    job.coro.close()
+    cleanup = create_background_task(_finish_job(lane, job, gate, task))
+    lane.cleanups.add(cleanup)
+    cleanup.add_done_callback(lane.cleanups.discard)
+
+
+async def _run_job(lane: _Lane, job: GenerationJob, gate: _ExclusiveGate | None) -> None:
     """Await one job and do the lane's bookkeeping when it ends, however it ends."""
+    job.started = True
     token = job_id_var.set(job.generation_id)
     try:
         await job.coro
@@ -310,20 +324,30 @@ async def _run_job(lane: _Lane, job: GenerationJob, entered: bool) -> None:
             "Worker exited without writing terminal status",
         )
     finally:
-        if entered and _gate is not None:
-            await _gate.leave(job.exclusive)
-        lane.running.pop(job.generation_id, None)
-        if not lane.running:
-            lane.running_engine = None
-            lane.running_exclusive = False
-        _running_generation_tasks.pop(job.generation_id, None)
+        try:
+            await _finish_job(lane, job, gate, asyncio.current_task())
+        finally:
+            job_id_var.reset(token)
+
+
+async def _finish_job(lane: _Lane, job: GenerationJob, gate: _ExclusiveGate | None, task: asyncio.Task) -> None:
+    if gate is not None:
+        await gate.leave(job.exclusive)
+    lane.running.pop(job.generation_id, None)
+    if not lane.running:
+        lane.running_engine = None
+        lane.running_exclusive = False
+    # A forced re-init can replace the global registry before an old task ends.
+    # That task must release its own gate, without releasing a newly reused ID.
+    if _running_generation_tasks.get(job.generation_id) is task:
+        _running_generation_tasks.pop(job.generation_id)
         _queued_generation_ids.discard(job.generation_id)
         _release(job.generation_id)
+    if _lanes.get(lane.name) is lane:
         metrics.QUEUE_RUNNING.labels(lane.name).set(len(lane.running))
         metrics.QUEUE_PENDING.set(pending_count())
-        async with lane.changed:
-            lane.changed.notify_all()
-        job_id_var.reset(token)
+    async with lane.changed:
+        lane.changed.notify_all()
 
 
 async def _force_fail_if_active(generation_id: str, error: str) -> None:
@@ -489,9 +513,9 @@ async def shutdown(drain_timeout_s: float) -> bool:
     for worker in workers:
         if not worker.done():
             worker.cancel()
-    for task in [*tasks, *workers]:
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await task
+    # Gather also lets each task's completion callback schedule pre-start cleanup.
+    await asyncio.gather(*tasks, *workers, return_exceptions=True)
+    await asyncio.gather(*(task for lane in _lanes.values() for task in lane.cleanups), return_exceptions=True)
     for lane in _lanes.values():
         while not lane.queue.empty():
             job = lane.queue.get_nowait()
