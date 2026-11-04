@@ -169,6 +169,13 @@ Validation on Apple Silicon with Kokoro and MLX Whisper Base: the speech roundtr
 
 Remaining deployment evidence includes CUDA execution, representative noisy/telephone/multilingual recordings, full multilingual checkpoint accuracy, and capacity limits on the intended hardware. Shared Postgres/object-storage/queue state remains deferred. The [benchmark walkthrough](walkthroughs/08-speech-benchmarks.md) provides the repeatable measurement path.
 
+### Saved defaults, telemetry and conversation reliability (2026-11-03)
+
+- **Saved speech settings:** API keys now retain pronunciation dictionaries, recognition context and vocabulary. Settings → Speech edits, imports and exports these values; administrators can select a client key. Voice profiles have an optional pronunciation dictionary, included in voice bundles. Explicit request settings take precedence, then voice settings, then client defaults. Empty dictionaries disable replacements; null inherits. See [saved speech settings](content/docs/integrations/speech-settings.mdx).
+- **Speech telemetry:** TTS and STT WebSockets now carry request IDs, structured lifecycle logs and bounded metric labels. Speech flushes record first audio, backpressure, timeouts and completion/cancellation/abandonment. Queue tasks preserve request context; completed delivery is counted after the final socket send succeeds.
+- **Conversation reliability:** both SDK harnesses support repeated turns and interruptions, idle gaps and optional configured LLMs. The new Docker runner checks both integrations around a server restart and requires queue, session and flush gauges to return to zero. A separate weekly/manual CPU workflow retains recordings and reports. Local repeated-call evidence and commands are in [the reliability walkthrough](walkthroughs/10-speech-reliability.md); the hosted workflow has not run yet.
+- **Silent microphone regression:** automatic Whisper partials and duration caps skip exact-zero manual audio, preventing idle microphone frames from inventing a transcript and interrupting a reply. Explicit commits and very quiet nonzero audio retain their transcription behavior.
+
 ### What's Shipped (v0.5.0 — the Capture release)
 
 Shipped 2026-04-25 (PR #544). Voicebox went from a voice-cloning studio to a full voice studio — dictation in, agent speech out, a local LLM in the middle.

@@ -99,3 +99,28 @@ The AMD64 and CUDA images were not built or executed locally. The Docker CI
 matrix is configured to build CPU and CUDA 12.8 images and run the offline smoke
 on AMD64 CPU runners; its result is still pending. Real CUDA inference, full-model
 quality, and GPU capacity require separate validation.
+
+## Saved settings and delivery telemetry
+
+The per-key settings API, profile dictionaries and settings UI were validated
+against a separate local server and scratch database. Chromium checks covered
+client isolation, duplicate-term validation, save/reload, import/export, discard,
+profile inheritance and empty overrides. Imports stay unsaved until Save is
+selected. Additional checks verified that opening the pronunciation editor cannot
+discard unsaved voice edits and that row creation works without
+`crypto.randomUUID`, as on HTTP LAN origins.
+
+Thirteen frontend validation tests passed, including Unicode limits, imports
+larger than 64 KiB and special object keys. App/web type checking and the web
+production build passed, as did the documentation site build. The backend CI
+test list passed 520 tests with five optional tests skipped; 106 additional route,
+speech socket, transcription and voice-bundle checks also passed. Targeted
+regressions cover saved-default precedence,
+concurrent settings updates, WebSocket delivery outcomes, trace propagation and
+silent microphone audio. The existing queue test emitted an unawaited-coroutine
+warning; there were no test failures.
+
+See [conversation reliability](10-speech-reliability.md) for repeated real-room and
+WebRTC measurements, interruption cycles and the container restart check. These
+checks use synthetic speech and echo responses; they do not establish production
+capacity or conversational quality with an external LLM.

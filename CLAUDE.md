@@ -101,6 +101,13 @@ Formatting: Biome for TS (`biome.json`: 2-space, width 100, single quotes); ruff
 - Repo skills live in `.agents/skills/` (`add-tts-engine`, `draft-release-notes`, `release-bump`, `triage-prs`), not `.claude/`, so open the relevant `SKILL.md` explicitly when doing those tasks.
 - Commits follow Conventional Commits: `fix(scope): summary (#PR)`, `feat(...)`, `docs: ...`.
 
+### Saved speech defaults and delivery tracing
+
+- `routes/speech_settings.py` and `services/speech_settings.py` persist per-key pronunciation and recognition hints. TTS selects a whole dictionary in request → voice → client order; null inherits and `{}` disables. Apply substitution once after personality rewriting and before character charging. Profile bundles preserve the optional dictionary. Realtime STT snapshots hints on connect; effective unsupported hints must be cleared in the initial update or rejected before audio. Capture operations snapshot hints before acquiring the Whisper slot.
+- Settings → Speech uses server/key-scoped queries and portable settings JSON. ProfileForm distinguishes inheritance from an empty override. Keep those semantics when changing drafts, import/export or voice editing.
+- `observability/websocket.py` records bounded session/close labels and request IDs for both speech sockets. `observability/trace.py` carries request/job/session/flush context into structured logs, including queued tasks. Flush completion is recorded only after the terminal ASGI send succeeds; unsent terminal events are abandoned, not delivered. Never put text, credentials or per-session IDs in metric labels.
+- Manual realtime STT suppresses automatic inference for exact-zero PCM, including automatic duration caps; it must still recognize quiet nonzero input and honor explicit commits. `scripts/run_speech_reliability.py` tests owned Docker instances with repeated SDK calls and restart passes; see `docs/walkthroughs/10-speech-reliability.md`. Keep integration SDK dependencies out of the backend environment.
+
 ## Where to read more
 - `backend/STYLE_GUIDE.md` (authoritative Python conventions), `backend/README.md`, `backend/mcp_server/README.md`.
 - `docs/content/docs/overview/api-reference.mdx` documents the `/v1` API for application developers; regenerate `docs/openapi.json` with `backend/venv/bin/python -c "import json; from backend.app import app; json.dump(app.openapi(), open('docs/openapi.json','w'), indent=2)"`.
