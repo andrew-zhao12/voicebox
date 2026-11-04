@@ -2,7 +2,9 @@
 
 Needs the integration requirements and a running Voicebox with Kokoro and Whisper.
 No browser, Docker, microphone, or paid LLM is needed. The caller sends a synthesized
-utterance over WebRTC and transcribes the bot's recorded greeting and echo reply.
+utterance over WebRTC and transcribes the bot's recorded greeting and replies.
+--turns/--duration repeat on the same call; --barge-in interrupts each cycle.
+Echo is the default; --llm configured uses the normal conversational provider.
 Artifacts go to --out-dir (a new temporary directory by default).
 """
 
@@ -34,13 +36,19 @@ from smoke import wav_bytes, word_error_rate
 
 HERE = Path(__file__).resolve().parent
 USER_LINE = "Hi there. Could you tell me what the weather is like today?"
+BARGE_LINE = "Sorry to interrupt. What time is it in Tokyo right now?"
+ECHO_TAIL = " ".join(
+    "This is a deliberately long answer with several extra sentences so the caller can "
+    "interrupt while speech is still playing and the next turn can start cleanly."
+    for _ in range(12)
+)
 FRAME_SAMPLES = SAMPLE_RATE // 50
 
 
 class Microphone(AudioStreamTrack):
     """A paced microphone that sends silence until the caller starts its utterance."""
 
-    def __init__(self, pcm: bytes):
+    def __init__(self, pcm: bytes = b""):
         super().__init__()
         self.pcm = pcm
         self.offset = 0
@@ -49,6 +57,16 @@ class Microphone(AudioStreamTrack):
         self.pts = 0
         self.started: float | None = None
         self.speech_end = 0.0
+
+    def play(self, pcm: bytes) -> None:
+        """Start another utterance on the same paced microphone track."""
+        if self.speaking and not self.done.is_set():
+            raise RuntimeError("The caller is already speaking")
+        if not pcm or len(pcm) % 2:
+            raise ValueError("Caller audio must contain complete PCM16 samples")
+        self.pcm, self.offset = pcm, 0
+        self.done.clear()
+        self.speaking = True
 
     async def recv(self) -> AudioFrame:
         if self.started is None:
@@ -90,6 +108,19 @@ class Recording:
         except MediaStreamError:
             return
 
+    async def wait_audible(self, after: int, timeout: float) -> float:
+        async with asyncio.timeout(timeout):
+            while not any(index >= after for index, _ in self.loud):
+                await asyncio.sleep(0.02)
+        return next(at for index, at in self.loud if index >= after)
+
+    async def wait_stop(self, after: float, timeout: float) -> tuple[float, int]:
+        """Detect the first 350ms quiet gap after the caller interrupts."""
+        async with asyncio.timeout(timeout):
+            while not self.loud or time.monotonic() - max(after, self.loud[-1][1]) < 0.35:
+                await asyncio.sleep(0.01)
+        return max(after, self.loud[-1][1]), len(self.chunks)
+
     async def wait_quiet(self, after: int, timeout: float) -> float:
         """Require audible speech after *after*, then 1.5 seconds of silence."""
         async with asyncio.timeout(timeout):
@@ -113,13 +144,15 @@ async def keep_alive(channel):
         await asyncio.sleep(1)
 
 
-async def conversation(url: str, pcm: bytes, out: Path, timeout: float) -> dict:
+async def conversation(url: str, audio: dict[str, bytes], out: Path, args) -> dict:
+    """Exercise repeated turns on one WebRTC connection; keep recording memory bounded."""
     peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
-    mic = Microphone(pcm)
+    mic = Microphone()
     recording = Recording()
     tasks: list[asyncio.Task] = []
     peer.addTrack(mic)
     channel = peer.createDataChannel("chat")
+    result = {"turns": []}
 
     @peer.on("track")
     def on_track(track):
@@ -137,18 +170,56 @@ async def conversation(url: str, pcm: bytes, out: Path, timeout: float) -> dict:
                 answer = await response.json()
         await peer.setRemoteDescription(RTCSessionDescription(answer["sdp"], answer["type"]))
         tasks.append(asyncio.create_task(keep_alive(channel)))
-        await recording.wait_quiet(0, timeout)
-        greeting_end = len(recording.chunks)
-        recording.save(out / "greeting.wav", 0, greeting_end)
-        mic.speaking = True
-        async with asyncio.timeout(timeout):
-            await mic.done.wait()
-        reply_start = await recording.wait_quiet(greeting_end, timeout)
-        recording.save(out / "reply.wav", greeting_end)
-        latency = reply_start - mic.speech_end
-        if latency <= 0:
-            raise RuntimeError("The bot replied before the caller finished speaking")
-        return {"reply_latency_s": round(latency, 3)}
+        await recording.wait_quiet(0, args.timeout)
+        recording.save(out / "greeting.wav", 0)
+        started = time.monotonic()
+        while len(result["turns"]) < args.turns or time.monotonic() - started < args.duration:
+            if result["turns"]:
+                await asyncio.sleep(args.idle_between)
+            recording.chunks.clear()
+            recording.loud.clear()
+            number = len(result["turns"]) + 1
+            turn = {"turn": number, "interrupted": args.barge_in}
+            mic.play(audio["user"])
+            await asyncio.wait_for(mic.done.wait(), args.timeout)
+            if args.barge_in:
+                initial_reply = await recording.wait_audible(0, args.timeout)
+                turn["initial_reply_latency_s"] = round(initial_reply - mic.speech_end, 3)
+                if not 0 < turn["initial_reply_latency_s"] <= args.max_reply_latency:
+                    raise RuntimeError(
+                        f"Initial reply latency outside (0, {args.max_reply_latency}]s"
+                    )
+                await asyncio.sleep(args.barge_after)
+                if not recording.loud or time.monotonic() - recording.loud[-1][1] > 0.2:
+                    raise RuntimeError(
+                        "Reply ended before barge-in; interruption was not exercised"
+                    )
+                barge_start = time.monotonic()
+                mic.play(audio["barge"])
+                stopped, reply_after = await recording.wait_stop(barge_start, args.timeout)
+                turn["barge_stop_s"] = round(stopped - barge_start, 3)
+                if turn["barge_stop_s"] > args.max_stop:
+                    raise RuntimeError(f"Barge-in stop latency exceeds {args.max_stop}s")
+                recording.save(out / f"interrupted-{number}.wav", 0, reply_after)
+                await asyncio.wait_for(mic.done.wait(), args.timeout)
+                overlap = [at for _, at in recording.loud if stopped + 0.35 < at < mic.speech_end]
+                if overlap:
+                    raise RuntimeError("Bot resumed speaking while the interrupting caller spoke")
+            else:
+                reply_after = 0
+            reply_start = await recording.wait_quiet(reply_after, args.timeout)
+            filename = "reply.wav" if number == 1 else f"reply-{number}.wav"
+            recording.save(out / filename, reply_after)
+            turn["file"] = filename
+            turn["reply_latency_s"] = round(reply_start - mic.speech_end, 3)
+            if not 0 < turn["reply_latency_s"] <= args.max_reply_latency:
+                raise RuntimeError(f"Reply latency outside (0, {args.max_reply_latency}]s")
+            result["turns"].append(turn)
+            # Preserve completed-turn evidence if a later turn fails or the run is interrupted.
+            (out / "conversation.json").write_text(json.dumps(result, indent=2) + "\n")
+        result["reply_latency_s"] = result["turns"][0]["reply_latency_s"]
+        result["conversation_s"] = round(time.monotonic() - started, 3)
+        return result
     finally:
         for task in tasks:
             task.cancel()
@@ -192,31 +263,37 @@ def stop_worker(proc: subprocess.Popen):
 async def check(args) -> dict:
     if args.tts:
         os.environ["VOICEBOX_TTS_TRANSPORT"] = args.tts
-    settings = Settings.from_env(require_llm=False)
+    os.environ["VOICEBOX_LLM"] = "echo" if args.llm == "echo" else "openai"
+    settings = Settings.from_env(require_llm=args.llm == "configured")
     out = Path(args.out_dir or tempfile.mkdtemp(prefix="voicebox-pipecat-e2e-")).resolve()
     out.mkdir(parents=True, exist_ok=True)
     print(f"Artifacts: {out}", flush=True)
-    result = {"stt": args.stt, "tts": settings.tts_transport, "pass": False}
+    result = {"stt": args.stt, "tts": settings.tts_transport, "llm": args.llm, "pass": False}
     headers = {"Authorization": f"Bearer {settings.voicebox_key}"}
     proc = None
     try:
         async with aiohttp.ClientSession(
             headers=headers, timeout=aiohttp.ClientTimeout(total=args.timeout)
         ) as http:
-            async with http.post(
-                f"{settings.voicebox_url}/audio/speech",
-                json={
-                    "model": settings.tts_model,
-                    "voice": "am_adam",
-                    "input": USER_LINE,
-                    "response_format": "pcm",
-                },
-            ) as response:
-                response.raise_for_status()
-                pcm = await response.read()
-            if not pcm or len(pcm) % 2:
-                raise RuntimeError("Voicebox returned invalid caller audio")
-            (out / "user.wav").write_bytes(wav_bytes(pcm))
+            audio = {}
+            for name, text in [("user", USER_LINE), ("barge", BARGE_LINE)]:
+                if name == "barge" and not args.barge_in:
+                    continue
+                async with http.post(
+                    f"{settings.voicebox_url}/audio/speech",
+                    json={
+                        "model": settings.tts_model,
+                        "voice": "am_adam",
+                        "input": text,
+                        "response_format": "pcm",
+                    },
+                ) as response:
+                    response.raise_for_status()
+                    pcm = await response.read()
+                if not pcm or len(pcm) % 2:
+                    raise RuntimeError("Voicebox returned invalid caller audio")
+                audio[name] = pcm
+                (out / f"{name}.wav").write_bytes(wav_bytes(pcm))
             # The runner cannot inherit a bound socket; choose an unused local port immediately
             # before launch and fail if the child cannot bind it.
             with socket.socket() as probe:
@@ -225,7 +302,8 @@ async def check(args) -> dict:
             url = f"http://127.0.0.1:{port}"
             env = dict(
                 os.environ,
-                VOICEBOX_LLM="echo",
+                VOICEBOX_LLM="echo" if args.llm == "echo" else "openai",
+                VOICEBOX_ECHO_TAIL=ECHO_TAIL if args.barge_in and args.llm == "echo" else "",
                 VOICEBOX_STT_REALTIME="1" if args.stt == "realtime" else "0",
                 VOICEBOX_TTS_TRANSPORT=settings.tts_transport,
             )
@@ -249,18 +327,23 @@ async def check(args) -> dict:
                 )
                 try:
                     await wait_ready(proc, url, args.timeout)
-                    async with asyncio.timeout(args.timeout):
-                        result.update(await conversation(url, pcm, out, args.timeout))
+                    result.update(await conversation(url, audio, out, args))
                 finally:
                     await asyncio.to_thread(stop_worker, proc)
-            for name, expected in [("greeting", GREETING), ("reply", f"You said: {USER_LINE}")]:
+            checks = [("greeting.wav", GREETING)]
+            expected_reply = f"You said: {BARGE_LINE if args.barge_in else USER_LINE}"
+            checks.extend(
+                (turn["file"], expected_reply if args.llm == "echo" else None)
+                for turn in result["turns"]
+            )
+            for filename, expected in checks:
                 form = aiohttp.FormData()
                 form.add_field("model", settings.stt_model)
                 form.add_field("language", settings.language)
                 form.add_field(
                     "file",
-                    (out / f"{name}.wav").read_bytes(),
-                    filename=f"{name}.wav",
+                    (out / filename).read_bytes(),
+                    filename=filename,
                     content_type="audio/wav",
                 )
                 async with http.post(
@@ -268,12 +351,15 @@ async def check(args) -> dict:
                 ) as response:
                     response.raise_for_status()
                     transcript = (await response.json())["text"].strip()
-                wer = word_error_rate(expected, transcript)
-                result[name] = {"transcript": transcript, "wer": round(wer, 3)}
-                if wer > args.max_wer:
-                    raise RuntimeError(f"{name} WER {wer:.2f} exceeds {args.max_wer:.2f}")
-            if result["reply_latency_s"] > args.max_reply_latency:
-                raise RuntimeError(f"Reply latency exceeds {args.max_reply_latency}s")
+                evidence = {"transcript": transcript}
+                result[Path(filename).stem] = evidence
+                if expected is not None:
+                    wer = word_error_rate(expected, transcript)
+                    evidence["wer"] = round(wer, 3)
+                    if wer > args.max_wer:
+                        raise RuntimeError(f"{filename} WER {wer:.2f} exceeds {args.max_wer:.2f}")
+                elif not transcript:
+                    raise RuntimeError(f"{filename} contains no intelligible reply")
             result["pass"] = True
     except Exception as exc:
         result["error"] = str(exc) or type(exc).__name__
@@ -291,17 +377,45 @@ async def main(args) -> int:
     return 0 if (await check(args))["pass"] else 1
 
 
-if __name__ == "__main__":
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stt", choices=["batch", "realtime"], default="realtime")
+    parser.add_argument("--tts", choices=["http", "websocket"], help="Override TTS transport")
     parser.add_argument(
-        "--tts", choices=["http", "websocket"], help="Override VOICEBOX_TTS_TRANSPORT"
+        "--llm",
+        choices=["echo", "configured"],
+        default="echo",
+        help="configured uses LLM_* settings; checks audible replies, not echo WER",
     )
-    parser.add_argument("--timeout", type=float, default=90)
+    parser.add_argument("--turns", type=int, default=1, help="minimum completed reply cycles")
+    parser.add_argument("--duration", type=float, default=0, help="minimum conversation seconds")
+    parser.add_argument(
+        "--idle-between", type=float, default=0, help="quiet seconds between cycles"
+    )
+    parser.add_argument(
+        "--barge-in", action="store_true", help="interrupt every cycle's first reply"
+    )
+    parser.add_argument("--barge-after", type=float, default=0.8)
+    parser.add_argument("--max-stop", type=float, default=1.5)
+    parser.add_argument("--timeout", type=float, default=90, help="per-stage progress timeout")
     parser.add_argument("--max-wer", type=float, default=0.25)
     parser.add_argument("--max-reply-latency", type=float, default=5)
     parser.add_argument("--out-dir")
+    args = parser.parse_args(argv)
+    if not 1 <= args.turns <= 1000 or not 0 <= args.duration <= 3600:
+        parser.error("turns must be 1..1000 and duration 0..3600 seconds")
+    if not 0 <= args.idle_between <= 300:
+        parser.error("idle-between must be 0..300 seconds")
+    if not all(
+        0 < n <= 300
+        for n in [args.timeout, args.max_reply_latency, args.max_stop, args.barge_after]
+    ):
+        parser.error("timeouts and latency bounds must be positive and at most 300 seconds")
+    return args
+
+
+if __name__ == "__main__":
     try:
-        sys.exit(asyncio.run(main(parser.parse_args())))
+        sys.exit(asyncio.run(main(parse_args())))
     except (KeyboardInterrupt, asyncio.CancelledError):
         sys.exit(130)

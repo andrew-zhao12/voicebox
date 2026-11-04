@@ -95,7 +95,12 @@ server = AgentServer(
 @server.rtc_session()
 async def entrypoint(ctx: JobContext) -> None:
     """The example's entrypoint with EchoLLM, bound to the scripted participant."""
-    session = example.build_session(vad=ctx.proc.userdata["vad"], llm=EchoLLM(tail=ECHO_TAIL))
+    llm = (
+        example.chat_llm()
+        if os.getenv("E2E_LLM") == "configured"
+        else EchoLLM(tail=ECHO_TAIL, repeat_tail=os.getenv("E2E_REPEAT_TAIL") == "1")
+    )
+    session = example.build_session(vad=ctx.proc.userdata["vad"], llm=llm)
     _report(session)
     detector = session.turn_detection
     _record(

@@ -132,6 +132,11 @@ def test_teardown_stops_only_the_container_started_by_this_run(tmp_path, monkeyp
     monkeypatch.setattr(run_e2e, "port_busy", lambda port, udp=False: False)
     monkeypatch.setattr(run_e2e.urllib.request, "urlopen", lambda *args, **kwargs: Ready())
     run.livekit.start()
+    assert [commands[0][index + 1] for index, value in enumerate(commands[0]) if value == "-p"] == [
+        "127.0.0.1:7880:7880",
+        "127.0.0.1:7881:7881",
+        "127.0.0.1:7882:7882/udp",
+    ]
     run.livekit.stop()
     run.livekit.stop()  # repeated teardown is harmless
     assert commands[1:] == [
@@ -320,3 +325,42 @@ def test_a_run_ended_by_a_signal_stops_its_worker_and_server(tmp_path, name):
             proc.wait()
         if worker_pid is not None and alive(worker_pid):
             os.killpg(worker_pid, signal.SIGKILL)
+
+
+@pytest.mark.parametrize(
+    "argv", [("--turns", "0"), ("--duration", "nan"), ("--idle-between", "-1")]
+)
+def test_soak_limits_are_bounded_before_launch(tmp_path, argv):
+    with pytest.raises(SystemExit):
+        make_run(tmp_path, *argv)
+
+
+def test_configured_llm_preserves_endpoint_and_skips_echo_word_matching(tmp_path, monkeypatch):
+    monkeypatch.setenv("LLM_BASE_URL", "http://localhost:11434/v1")
+    run = make_run(tmp_path, "--llm", "configured", "--turns", "3")
+    assert run.worker_env()["LLM_BASE_URL"] == "http://localhost:11434/v1"
+    assert run.worker_env()["E2E_LLM"] == "configured"
+    session = run_e2e.Session(run, 1)
+    session._check_reply("reply", "You said hello", "A completely different useful answer.")
+    assert not session.failures
+    session._check_reply("reply", "You said hello", "")
+    assert session.failures == ["reply: no intelligible reply"]
+
+
+def test_later_turn_failure_cannot_hide_behind_first_turn_success(tmp_path, monkeypatch):
+    run = make_run(tmp_path, "--turns", "2")
+    session = run_e2e.Session(run, 1)
+    monkeypatch.setattr(
+        session,
+        "_transcript",
+        lambda name: "You said: " + run_e2e.USER_LINE if name != "greeting.wav" else run.greeting,
+    )
+    report = {
+        **REPORT,
+        "turns": [
+            {"turn": 1, "phases": REPORT["phases"]},
+            {"turn": 2, "phases": {"user_end": 2.0, "reply_start": 40.0}},
+        ],
+    }
+    session._check_audio(report)
+    assert any("turn 2 reply latency" in failure for failure in session.failures)

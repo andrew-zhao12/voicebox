@@ -7,7 +7,7 @@ told to speak, and plays this script:
 2. say the --speak WAV and wait for the reply to start;
 3. with --barge-in, say a second WAV --barge-after seconds into the reply,
    then wait for the reply to that;
-4. wait for the agent to go quiet, then leave.
+4. wait for the agent to go quiet; repeat for --turns cycles, then leave.
 
 It writes the agent's audio for each phase (greeting.wav, reply.wav and,
 with --barge-in, barge-reply.wav) to --out-dir with a JSON report. Report
@@ -235,6 +235,52 @@ async def dispatch(url: str, agent_name: str, room: str) -> str:
         return (await lk.agent_dispatch.create_dispatch(req)).id
 
 
+async def run_turn(rec, mic, speech, barge, args) -> dict:
+    """One normal/interrupted exchange on an already connected room."""
+    phases = {}
+    phases["user_start"], phases["user_end"] = await mic.say(
+        speech[0], speech_bounds(*speech, args.user_threshold)
+    )
+    reply_seen = await rec.wait_for(
+        lambda: rec.first_loud_after(phases["user_end"]) is not None, args.reply_timeout
+    )
+    if not reply_seen:
+        raise RuntimeError("no reply after the user spoke")
+    phases["reply_start"] = rec.first_loud_after(phases["user_end"])
+
+    if barge:
+        await asyncio.sleep(max(0.0, phases["reply_start"] + args.barge_after - rec.now()))
+        if rec.last_loud is None or rec.now() - rec.last_loud > 0.2:
+            raise RuntimeError("reply ended before barge-in; interruption was not exercised")
+        bounds = speech_bounds(*barge, args.user_threshold)
+        phases["barge_start"], phases["barge_end"] = await mic.say(barge[0], bounds)
+
+        def stopped() -> bool:
+            return rec.end_of_sound_after(phases["barge_start"], args.stop_gap) is not None
+
+        if not await rec.wait_for(stopped, args.reply_timeout):
+            raise RuntimeError("the agent kept talking over the barge-in")
+        phases["agent_stop"] = rec.end_of_sound_after(phases["barge_start"], args.stop_gap)
+        seen = await rec.wait_for(
+            lambda: rec.first_loud_after(phases["barge_end"]) is not None, args.reply_timeout
+        )
+        if not seen:
+            raise RuntimeError("no reply after the barge-in")
+        phases["barge_reply_start"] = rec.first_loud_after(phases["barge_end"])
+        end = await rec.wait_quiet(
+            phases["barge_reply_start"], args.reply_silence, args.reply_timeout
+        )
+        if end is None:
+            raise RuntimeError("reply after barge-in never ended")
+        phases["barge_reply_end"] = end
+    else:
+        end = await rec.wait_quiet(phases["reply_start"], args.reply_silence, args.reply_timeout)
+        if end is None:
+            raise RuntimeError("reply never ended")
+        phases["reply_end"] = end
+    return phases
+
+
 async def run(args: argparse.Namespace) -> dict:
     url = os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
     out = Path(args.out_dir)
@@ -283,72 +329,54 @@ async def run(args: argparse.Namespace) -> dict:
         phases["greeting_start"] = rec.first_loud_after(0.0) or 0.0
         phases["greeting_end"] = greeting_end
 
-        phases["user_start"], phases["user_end"] = await mic.say(
-            speech[0], speech_bounds(*speech, args.user_threshold)
-        )
-        reply_seen = await rec.wait_for(
-            lambda: rec.first_loud_after(phases["user_end"]) is not None, args.reply_timeout
-        )
-        if not reply_seen:
-            report["error"] = "no reply after the user spoke"
-            return report
-        phases["reply_start"] = rec.first_loud_after(phases["user_end"])
-
-        if barge:
-            await asyncio.sleep(max(0.0, phases["reply_start"] + args.barge_after - rec.now()))
-            bounds = speech_bounds(*barge, args.user_threshold)
-            phases["barge_start"], phases["barge_end"] = await mic.say(barge[0], bounds)
-
-            def stopped() -> bool:
-                return rec.end_of_sound_after(phases["barge_start"], args.stop_gap) is not None
-
-            if not await rec.wait_for(stopped, args.reply_timeout):
-                report["error"] = "the agent kept talking over the barge-in"
-                return report
-            phases["agent_stop"] = rec.end_of_sound_after(phases["barge_start"], args.stop_gap)
-            seen = await rec.wait_for(
-                lambda: rec.first_loud_after(phases["barge_end"]) is not None, args.reply_timeout
-            )
-            if not seen:
-                report["error"] = "no reply after the barge-in"
-                return report
-            phases["barge_reply_start"] = rec.first_loud_after(phases["barge_end"])
-            end = await rec.wait_quiet(
-                phases["barge_reply_start"], args.reply_silence, args.reply_timeout
-            )
-            phases["barge_reply_end"] = end if end is not None else rec.now()
-        else:
-            end = await rec.wait_quiet(
-                phases["reply_start"], args.reply_silence, args.reply_timeout
-            )
-            phases["reply_end"] = end if end is not None else rec.now()
+        report["turns"] = []
+        rec.write(out / "greeting.wav", 0.0, rec.now())
+        for number in range(1, args.turns + 1):
+            if number > 1:
+                await asyncio.sleep(args.idle_between)
+            turn = await run_turn(rec, mic, speech, barge, args)
+            prefix = "" if number == 1 else f"turn-{number}-"
+            reply_end = turn.get("agent_stop", turn.get("reply_end", rec.now())) + FRAME_S
+            rec.write(out / f"{prefix}reply.wav", turn["user_end"], reply_end)
+            if barge:
+                rec.write(out / f"{prefix}barge-reply.wav", turn["barge_end"], rec.now())
+            evidence = {
+                "turn": number,
+                "phases": {k: round(v, 3) for k, v in turn.items()},
+                "agent_audio_during_user_s": round(
+                    rec.loud_between(turn["user_start"], turn["user_end"]), 3
+                ),
+            }
+            if barge:
+                evidence["agent_audio_during_barge_s"] = round(
+                    rec.loud_between(turn["agent_stop"] + args.stop_gap, turn["barge_end"]), 3
+                )
+            report["turns"].append(evidence)
+            if number == 1:
+                phases.update(turn)
+                report.update(
+                    {
+                        key: value
+                        for key, value in evidence.items()
+                        if key.startswith("agent_audio_")
+                    }
+                )
+            # Keep long-call memory bounded; WAV artifacts retain completed turns.
+            rec.frames.clear()
+            rec.times.clear()
+            rec.loud.clear()
+            rec.loud_starts.clear()
+            rec.last_loud = None
+            (out / "progress.json").write_text(json.dumps(report, indent=2) + "\n")
+    except RuntimeError as exc:
+        report["error"] = str(exc)
     finally:
         await mic.aclose()
         for t in tasks:
             t.cancel()
         await room.disconnect()
         report["phases"] = {k: round(v, 3) for k, v in phases.items()}
-        end_of_recording = rec.now()
-        if "user_start" in phases:
-            report["greeting_s"] = rec.write(out / "greeting.wav", 0.0, phases["user_start"])
-        if "reply_start" in phases:
-            reply_end = phases.get("barge_start", end_of_recording)
-            if "agent_stop" in phases:
-                reply_end = phases["agent_stop"] + FRAME_S
-            report["reply_s"] = rec.write(out / "reply.wav", phases["user_end"], reply_end)
-        if "barge_reply_start" in phases:
-            report["barge_reply_s"] = rec.write(
-                out / "barge-reply.wav", phases["barge_end"], end_of_recording
-            )
 
-    if "user_end" in phases:
-        # The agent talking over the user (the greeting has ended before the user starts).
-        overlap = rec.loud_between(phases["user_start"], phases["user_end"])
-        report["agent_audio_during_user_s"] = round(overlap, 3)
-    if "agent_stop" in phases:
-        # Agent audio after it had stopped for the barge-in, while the user was still talking.
-        resumed = rec.loud_between(phases["agent_stop"] + args.stop_gap, phases["barge_end"])
-        report["agent_audio_during_barge_s"] = round(resumed, 3)
     return report
 
 
@@ -367,6 +395,8 @@ def main() -> int:
     ap.add_argument(
         "--barge-after", type=float, default=1.5, help="seconds into the reply to start talking"
     )
+    ap.add_argument("--turns", type=int, default=1)
+    ap.add_argument("--idle-between", type=float, default=0)
     ap.add_argument("--timeout", type=float, default=120.0, help="hard cap for the whole session")
     ap.add_argument("--join-timeout", type=float, default=30.0)
     ap.add_argument("--greeting-timeout", type=float, default=30.0)

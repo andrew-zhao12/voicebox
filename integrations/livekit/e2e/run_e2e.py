@@ -20,9 +20,11 @@ barge-in check read Voicebox's /metrics. One run:
    SIGTERM, SIGHUP and SIGALRM stop a run the way Ctrl-C does, through the
    same teardown.
 
-Each reply is "You said: <what the agent heard>", so its transcript checks
-Voicebox's STT and TTS in one go. Artifacts (WAVs, reports, worker and
-server logs) go to --out-dir, a new temporary directory by default.
+By default each reply is "You said: <what the agent heard>", so its transcript
+checks Voicebox's STT and TTS in one go. --llm configured uses the normal LLM
+settings and checks intelligibility without echo-specific word error rates.
+Artifacts (WAVs, reports, worker and server logs) go to --out-dir, a new temporary
+directory by default.
 """
 
 from __future__ import annotations
@@ -57,7 +59,7 @@ AGENT_NAME = "e2e-agent"  # each run registers as e2e-agent-<run id>
 USER_IDENTITY = "e2e-user"
 USER_LINE = "Hi there. Could you tell me what the weather is like today?"
 BARGE_LINE = "Sorry to interrupt. What time is it in Tokyo right now?"
-# Appended to the first reply in --barge-in runs, so that speech is still being
+# Appended to each cycle's first reply in --barge-in runs, so speech is still being
 # synthesized when the user cuts in. Each sentence is longer than Voicebox's
 # first chunk (120 characters), so its request stays in flight while the rest
 # renders; the barge-in lands inside a request rather than between two.
@@ -284,7 +286,8 @@ class LiveKitServer:
         t0 = time.monotonic()
         cmd = [
             "docker", "run", "--rm", "-d", "--name", self.args.container,
-            "-p", f"{b}:{b}", "-p", f"{b + 1}:{b + 1}", "-p", f"{b + 2}:{b + 2}/udp",
+            "-p", f"127.0.0.1:{b}:{b}", "-p", f"127.0.0.1:{b + 1}:{b + 1}",
+            "-p", f"127.0.0.1:{b + 2}:{b + 2}/udp",
             "-v", f"{config}:/etc/livekit.yaml:ro",
             self.args.image, "--dev", "--bind", "0.0.0.0", "--config", "/etc/livekit.yaml",
         ]  # fmt: skip
@@ -386,6 +389,14 @@ class Session:
             "--out-dir", str(self.dir), "--dispatch-agent", run.agent_name,
             "--identity", USER_IDENTITY,
         ]  # fmt: skip
+        cmd += [
+            "--turns",
+            str(args.turns),
+            "--idle-between",
+            str(args.idle_between),
+            "--timeout",
+            str(args.session_timeout),
+        ]
         if args.barge_in:
             cmd += ["--barge-in", str(run.barge_wav), "--barge-after", str(args.barge_after)]
         env = dict(os.environ, LIVEKIT_URL=run.livekit.url, LIVEKIT_API_KEY="devkey")
@@ -395,7 +406,12 @@ class Session:
         started = time.monotonic()
         try:
             done = subprocess.run(
-                cmd, cwd=HERE, env=env, capture_output=True, text=True, timeout=240
+                cmd,
+                cwd=HERE,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=args.session_timeout + 15,
             )
             output = done.stdout + done.stderr
             if done.returncode:
@@ -427,6 +443,7 @@ class Session:
             "session": self.index,
             "room": self.room,
             "tts_transport": args.tts_transport,
+            "llm": args.llm,
             "pass": not self.failures,
             "wall_s": round(wall_s, 2),
             "timings": {k: None if v is None else round(v, 3) for k, v in self.timings.items()},
@@ -465,15 +482,56 @@ class Session:
         self.check(overlap <= 0.1, f"agent spoke for {overlap:.2f} s while the user was talking")
         if self.args.barge_in:
             heard = self._transcript("barge-reply.wav")
-            self._check_text("barge_reply", f"You said: {BARGE_LINE}", heard)
+            self._check_reply("barge_reply", f"You said: {BARGE_LINE}", heard)
             self.timings["barge_end_to_reply_s"] = phases["barge_reply_start"] - phases["barge_end"]
         else:
-            self._check_text("reply", f"You said: {USER_LINE}", self._transcript("reply.wav"))
+            self._check_reply("reply", f"You said: {USER_LINE}", self._transcript("reply.wav"))
+        turns = report.get("turns", [report])
+        self.check(len(turns) == self.args.turns, f"expected {self.args.turns} completed turns")
+        for turn in turns[1:]:
+            number, phases = turn["turn"], turn["phases"]
+            suffix = "barge-reply" if self.args.barge_in else "reply"
+            self._check_reply(
+                f"turn_{number}",
+                f"You said: {BARGE_LINE if self.args.barge_in else USER_LINE}",
+                self._transcript(f"turn-{number}-{suffix}.wav"),
+            )
+            latency = phases["reply_start"] - phases["user_end"]
+            self.timings[f"turn_{number}_reply_s"] = latency
+            self.check(0 < latency <= limit, f"turn {number} reply latency {latency:.2f}s")
+            self.check(
+                turn.get("agent_audio_during_user_s", 0) <= 0.1,
+                f"turn {number}: agent spoke over the user",
+            )
+            if self.args.barge_in:
+                stop = phases["agent_stop"] - phases["barge_start"]
+                followup = phases["barge_reply_start"] - phases["barge_end"]
+                self.timings[f"turn_{number}_barge_stop_s"] = stop
+                self.timings[f"turn_{number}_barge_reply_s"] = followup
+                self.check(
+                    0 <= stop <= self.args.max_stop, f"turn {number} interruption took {stop:.2f}s"
+                )
+                self.check(
+                    0 < followup <= limit, f"turn {number} follow-up latency {followup:.2f}s"
+                )
+                self.check(
+                    turn.get("agent_audio_during_barge_s", 0) <= 0.1,
+                    f"turn {number}: agent resumed during interruption",
+                )
+
+    def _check_reply(self, what: str, expected: str, heard: str | None) -> None:
+        if self.args.llm == "echo":
+            self._check_text(what, expected, heard)
+        else:
+            # Configured models may answer freely. Semantic correctness needs a task-specific eval.
+            self.check(bool(heard and heard.strip()), f"{what}: no intelligible reply")
 
     def _check_agent(self, report: dict[str, Any]) -> None:
         """What the agent heard, and when, from its own log."""
         user_end_wall = report["t0_wall"] + report["phases"]["user_end"]
-        expected = [USER_LINE, BARGE_LINE] if self.args.barge_in else [USER_LINE]
+        expected = (
+            [USER_LINE, BARGE_LINE] if self.args.barge_in else [USER_LINE]
+        ) * self.args.turns
         records = [r for r in log_records(self.run.worker.logfile) if r.get("room") == self.room]
         if self.args.agent == "example":
             turn = [r["message"] for r in records if r["message"].startswith("turn detection: ")]
@@ -612,7 +670,9 @@ class Run:
             VOICEBOX_STT_REALTIME="1" if args.stt == "realtime" else "0",
             VOICEBOX_LANGUAGE=args.language,
             E2E_USER_IDENTITY=USER_IDENTITY,
-            E2E_ECHO_TAIL=ECHO_TAIL if args.barge_in else "",
+            E2E_ECHO_TAIL=ECHO_TAIL if args.barge_in and args.llm == "echo" else "",
+            E2E_REPEAT_TAIL="1" if args.turns > 1 else "0",
+            E2E_LLM=args.llm,
             COLUMNS="2000",  # console-formatted logs: one record per line
             PYTHONWARNINGS="ignore",
             PYTHONDONTWRITEBYTECODE="1",
@@ -621,14 +681,18 @@ class Run:
 
     def start_worker(self) -> None:
         env = self.worker_env()
-        if self.args.agent == "example":
+        if self.args.agent == "example" and self.args.llm == "echo":
             from echo import EchoChatServer  # lazy: imports livekit.agents
 
-            self.echo_server = EchoChatServer(tail=ECHO_TAIL if self.args.barge_in else "").start()
+            self.echo_server = EchoChatServer(
+                tail=ECHO_TAIL if self.args.barge_in else "", repeat_tail=self.args.turns > 1
+            ).start()
             env.update(
                 LLM_BASE_URL=self.echo_server.base_url, LLM_MODEL="echo", LLM_API_KEY="unused"
             )
             env["LIVEKIT_LOG_LEVEL"] = "DEBUG"  # the example logs what it heard at debug level
+        if self.args.agent == "example":
+            env["LIVEKIT_LOG_LEVEL"] = "DEBUG"
             cmd = [PY, str(EXAMPLE), self.args.example_command]
         else:
             cmd = [PY, "e2e_agent.py", "start"]
@@ -651,11 +715,17 @@ class Run:
             took = self.livekit.start()
             log(f"livekit-server {args.image} ready in {took:.2f} s ({self.livekit.url})")
             self.start_worker()
-            for i in range(1, args.sessions + 1):
+            started = time.monotonic()
+            i = 0
+            while i < args.sessions or time.monotonic() - started < args.duration:
+                i += 1
                 result = Session(self, i).execute()
                 results.append(result)
                 status = "PASS" if result["pass"] else "FAIL"
                 log(f"session {i}: {status} {json.dumps(result['timings'])}")
+                (self.out / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
+                if not result["pass"]:
+                    break
         finally:
             # A second signal must not cut the teardown short.
             held = {
@@ -673,8 +743,8 @@ class Run:
         (self.out / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
         self.print_summary(results)
         passed = sum(r["pass"] for r in results)
-        ok = passed == args.sessions
-        log(f"RESULT {'PASS' if ok else 'FAIL'}: {passed}/{args.sessions} sessions passed")
+        ok = passed == len(results) and len(results) >= args.sessions
+        log(f"RESULT {'PASS' if ok else 'FAIL'}: {passed}/{len(results)} sessions passed")
         return 0 if ok else 1
 
     def print_summary(self, results: list[dict[str, Any]]) -> None:
@@ -698,7 +768,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     env = os.environ.get
     ap.add_argument("--stt", choices=["realtime", "batch"], default="realtime")
-    ap.add_argument("--sessions", type=int, default=1, help="sessions on one server and worker")
+    ap.add_argument("--sessions", type=int, default=1, help="minimum sessions on one worker")
+    ap.add_argument("--turns", type=int, default=1, help="reply/interruption cycles in each room")
+    ap.add_argument("--duration", type=float, default=0, help="minimum soak duration in seconds")
+    ap.add_argument(
+        "--idle-between", type=float, default=0, help="quiet seconds between room turns"
+    )
+    ap.add_argument(
+        "--session-timeout", type=float, default=240, help="hard cap per room in seconds"
+    )
+    ap.add_argument(
+        "--llm",
+        choices=["echo", "configured"],
+        default="echo",
+        help="configured uses LLM_* settings and checks audible replies, not echo WER",
+    )
     ap.add_argument("--barge-in", action="store_true", help="talk over the agent's first reply")
     ap.add_argument(
         "--agent",
@@ -743,8 +827,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = ap.parse_args(argv)
     if not args.client_key:
         ap.error("set VOICEBOX_CLIENT_KEY or pass --client-key")
-    if args.sessions < 1:
-        ap.error("--sessions must be at least 1")
+    if not 1 <= args.sessions <= 1000 or not 1 <= args.turns <= 1000:
+        ap.error("--sessions and --turns must be 1..1000")
+    if not 0 <= args.duration <= 3600 or not 0 <= args.idle_between <= 300:
+        ap.error("--duration must be 0..3600 and --idle-between 0..300 seconds")
+    if not 1 <= args.session_timeout <= 86400:
+        ap.error("--session-timeout must be 1..86400 seconds")
+    if args.llm == "configured" and not (
+        env("LLM_BASE_URL") or env("LLM_API_KEY") or env("OPENAI_API_KEY")
+    ):
+        ap.error("configured LLM needs LLM_BASE_URL, LLM_API_KEY, or OPENAI_API_KEY")
     return args
 
 

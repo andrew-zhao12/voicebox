@@ -37,7 +37,7 @@ from livekit.agents.llm import ChatChunk, ChoiceDelta
 TOKEN_DELAY_S = 0.01
 
 
-def reply_for(user_messages: list[str], tail: str = "") -> list[str]:
+def reply_for(user_messages: list[str], tail: str = "", *, repeat_tail: bool = False) -> list[str]:
     """The reply to the latest user message, as text deltas.
 
     The echo comes word by word, like a model's tokens. *tail*, added to the
@@ -47,7 +47,7 @@ def reply_for(user_messages: list[str], tail: str = "") -> list[str]:
     heard = user_messages[-1].strip() if user_messages else ""
     words = (f"You said: {heard}" if heard else "I didn't catch that.").split(" ")
     deltas = [w if i == 0 else f" {w}" for i, w in enumerate(words)]
-    if tail and len(user_messages) == 1:
+    if tail and (len(user_messages) == 1 or (repeat_tail and len(user_messages) % 2 == 1)):
         deltas += [f" {sentence.strip()}." for sentence in tail.split(".") if sentence.strip()]
     return deltas
 
@@ -55,9 +55,10 @@ def reply_for(user_messages: list[str], tail: str = "") -> list[str]:
 class EchoLLM(llm.LLM):
     """An LLM that streams the deltas of :func:`reply_for`."""
 
-    def __init__(self, *, tail: str = "") -> None:
+    def __init__(self, *, tail: str = "", repeat_tail: bool = False) -> None:
         super().__init__()
         self.tail = tail
+        self.repeat_tail = repeat_tail
 
     @property
     def model(self) -> str:
@@ -85,7 +86,7 @@ class _EchoStream(llm.LLMStream):
         echo: EchoLLM = self._llm  # type: ignore[assignment]  # set by LLMStream.__init__
         users = [m.text_content or "" for m in self._chat_ctx.messages() if m.role == "user"]
         request_id = utils.shortuuid("echo_")
-        for text in reply_for(users, echo.tail):
+        for text in reply_for(users, echo.tail, repeat_tail=echo.repeat_tail):
             await asyncio.sleep(TOKEN_DELAY_S)
             delta = ChoiceDelta(role="assistant", content=text)
             self._event_ch.send_nowait(ChatChunk(id=request_id, delta=delta))
@@ -122,7 +123,7 @@ class _ChatHandler(BaseHTTPRequestHandler):
         users = [
             _text_of(m.get("content")) for m in body.get("messages", []) if m.get("role") == "user"
         ]
-        deltas = reply_for(users, self.server.tail)
+        deltas = reply_for(users, self.server.tail, repeat_tail=self.server.repeat_tail)
         text = "".join(deltas)
         self.server.requests += 1
         base = {
@@ -177,9 +178,10 @@ class EchoChatServer(ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self, *, tail: str = "", port: int = 0) -> None:
+    def __init__(self, *, tail: str = "", port: int = 0, repeat_tail: bool = False) -> None:
         super().__init__(("127.0.0.1", port), _ChatHandler)
         self.tail = tail
+        self.repeat_tail = repeat_tail
         self.requests = 0
         self._thread = threading.Thread(target=self.serve_forever, name="echo-llm", daemon=True)
 

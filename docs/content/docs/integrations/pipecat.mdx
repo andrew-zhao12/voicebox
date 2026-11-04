@@ -15,7 +15,9 @@ description: "Build a browser voice agent with Pipecat and self-hosted Voicebox 
 
 Pipecat 1.15's stock OpenAI TTS service validates voices against OpenAI's catalog. Both adapters allow Voicebox preset IDs such as `af_heart` and cloned voice names or IDs. The default HTTP adapter uses Pipecat's sentence aggregation, closes interrupted streams, and disables automatic SDK retries. The optional WebSocket adapter consumes tokens and flushes bounded phrases. Neither replays speech after a failure.
 
-The transcription adapters mark completed Voicebox utterances as final for Pipecat's turn handling and close the batch service's HTTP pool when a call ends. The underlying HTTP and realtime protocols remain Pipecat's OpenAI implementations.
+The transcription adapters identify completed Voicebox results and close the batch service's HTTP pool when a call ends. Realtime turns wait for every locally committed fragment before finalizing. The underlying HTTP and realtime protocols remain Pipecat's OpenAI implementations.
+
+Realtime resampling uses float filtering with explicit PCM rounding. This keeps digital silence exact, preserving quiet speech and streaming filter tails without integer dither that can trigger Whisper hallucinations while the caller is idle.
 
 ## Start a browser conversation
 
@@ -68,6 +70,32 @@ For a conversational LLM, set `VOICEBOX_LLM=openai` and `OPENAI_API_KEY`, or con
 
 Realtime mode streams audio to `/v1/realtime?intent=transcription`. Pipecat's local VAD commits utterances. Whisper and faster-whisper produce rolling partial passes; optional Nemotron uses cached native streaming state between chunks. Set `VOICEBOX_STT_MODEL` to a model ID from `/v1/models` after [installing and preloading its runtime](/developer/transcription). Batch mode posts VAD-cut recordings to `/v1/audio/transcriptions`.
 
+## Realtime turn handling in your own pipeline
+
+Pair the realtime adapter with `VoiceboxSpeechTimeoutUserTurnStopStrategy(stt)`. The example already wires this strategy. For a custom pipeline with `integrations/pipecat/` on the Python import path:
+
+```python
+import os
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregatorParams
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from services import VoiceboxSpeechTimeoutUserTurnStopStrategy, voicebox_stt
+
+stt = voicebox_stt(
+    api_key=os.environ["VOICEBOX_CLIENT_KEY"],
+    base_url=os.environ["VOICEBOX_URL"],
+    realtime=True,
+)
+user_params = LLMUserAggregatorParams(
+    vad_analyzer=SileroVADAnalyzer(),
+    user_turn_strategies=UserTurnStrategies(
+        stop=[VoiceboxSpeechTimeoutUserTurnStopStrategy(stt)]
+    ),
+)
+```
+
+Pass `user_params` to `LLMContextAggregatorPair` and place `stt` before its user aggregator. Short pauses can create multiple local VAD commits while CPU transcription is still pending. The custom strategy preserves all transcript fragments and holds the turn open until the outstanding results arrive, preventing a late fragment from interrupting the reply. It adds no fixed wait after the last result. Unresolved commits fail explicitly after 120 seconds by default; direct `VoiceboxRealtimeSTTService` construction accepts `commit_timeout_s`. Batch mode uses the stock `SpeechTimeoutUserTurnStopStrategy`.
+
 ## Incremental speech
 
 Set `VOICEBOX_TTS_TRANSPORT=websocket` to use `/v1/audio/speech/stream`. This adapter consumes Pipecat LLM **tokens**, flushing at sentence punctuation or a word boundary near `VOICEBOX_TEXT_FLUSH_CHARS`, and flushes the remainder when the LLM response ends. It can start speech before the full sentence arrives. Each phrase is held locally, then appended and flushed atomically; the server only synthesizes flushed text.
@@ -88,9 +116,12 @@ python integrations/pipecat/e2e.py --stt realtime
 python integrations/pipecat/e2e.py --stt batch
 python integrations/pipecat/smoke.py --tts websocket --stt both
 python integrations/pipecat/e2e.py --tts websocket --stt realtime
+python integrations/pipecat/e2e.py --tts websocket --turns 3 --barge-in --idle-between 18
 ```
 
 Run these in the example's environment with `VOICEBOX_URL` and `VOICEBOX_CLIENT_KEY` set. The WebRTC check starts its own local agent and scripted caller, records the greeting and reply, verifies their transcripts, and stops its runner. It needs no browser, microphone, or paid LLM.
+
+`--turns` repeats exchanges on the same connection; `--barge-in` interrupts every cycle and checks the follow-up. `--duration 1800` continues the conversation for at least 30 minutes. Echo is the default; `--llm configured` uses your chat provider and checks intelligible speech and timing without requiring replies to repeat the caller. The separate manual/weekly speech reliability workflow runs isolated model-backed conversations and server restarts. See `docs/walkthroughs/10-speech-reliability.md` for local orchestration, idle reconnect checks and artifact details.
 
 On 2026-11-03, both WebRTC modes passed against Kokoro and MLX Whisper Base on Apple Silicon with zero word errors. Replies began 1.057 s after the caller finished in realtime mode and 1.078 s in batch mode. These single-session checks use an echo LLM and do not measure production capacity. CI runs the server-free checks in a separate environment from the backend and LiveKit.
 

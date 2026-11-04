@@ -82,18 +82,52 @@ transport, even though Pipecat's shared CLI lists other transports.
 - Pipecat's stock OpenAI TTS service rejects voices outside OpenAI's fixed catalog.
   `VoiceboxTTSService` instead sends the selected Voicebox voice unchanged and
   streams PCM16 mono at **24 kHz**, matching Voicebox's `/v1/audio/speech` contract.
-- Batch and realtime STT inherit Pipecat's OpenAI services. The wrappers mark
-  completed utterances as final so turn handling does not wait for additional
-  transcripts, and close the batch SDK client's connection pool at session end.
+- Batch and realtime STT inherit Pipecat's OpenAI services. The wrappers identify
+  completed results and close the batch SDK client's connection pool at session end.
+  Realtime turns wait for every locally committed fragment before finalizing.
 - Local Silero VAD commits realtime audio. Server VAD is explicitly disabled.
   Turns finish after a silence window and a completed transcript; this example
   does not download or depend on a semantic end-of-turn model.
+- Realtime resampling preserves digital silence and quiet speech without adding
+  integer dither that can trigger Whisper hallucinations during idle periods.
+  Streaming filter tails, flushes and resets retain the SDK's behavior.
 - Interruptions cancel synthesis through Pipecat. Closing the HTTP stream lets
   Voicebox abandon the queued request or stop between synthesis chunks. A chunk
   already running on the backend still completes.
 - Slow or queued speech may wait up to 120 seconds for HTTP progress. Its audio
   context stays open during that wait; empty responses, malformed PCM, and HTTP
   errors produce pipeline errors and close the context promptly.
+
+When using the realtime adapter in your own pipeline, pair it with
+`VoiceboxSpeechTimeoutUserTurnStopStrategy(stt)` instead of the stock stop strategy:
+
+```python
+import os
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregatorParams
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from services import VoiceboxSpeechTimeoutUserTurnStopStrategy, voicebox_stt
+
+stt = voicebox_stt(
+    api_key=os.environ["VOICEBOX_CLIENT_KEY"],
+    base_url=os.environ["VOICEBOX_URL"],
+    realtime=True,
+)
+user_params = LLMUserAggregatorParams(
+    vad_analyzer=SileroVADAnalyzer(),
+    user_turn_strategies=UserTurnStrategies(
+        stop=[VoiceboxSpeechTimeoutUserTurnStopStrategy(stt)]
+    ),
+)
+```
+
+Pass `user_params` to `LLMContextAggregatorPair` and place `stt` before its user
+aggregator, as in `bot.py`. Short pauses can produce multiple VAD commits before
+CPU transcription finishes. This strategy holds the turn open until those results
+arrive, preserving their words without allowing a late fragment to interrupt the
+reply. It adds no fixed delay after the last result. Unresolved commits fail
+explicitly after 120 seconds by default (`VoiceboxRealtimeSTTService` accepts
+`commit_timeout_s`). Batch STT continues to use `SpeechTimeoutUserTurnStopStrategy`.
 
 For incremental input, set `VOICEBOX_TTS_TRANSPORT=websocket`. The optional
 `VoiceboxStreamingTTSService` in `streaming_tts.py` uses Pipecat's **token**
@@ -174,3 +208,18 @@ SIP/telephony, and full-call barge-in timing still need deployment-specific chec
 Upstream references: [Pipecat OpenAI STT](https://reference-server.pipecat.ai/en/stable/api/pipecat.services.openai.stt.html),
 [TTS implementation at the tested version](https://github.com/pipecat-ai/pipecat/blob/v1.15.0/src/pipecat/services/openai/tts.py),
 [SmallWebRTC](https://docs.pipecat.ai/api-reference/server/services/transport/small-webrtc).
+
+### Longer calls and repeated interruption
+
+`e2e.py --turns 3 --barge-in --idle-between 18 --tts websocket` exercises three
+interruption/reply cycles on the same WebRTC connection. `--duration 1800` keeps
+the conversation running for at least 30 minutes; audio memory is released after
+each recorded cycle. With WebSocket speech, `VOICEBOX_TTS_TIMEOUT=10` makes the
+18-second gaps exercise idle speech reconnection. `--llm configured` uses your
+normal chat settings and validates intelligible replies without assuming echo
+text. The default stays deterministic echo; `VOICEBOX_ECHO_TAIL` is an optional
+long-answer fixture used only by echo mode for repeated interruption.
+
+See [the reliability runbook](../../docs/walkthroughs/10-speech-reliability.md) for
+isolated Docker runs, owned-server restart checks and the separate model-backed
+CI workflow. Recorded synthetic calls and failure progress remain in `--out-dir`.

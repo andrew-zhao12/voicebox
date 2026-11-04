@@ -105,3 +105,4 @@ backend/services/speech_settings.py
 backend/routes/speech_settings.py
 backend/tests/test_speech_settings.py
 backend/tests/test_speech_settings_routes.py
+scripts/run_speech_reliability.py

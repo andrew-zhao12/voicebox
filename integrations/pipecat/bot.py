@@ -136,6 +136,10 @@ class Settings:
 class EchoLLM(FrameProcessor):
     """Deterministic conversation substitute for testing speech without an LLM account."""
 
+    def __init__(self, *, tail: str = ""):
+        super().__init__()
+        self.tail = tail
+
     async def process_frame(self, frame, direction: FrameDirection):
         """Reply to the latest plain-text user message through standard LLM frames."""
         await super().process_frame(frame, direction)
@@ -147,6 +151,9 @@ class EchoLLM(FrameProcessor):
             )
             if isinstance(text, list):
                 text = " ".join(p.get("text", "") for p in text if p.get("type") == "text")
+            users = sum(m.get("role") == "user" for m in messages)
+            if self.tail and users % 2 == 1:
+                text += " " + self.tail
             await self.push_frame(LLMFullResponseStartFrame())
             # Exercise incremental text in the local smoke just as an LLM streams tokens.
             for token in re.findall(r"\S+\s*", f"You said: {text}"):
@@ -192,7 +199,7 @@ def build_pipeline(transport: BaseTransport, settings: Settings) -> Pipeline:
     )
     tts = voicebox_tts(settings)
     llm = (
-        EchoLLM()
+        EchoLLM(tail=os.getenv("VOICEBOX_ECHO_TAIL", ""))
         if settings.echo
         else ChatService(
             api_key=settings.llm_key,

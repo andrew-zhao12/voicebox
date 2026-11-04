@@ -242,3 +242,17 @@ Pitfalls the scripts already handle, worth knowing when you adapt them:
   not bindable ports, so back-to-back runs work.
 - Keep the machine awake (`caffeinate -i` on macOS): a sleep in the middle of a run stalls the
   room, and the caller's clock (`time.monotonic()`) stops while the wall clock does not.
+
+### Longer calls and repeated interruption
+
+`e2e/run_e2e.py --turns 3 --barge-in --idle-between 18 --tts-transport websocket`
+checks three interruption/reply cycles in each room, including transcripts and
+latency for later turns. `--duration 1800` repeats rooms on the same worker for
+at least 30 minutes. Use `--session-timeout` for a longer single room; `--turns`
+controls its number of cycles. Completed-turn progress and WAVs are saved as the
+call runs, and recording memory is released between cycles.
+
+`--llm configured` uses the normal `LLM_*` settings, checks intelligible replies
+without echo-specific reply WER, and keeps caller transcription checks. Echo is
+the default. See [the reliability runbook](../../docs/walkthroughs/10-speech-reliability.md)
+for isolated Docker/server-restart runs and the separate model-backed CI workflow.

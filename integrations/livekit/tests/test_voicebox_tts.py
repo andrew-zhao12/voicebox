@@ -64,6 +64,19 @@ class Peer:
                     buffer = ""
                     flush_id = event["flush_id"]
                     await socket.send_json({"type": "input_text.flushed", "flush_id": flush_id})
+                    if self.mode == "overload":
+                        await socket.send_json(
+                            {
+                                "type": "error",
+                                "flush_id": flush_id,
+                                "error": {
+                                    "code": "queue_full",
+                                    "message": "Queue full",
+                                    "retry_after_s": 1,
+                                },
+                            }
+                        )
+                        continue
                     if self.mode == "timeout":
                         continue
                     if self.mode == "early_close":
@@ -213,6 +226,7 @@ async def test_synthesize_and_unpunctuated_text_are_bounded(peer):
         "timeout",
         "session_format",
         "unauthorized",
+        "overload",
     ],
 )
 async def test_failures_never_retry_or_replay_even_after_audio(peer, mode):
