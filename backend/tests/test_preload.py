@@ -146,7 +146,17 @@ def registry(monkeypatch):
     """Point ``_load_one`` at a fake model of the requested engine; returns a setter."""
 
     def use(engine: str, load: ThreadLoad) -> None:
-        monkeypatch.setattr("backend.backends.get_model_config", lambda name: SimpleNamespace(engine=engine))
+        monkeypatch.setattr(
+            "backend.backends.get_model_config",
+            lambda name: SimpleNamespace(
+                engine=engine,
+                model_type="stt"
+                if engine in {"whisper", "faster_whisper", "nemotron"}
+                else "llm"
+                if engine == "qwen_llm"
+                else "tts",
+            ),
+        )
         monkeypatch.setattr("backend.backends.check_model_loaded", lambda cfg: False)
         monkeypatch.setattr("backend.backends.get_model_load_func", lambda cfg: load)
 
@@ -159,7 +169,15 @@ async def _until(predicate, timeout_s: float = 5.0) -> None:
             await asyncio.sleep(0.005)
 
 
-@pytest.mark.parametrize(("engine", "slot_name"), [("whisper", "whisper_slot"), ("qwen_llm", "llm_slot")])
+@pytest.mark.parametrize(
+    ("engine", "slot_name"),
+    [
+        ("whisper", "whisper_slot"),
+        ("faster_whisper", "whisper_slot"),
+        ("nemotron", "whisper_slot"),
+        ("qwen_llm", "llm_slot"),
+    ],
+)
 async def test_whisper_and_llm_loads_start_only_once_they_hold_their_slot(monkeypatch, registry, engine, slot_name):
     slot = InferenceSlot(engine, wait_timeout_s=5)
     monkeypatch.setattr(preload, slot_name, slot)
@@ -188,7 +206,15 @@ async def test_whisper_and_llm_loads_start_only_once_they_hold_their_slot(monkey
     assert not slot.busy
 
 
-@pytest.mark.parametrize(("engine", "slot_name"), [("whisper", "whisper_slot"), ("qwen_llm", "llm_slot")])
+@pytest.mark.parametrize(
+    ("engine", "slot_name"),
+    [
+        ("whisper", "whisper_slot"),
+        ("faster_whisper", "whisper_slot"),
+        ("nemotron", "whisper_slot"),
+        ("qwen_llm", "llm_slot"),
+    ],
+)
 async def test_a_cancelled_preload_keeps_the_slot_until_its_load_ends(monkeypatch, registry, engine, slot_name):
     slot = InferenceSlot(engine, wait_timeout_s=5)
     monkeypatch.setattr(preload, slot_name, slot)

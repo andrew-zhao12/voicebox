@@ -2,14 +2,13 @@
 
 import asyncio
 import shutil
+from contextlib import suppress
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
 
 from .. import models
-from ..utils.platform_detect import get_backend_type
 from ..services.task_queue import create_background_task
 from ..utils.progress import get_progress_manager
 from ..utils.tasks import get_task_manager
@@ -49,7 +48,20 @@ def _copy_with_progress(src: Path, dst: Path, progress_manager, copied_so_far: i
 
 def _refuse_if_in_use(engine: str) -> None:
     """Unloading under a running job would pull the model out from under it."""
+    from ..backends import STT_ENGINES, get_stt_backend_for_engine
     from ..services import task_queue
+    from ..services.inference_slots import llm_slot, whisper_slot
+
+    if engine in STT_ENGINES:
+        backend = get_stt_backend_for_engine(engine)
+        if whisper_slot.busy or getattr(backend, "active_streams", 0):
+            raise HTTPException(
+                status_code=409,
+                detail=f"{engine} has active transcription work; retry when it finishes",
+                headers={"Retry-After": "5"},
+            )
+    elif engine == "qwen_llm" and llm_slot.busy:
+        raise HTTPException(status_code=409, detail="The language model is in use", headers={"Retry-After": "5"})
 
     pending = task_queue.engine_in_use(engine)
     if pending:
@@ -58,6 +70,26 @@ def _refuse_if_in_use(engine: str) -> None:
             detail=f"{engine} has {pending} generation(s) queued or running; retry when they finish",
             headers={"Retry-After": "5"},
         )
+
+
+async def _model_action(config, action):
+    """Serialize STT/LLM administration with inference, including abandoned worker threads."""
+    from ..backends import get_stt_backend_for_engine
+    from ..services.inference_slots import InferenceBusyError, llm_slot, whisper_slot
+
+    async def invoke():
+        if config.model_type == "stt":
+            backend = get_stt_backend_for_engine(config.engine)
+            if getattr(backend, "active_streams", 0):
+                raise HTTPException(status_code=409, detail="Close active native transcription streams first")
+        result = action()
+        return await result if asyncio.iscoroutine(result) else result
+
+    slot = whisper_slot if config.model_type == "stt" else llm_slot if config.model_type == "llm" else None
+    try:
+        return await slot.run(invoke) if slot else await invoke()
+    except InferenceBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc), headers={"Retry-After": "5"}) from exc
 
 
 @router.post("/models/load")
@@ -70,7 +102,7 @@ async def load_model(model_size: str = "1.7B"):
         await tts_model.load_model_async(model_size)
         return {"message": f"Model {model_size} loaded successfully"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.post("/models/unload")
@@ -83,7 +115,7 @@ async def unload_model():
         tts.unload_tts_model()
         return {"message": "Model unloaded successfully"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.post("/models/{model_name}/unload")
@@ -97,10 +129,12 @@ async def unload_model_by_name(model_name: str):
 
     _refuse_if_in_use(config.engine)
     try:
-        was_loaded = unload_model_by_config(config)
+        was_loaded = await _model_action(config, lambda: unload_model_by_config(config))
         if not was_loaded:
             return {"message": f"Model {model_name} is not loaded"}
         return {"message": f"Model {model_name} unloaded successfully"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -160,10 +194,8 @@ async def migrate_models(request: models.ModelMigrateRequest):
     destination.mkdir(parents=True, exist_ok=True)
 
     same_fs = False
-    try:
+    with suppress(OSError):
         same_fs = source.stat().st_dev == destination.stat().st_dev
-    except OSError:
-        pass
 
     async def migrate_background():
         moved = 0
@@ -186,7 +218,7 @@ async def migrate_models(request: models.ModelMigrateRequest):
                             status="downloading",
                         )
                     except Exception as e:
-                        errors.append(f"{item.name}: {str(e)}")
+                        errors.append(f"{item.name}: {e!s}")
             else:
                 total_bytes = sum(_get_dir_size(d) for d in model_dirs)
                 progress_manager.update_progress(
@@ -205,7 +237,7 @@ async def migrate_models(request: models.ModelMigrateRequest):
                         await asyncio.to_thread(shutil.rmtree, str(item))
                         moved += 1
                     except Exception as e:
-                        errors.append(f"{item.name}: {str(e)}")
+                        errors.append(f"{item.name}: {e!s}")
 
             progress_manager.update_progress("migration", 1, 1, status="complete")
             progress_manager.mark_complete("migration")
@@ -243,7 +275,6 @@ async def get_model_status():
     """Get status of all available models."""
     from huggingface_hub import constants as hf_constants
 
-    backend_type = get_backend_type()
     task_manager = get_task_manager()
 
     # Pending only — an errored task stays in the active list for the
@@ -258,7 +289,7 @@ async def get_model_status():
     except ImportError:
         use_scan_cache = False
 
-    from ..backends import get_all_model_configs, check_model_loaded
+    from ..backends import check_model_loaded, get_all_model_configs, get_stt_backend_for_engine
 
     registry_configs = get_all_model_configs()
     model_configs = [
@@ -267,6 +298,14 @@ async def get_model_status():
             "display_name": cfg.display_name,
             "hf_repo_id": cfg.hf_repo_id,
             "model_size": cfg.model_size,
+            "model_type": cfg.model_type,
+            "engine": cfg.engine,
+            "supports_streaming": cfg.supports_streaming,
+            "runtime_available": (
+                getattr(get_stt_backend_for_engine(cfg.engine), "runtime_available", lambda: None)()
+                if cfg.model_type == "stt"
+                else None
+            ),
             "check_loaded": lambda c=cfg: check_model_loaded(c),
         }
         for cfg in registry_configs
@@ -277,10 +316,8 @@ async def get_model_status():
 
     cache_info = None
     if use_scan_cache:
-        try:
+        with suppress(Exception):
             cache_info = scan_cache_dir()
-        except Exception:
-            pass
 
     statuses = []
 
@@ -298,7 +335,7 @@ async def get_model_status():
                         for rev in repo.revisions:
                             for f in rev.files:
                                 fname = f.file_name.lower()
-                                if fname.endswith((".safetensors", ".bin", ".pt", ".pth", ".npz")):
+                                if fname.endswith((".safetensors", ".bin", ".pt", ".pth", ".npz", ".nemo")):
                                     has_model_weights = True
                                     break
                             if has_model_weights:
@@ -341,6 +378,7 @@ async def get_model_status():
                                     or any(snapshots_dir.rglob("*.pt"))
                                     or any(snapshots_dir.rglob("*.pth"))
                                     or any(snapshots_dir.rglob("*.npz"))
+                                    or any(snapshots_dir.rglob("*.nemo"))
                                 )
 
                             if has_model_files:
@@ -373,6 +411,10 @@ async def get_model_status():
                     model_name=config["model_name"],
                     display_name=config["display_name"],
                     hf_repo_id=config["hf_repo_id"],
+                    model_type=config["model_type"],
+                    engine=config["engine"],
+                    supports_streaming=config["supports_streaming"],
+                    runtime_available=config["runtime_available"],
                     downloaded=downloaded,
                     downloading=is_downloading,
                     size_mb=size_mb,
@@ -392,6 +434,10 @@ async def get_model_status():
                     model_name=config["model_name"],
                     display_name=config["display_name"],
                     hf_repo_id=config["hf_repo_id"],
+                    model_type=config["model_type"],
+                    engine=config["engine"],
+                    supports_streaming=config["supports_streaming"],
+                    runtime_available=config["runtime_available"],
                     downloaded=False,
                     downloading=is_downloading,
                     size_mb=None,
@@ -415,12 +461,12 @@ async def trigger_model_download(request: models.ModelDownloadRequest):
         raise HTTPException(status_code=400, detail=f"Unknown model: {request.model_name}")
 
     load_func = get_model_load_func(config)
+    if config.model_type in {"stt", "llm"}:
+        _refuse_if_in_use(config.engine)
 
     async def download_in_background():
         try:
-            result = load_func()
-            if asyncio.iscoroutine(result):
-                await result
+            await _model_action(config, load_func)
             task_manager.complete_download(request.model_name)
         except Exception as e:
             task_manager.error_download(request.model_name, str(e))
@@ -463,6 +509,7 @@ async def cancel_model_download(request: models.ModelDownloadRequest):
 async def delete_model(model_name: str):
     """Delete a downloaded model from the HuggingFace cache."""
     from huggingface_hub import constants as hf_constants
+
     from ..backends import get_model_config, unload_model_by_config
 
     config = get_model_config(model_name)
@@ -470,8 +517,9 @@ async def delete_model(model_name: str):
         raise HTTPException(status_code=400, detail=f"Unknown model: {model_name}")
 
     hf_repo_id = config.hf_repo_id
+    _refuse_if_in_use(config.engine)
 
-    try:
+    async def remove_cached_model():
         unload_model_by_config(config)
 
         cache_dir = hf_constants.HF_HUB_CACHE
@@ -481,13 +529,15 @@ async def delete_model(model_name: str):
             raise HTTPException(status_code=404, detail=f"Model {model_name} not found in cache")
 
         try:
-            shutil.rmtree(repo_cache_dir)
+            await asyncio.to_thread(shutil.rmtree, repo_cache_dir)
         except OSError as e:
-            raise HTTPException(status_code=500, detail=f"Failed to delete model cache directory: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to delete model cache directory: {e}") from e
 
         return {"message": f"Model {model_name} deleted successfully"}
 
+    try:
+        return await _model_action(config, remove_cached_model)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete model: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete model: {e}") from e

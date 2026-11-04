@@ -14,7 +14,7 @@ from ..utils import hf_offline_patch  # noqa: F401
 
 import threading
 from dataclasses import dataclass, field
-from typing import Protocol, Optional, Tuple, List
+from typing import TYPE_CHECKING, Protocol, Optional, Tuple, List
 from typing_extensions import runtime_checkable
 import numpy as np
 
@@ -22,6 +22,9 @@ DEFAULT_LLM_MAX_TOKENS = 512
 DEFAULT_LLM_TEMPERATURE = 0.7
 
 from ..utils.platform_detect import get_backend_type
+
+if TYPE_CHECKING:
+    from ..utils.subtitles import Transcript
 
 LANGUAGE_CODE_TO_NAME = {
     "zh": "chinese",
@@ -59,6 +62,12 @@ class ModelConfig:
     retries_runaway: bool = False
     supports_instruct: bool = False
     languages: list[str] = field(default_factory=lambda: ["en"])
+    model_type: str = "tts"
+    supports_streaming: bool = False
+    supports_prompt: bool = False
+    supports_hotwords: bool = False
+    supports_word_timestamps: bool = False
+    supports_segment_timestamps: bool = False
 
 
 @runtime_checkable
@@ -153,6 +162,10 @@ class STTBackend(Protocol):
         audio_path: str,
         language: Optional[str] = None,
         model_size: Optional[str] = None,
+        *,
+        prompt: str | None = None,
+        hotwords: list[str] | tuple[str, ...] | None = None,
+        word_timestamps: bool = False,
     ) -> str:
         """
         Transcribe audio to text.
@@ -167,7 +180,11 @@ class STTBackend(Protocol):
         audio_path: str,
         language: Optional[str] = None,
         model_size: Optional[str] = None,
-    ):
+        *,
+        prompt: str | None = None,
+        hotwords: list[str] | tuple[str, ...] | None = None,
+        word_timestamps: bool = False,
+    ) -> "Transcript":
         """Transcribe with segment timestamps; returns a ``utils.subtitles.Transcript``."""
         ...
 
@@ -177,6 +194,45 @@ class STTBackend(Protocol):
 
     def is_loaded(self) -> bool:
         """Check if model is loaded."""
+        ...
+
+
+@runtime_checkable
+class STTStreamingSession(Protocol):
+    """Independent native decoder state for one utterance of 16 kHz mono PCM."""
+
+    async def accept_audio(self, audio: np.ndarray) -> str:
+        """Consume only new samples and return cumulative text."""
+        ...
+
+    async def finish(self) -> "Transcript":
+        """Flush the final chunk and release model ownership."""
+        ...
+
+    async def close(self) -> None:
+        """Discard unfinished input and release model ownership, idempotently."""
+        ...
+
+
+@runtime_checkable
+class StreamingSTTBackend(STTBackend, Protocol):
+    """Optional interface for models with native cached streaming inference."""
+
+    @property
+    def active_streams(self) -> int:
+        """Number of decoder sessions that prevent model unloading or switching."""
+        ...
+
+    async def open_stream(
+        self,
+        language: str | None = None,
+        model_size: str | None = None,
+        *,
+        prompt: str | None = None,
+        hotwords: list[str] | tuple[str, ...] | None = None,
+        word_timestamps: bool = False,
+    ) -> STTStreamingSession:
+        """Create a session with independent encoder and decoder caches."""
         ...
 
 
@@ -219,6 +275,9 @@ _tts_backend: Optional[TTSBackend] = None
 _tts_backends: dict[str, TTSBackend] = {}
 _tts_backends_lock = threading.Lock()
 _stt_backend: Optional[STTBackend] = None
+_stt_backends: dict[str, STTBackend] = {}
+_stt_backends_lock = threading.Lock()
+STT_ENGINES = {"whisper": "Whisper", "faster_whisper": "faster-whisper", "nemotron": "Nemotron"}
 _llm_backends: dict[str, LLMBackend] = {}
 _llm_backends_lock = threading.Lock()
 
@@ -391,43 +450,60 @@ def _get_non_qwen_tts_configs() -> list[ModelConfig]:
 
 
 def _get_whisper_configs() -> list[ModelConfig]:
-    """Return Whisper STT model configs."""
+    """Return the existing Whisper models with their actual language capabilities."""
+    from .stt_capabilities import WHISPER_LANGUAGES
+
     return [
         ModelConfig(
-            model_name="whisper-base",
-            display_name="Whisper Base",
+            model_name=f"whisper-{size}",
+            display_name=f"Whisper {size.title()}",
             engine="whisper",
-            hf_repo_id="openai/whisper-base",
-            model_size="base",
-        ),
+            hf_repo_id=repo,
+            model_size=size,
+            model_type="stt",
+            languages=WHISPER_LANGUAGES + (["yue"] if size in ("large", "turbo") else []),
+            supports_prompt=True,
+            supports_hotwords=True,
+            supports_word_timestamps=True,
+            supports_segment_timestamps=True,
+        )
+        for size, repo in WHISPER_HF_REPOS.items()
+    ]
+
+
+def _get_optional_stt_configs() -> list[ModelConfig]:
+    """Describe optional runtimes without importing them or loading weights."""
+    from .stt_capabilities import FASTER_WHISPER_REPOS, NEMOTRON_MULTILINGUAL_LOCALES, NEMOTRON_REPOS, WHISPER_LANGUAGES
+
+    return [
         ModelConfig(
-            model_name="whisper-small",
-            display_name="Whisper Small",
-            engine="whisper",
-            hf_repo_id="openai/whisper-small",
-            model_size="small",
-        ),
+            model_name=f"faster-whisper-{size}",
+            display_name=f"faster-whisper {size.title()} (CPU/CUDA)",
+            engine="faster_whisper",
+            hf_repo_id=repo,
+            model_size=size,
+            model_type="stt",
+            languages=WHISPER_LANGUAGES + (["yue"] if size in ("large", "turbo") else []),
+            supports_prompt=True,
+            supports_hotwords=True,
+            supports_word_timestamps=True,
+            supports_segment_timestamps=True,
+        )
+        for size, repo in FASTER_WHISPER_REPOS.items()
+    ] + [
         ModelConfig(
-            model_name="whisper-medium",
-            display_name="Whisper Medium",
-            engine="whisper",
-            hf_repo_id="openai/whisper-medium",
-            model_size="medium",
-        ),
-        ModelConfig(
-            model_name="whisper-large",
-            display_name="Whisper Large",
-            engine="whisper",
-            hf_repo_id="openai/whisper-large-v3",
-            model_size="large",
-        ),
-        ModelConfig(
-            model_name="whisper-turbo",
-            display_name="Whisper Turbo",
-            engine="whisper",
-            hf_repo_id="openai/whisper-large-v3-turbo",
-            model_size="turbo",
-        ),
+            model_name=f"nemotron-streaming-{size}",
+            display_name="Nemotron English 0.6B" if size == "en-0.6b" else "Nemotron 3.5 Multilingual 0.6B",
+            engine="nemotron",
+            hf_repo_id=repo,
+            model_size=size,
+            size_mb=2400,
+            model_type="stt",
+            languages=["en"] if size == "en-0.6b" else list(NEMOTRON_MULTILINGUAL_LOCALES),
+            supports_streaming=True,
+            supports_segment_timestamps=True,
+        )
+        for size, repo in NEMOTRON_REPOS.items()
     ]
 
 
@@ -456,6 +532,7 @@ def _get_qwen_llm_configs() -> list[ModelConfig]:
             model_name="qwen3-0.6b",
             display_name="Qwen3 0.6B",
             engine="qwen_llm",
+            model_type="llm",
             hf_repo_id=repo_0_6,
             model_size="0.6B",
             size_mb=400 if backend_type == "mlx" else 1400,
@@ -465,6 +542,7 @@ def _get_qwen_llm_configs() -> list[ModelConfig]:
             model_name="qwen3-1.7b",
             display_name="Qwen3 1.7B",
             engine="qwen_llm",
+            model_type="llm",
             hf_repo_id=repo_1_7,
             model_size="1.7B",
             size_mb=1100 if backend_type == "mlx" else 3500,
@@ -474,6 +552,7 @@ def _get_qwen_llm_configs() -> list[ModelConfig]:
             model_name="qwen3-4b",
             display_name="Qwen3 4B",
             engine="qwen_llm",
+            model_type="llm",
             hf_repo_id=repo_4,
             model_size="4B",
             size_mb=2500 if backend_type == "mlx" else 8000,
@@ -488,7 +567,7 @@ def get_all_model_configs() -> list[ModelConfig]:
         _get_qwen_model_configs()
         + _get_qwen_custom_voice_configs()
         + _get_non_qwen_tts_configs()
-        + _get_whisper_configs()
+        + get_stt_model_configs()
         + _get_qwen_llm_configs()
     )
 
@@ -504,8 +583,8 @@ def get_llm_model_configs() -> list[ModelConfig]:
 
 
 def get_stt_model_configs() -> list[ModelConfig]:
-    """Return only STT (Whisper) model configs."""
-    return _get_whisper_configs()
+    """Return all default and optional speech-recognition model configs."""
+    return _get_whisper_configs() + _get_optional_stt_configs()
 
 
 # Lookup helpers — these replace the if/elif chains in main.py
@@ -581,12 +660,12 @@ async def ensure_model_cached_or_raise(engine: str, model_size: str = "default")
 def unload_model_by_config(config: ModelConfig) -> bool:
     """Unload a model given its config. Returns True if it was loaded, False otherwise."""
     from . import get_tts_backend_for_engine
-    from ..services import tts, transcribe, llm as llm_service
+    from ..services import tts, llm as llm_service
 
-    if config.engine == "whisper":
-        whisper_model = transcribe.get_whisper_model()
-        if whisper_model.is_loaded() and whisper_model.model_size == config.model_size:
-            transcribe.unload_whisper_model()
+    if config.engine in STT_ENGINES:
+        backend = get_stt_backend_for_engine(config.engine)
+        if backend.is_loaded() and backend.model_size == config.model_size:
+            backend.unload_model()
             return True
         return False
 
@@ -625,12 +704,12 @@ def unload_model_by_config(config: ModelConfig) -> bool:
 def check_model_loaded(config: ModelConfig) -> bool:
     """Check if a model is currently loaded."""
     from . import get_tts_backend_for_engine
-    from ..services import tts, transcribe, llm as llm_service
+    from ..services import tts, llm as llm_service
 
     try:
-        if config.engine == "whisper":
-            whisper_model = transcribe.get_whisper_model()
-            return whisper_model.is_loaded() and getattr(whisper_model, "model_size", None) == config.model_size
+        if config.engine in STT_ENGINES:
+            backend = get_stt_backend_for_engine(config.engine)
+            return backend.is_loaded() and getattr(backend, "model_size", None) == config.model_size
 
         if config.engine == "qwen_llm":
             backend = llm_service.get_llm_model()
@@ -656,10 +735,10 @@ def check_model_loaded(config: ModelConfig) -> bool:
 def get_model_load_func(config: ModelConfig):
     """Return a callable that loads/downloads the model."""
     from . import get_tts_backend_for_engine
-    from ..services import tts, transcribe, llm as llm_service
+    from ..services import tts, llm as llm_service
 
-    if config.engine == "whisper":
-        return lambda: transcribe.get_whisper_model().load_model(config.model_size)
+    if config.engine in STT_ENGINES:
+        return lambda: get_stt_backend_for_engine(config.engine).load_model(config.model_size)
 
     if config.engine == "qwen":
         return lambda: tts.get_tts_model().load_model(config.model_size)
@@ -770,6 +849,25 @@ def get_stt_backend() -> STTBackend:
     return _stt_backend
 
 
+def get_stt_backend_for_engine(engine: str) -> STTBackend:
+    """Resolve an STT runtime lazily, preserving platform-native Whisper as default."""
+    if engine == "whisper":
+        return get_stt_backend()
+    if engine not in STT_ENGINES:
+        raise ValueError(f"Unknown STT engine: {engine}. Supported: {list(STT_ENGINES)}")
+    with _stt_backends_lock:
+        if engine not in _stt_backends:
+            if engine == "faster_whisper":
+                from .faster_whisper_backend import FasterWhisperSTTBackend
+
+                _stt_backends[engine] = FasterWhisperSTTBackend()
+            else:
+                from .nemotron_backend import NemotronSTTBackend
+
+                _stt_backends[engine] = NemotronSTTBackend()
+        return _stt_backends[engine]
+
+
 def get_llm_backend() -> LLMBackend:
     """Get or create the default Qwen3 LLM backend based on platform."""
     return get_llm_backend_for_engine("qwen_llm")
@@ -809,4 +907,5 @@ def reset_backends():
     _tts_backend = None
     _tts_backends.clear()
     _stt_backend = None
+    _stt_backends.clear()
     _llm_backends.clear()

@@ -229,11 +229,11 @@ Voicebox ends a session in these cases; the close carries the reason as text:
 
 These closes come without an `error` event, except the `1008` ones, so the plugin treats them as recoverable and reconnects: after 0.1 s, then every 2 s, giving up after three retries in a row. A connection that lasted longer than LiveKit's 10 s connect timeout starts that count over, which is why the idle timeout cannot go below 15 s. Before an idle, too-long or shutdown close, Voicebox commits the utterance in progress and delivers its final transcript first; on shutdown that needs `VOICEBOX_SHUTDOWN_DELAY_S` (see [Deployment](/overview/deployment#5-graceful-stop)). Every reconnect costs one `inference`, so a muted caller costs one per idle timeout, and the plugin itself starts a fresh session after ten minutes, at its next final transcript.
 
-The socket accepts the plugin's `prompt` (up to 4,096 characters) but does not pass it to Whisper yet, and ignores `noise_reduction_type`.
+The socket passes the plugin's `prompt` (up to 4,096 characters) into Whisper/faster-whisper inference and ignores `noise_reduction_type`. Native Nemotron rejects prompts; omit them for that model.
 
 ### Batch transcription
 
-`openai.STT(...)` without `use_realtime` posts each utterance to `POST /v1/audio/transcriptions`. The plugin cannot stream in this mode, so `AgentSession` lets the session's VAD cut the utterances; it must have one, and `vad=None` fails with "does not support streaming, add a VAD". The final transcript arrives one Whisper pass after Silero closes the utterance, with no interim transcripts. There is no session to keep open, and each utterance costs one `inference` and one request. `prompt` and `temperature` are ignored.
+`openai.STT(...)` without `use_realtime` posts each utterance to `POST /v1/audio/transcriptions`. The plugin cannot stream in this mode, so `AgentSession` lets the session's VAD cut the utterances; it must have one, and `vad=None` fails with "does not support streaming, add a VAD". The final transcript arrives one Whisper pass after Silero closes the utterance, with no interim transcripts. There is no session to keep open, and each utterance costs one `inference` and one request. `prompt` reaches supporting STT models; `temperature` is ignored.
 
 ### Models
 
@@ -328,3 +328,7 @@ The first row is what a caller feels. With LiveKit's defaults the LLM starts on 
     The other way agents use Voicebox: a tool call to speak or transcribe.
   </Card>
 </Cards>
+
+## Optional STT runtimes
+
+Set `VOICEBOX_STT_MODEL` to `faster-whisper-base` (or another registered size), `nemotron-streaming-en-0.6b`, or `nemotron-streaming-multilingual-0.6b` after [installing and preloading the runtime](/developer/transcription). Native Nemotron retains encoder/decoder state between audio chunks through the same realtime endpoint. Whisper and faster-whisper use rolling partial passes. Their historical latency measurements above do not describe Nemotron performance.

@@ -499,6 +499,10 @@ class ModelStatus(BaseModel):
 
     model_name: str
     display_name: str
+    model_type: Literal["tts", "stt", "llm"] = "tts"
+    engine: str | None = None
+    supports_streaming: bool = False
+    runtime_available: bool | None = None
     hf_repo_id: Optional[str] = None  # HuggingFace repository ID
     downloaded: bool
     downloading: bool = False  # True if download is in progress

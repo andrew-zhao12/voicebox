@@ -30,3 +30,7 @@ backend/tests/test_task_queue_concurrency.py
 backend/tests/test_task_queue_lanes.py
 backend/tests/test_wav_stream.py
 backend/tests/test_speech_benchmark.py
+backend/tests/test_native_stt.py
+backend/tests/test_model_stt_lifecycle.py
+backend/tests/test_optional_stt_backends.py
+backend/tests/test_speech_text.py

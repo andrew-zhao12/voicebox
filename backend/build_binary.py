@@ -57,6 +57,18 @@ def build_server(cuda=False, rocm=False):
         binary_name,
     ]
 
+    # The optional Nemotron interpreter needs source, not PyInstaller bytecode.
+    args.extend(["--add-data", "backends/nemotron_worker.py:backend/backends"])
+    if os.environ.get("VOICEBOX_BUNDLE_FASTER_WHISPER") == "1":
+        import importlib.util
+
+        if importlib.util.find_spec("faster_whisper") is None:
+            raise RuntimeError("Install requirements-faster-whisper.txt before bundling faster-whisper")
+        for package in ("faster_whisper", "ctranslate2", "av", "onnxruntime"):
+            args.extend(["--collect-all", package])
+    else:
+        args.extend(["--exclude-module", "faster_whisper", "--exclude-module", "ctranslate2"])
+
     # Hide console window on Windows only. On macOS/Linux the sidecar needs
     # stdout/stderr for Tauri to capture logs.
     if platform.system() == "Windows":

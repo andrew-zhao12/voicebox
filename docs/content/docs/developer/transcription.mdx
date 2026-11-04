@@ -1,167 +1,101 @@
 ---
 title: "Transcription"
-description: "How Whisper-based audio transcription works in Voicebox"
+description: "Whisper, faster-whisper and native Nemotron streaming recognition"
 ---
 
-## Overview
+Voicebox uses Whisper by default: MLX on Apple Silicon and Transformers/PyTorch elsewhere. Optional faster-whisper and Nemotron runtimes share the same upload and realtime APIs. Voice-sample auto-fill continues to use the default Whisper backend.
 
-Voicebox uses OpenAI's Whisper for automatic speech recognition (ASR). Transcription powers two flows:
+## Models and capabilities
 
-1. **Reference-text auto-fill** — when a user records or uploads a voice sample, the backend transcribes it and populates the `reference_text` field so cloning can use it.
-2. **On-demand transcription** — a user-facing `/transcribe` endpoint for arbitrary audio.
+`GET /v1/models` returns model IDs, languages, download/load state, runtime availability and capability flags. Downloaded weights and an installed runtime are separate requirements.
 
-On Apple Silicon, the transcription path runs through **MLX-Whisper** (from `mlx-audio`) for ~8× faster inference than PyTorch. Everywhere else it runs through PyTorch's `transformers` Whisper.
+| IDs | Runtime | Native streaming | Vocabulary hints | Word timestamps |
+|---|---|---|---|---|
+| `whisper-base`, `whisper-small`, `whisper-medium`, `whisper-large`, `whisper-turbo` | Built-in MLX or PyTorch | No; rolling partial passes | `prompt`, `hotwords` | Yes |
+| `faster-whisper-base`, `faster-whisper-small`, `faster-whisper-medium`, `faster-whisper-large`, `faster-whisper-turbo` | Optional CTranslate2 | No; rolling partial passes | `prompt`, `hotwords` | Yes |
+| `nemotron-streaming-en-0.6b` | Isolated Transformers worker | Yes; cached encoder and RNNT decoder | Unsupported | Unsupported |
+| `nemotron-streaming-multilingual-0.6b` | Isolated Transformers worker | Yes; cached encoder and RNNT decoder | Unsupported | Unsupported |
 
-## Architecture
+Large maps to Whisper Large v3; Turbo maps to Large v3 Turbo. Base, Small and Medium advertise Whisper's 99 languages; Large and Turbo also include Cantonese (`yue`). Nemotron English supports English; the multilingual model advertises its 32 usable locales, excluding adaptation-only locales. Consult each model's returned `languages` list.
 
-Transcription is wired through the same backend abstraction as TTS. The `STTBackend` protocol lives in `backend/backends/__init__.py`:
+`whisper-1`, `gpt-4o-transcribe` and `gpt-4o-mini-transcribe` remain aliases for the current default Whisper size. They do not invoke OpenAI's hosted models. Bare sizes (`base`, `small`, `medium`, `large`, `turbo`) remain valid for existing clients.
 
-```python
-@runtime_checkable
-class STTBackend(Protocol):
-    async def load_model(self, model_size: str) -> None: ...
-    async def transcribe(
-        self,
-        audio_path: str,
-        language: Optional[str] = None,
-        model_size: Optional[str] = None,
-    ) -> str: ...
-    def unload_model(self) -> None: ...
-    def is_loaded(self) -> bool: ...
+## Optional runtimes
+
+Install faster-whisper into the Python environment that runs the server:
+
+```bash
+backend/venv/bin/python -m pip install -r backend/requirements-faster-whisper.txt
 ```
 
-Two implementations ship today:
+Set `VOICEBOX_FASTER_WHISPER_DEVICE=cpu` or `cuda` (default `auto`). `VOICEBOX_FASTER_WHISPER_COMPUTE_TYPE` overrides the runtime's compute type; CPU defaults to `int8`, CUDA to `float16`. `VOICEBOX_REPLICA_THREADS` sets CPU threads. The requirements pin a compatible PyAV version. CUDA also needs the libraries required by the installed CTranslate2 build; verify them on the target host.
 
-- **`MLXSTTBackend`** (`backends/mlx_backend.py`) — uses `mlx_audio.stt.load()`. Default on Apple Silicon.
-- **`PyTorchSTTBackend`** (`backends/pytorch_backend.py`) — uses `transformers.WhisperForConditionalGeneration`. Default everywhere else.
+Nemotron requires Transformers 5, which conflicts with the desktop TTS stack. Install it into a **separate Python 3.12 environment** and point Voicebox at that interpreter:
 
-`get_stt_backend()` picks the right one based on `get_backend_type()`. `backend/services/transcribe.py` is a thin wrapper that delegates to the backend.
-
-## Model Sizes
-
-Five Whisper variants are registered in `ModelConfig`:
-
-| Model | HuggingFace Repo | Size | Notes |
-|-------|------------------|------|-------|
-| **Base** | `openai/whisper-base` | ~300 MB | Default; fast, decent quality |
-| **Small** | `openai/whisper-small` | ~500 MB | Better quality, still fast |
-| **Medium** | `openai/whisper-medium` | ~1.5 GB | High quality |
-| **Large** | `openai/whisper-large-v3` | ~3 GB | Best quality, slow on CPU |
-| **Turbo** | `openai/whisper-large-v3-turbo` | ~1.5 GB | Large-tier quality, ~5× faster than Large |
-
-The `tiny` model is **not** exposed — the quality gap to `base` wasn't worth the download.
-
-`Turbo` + MLX-Whisper on Apple Silicon dropped user-facing transcription latency from ~20s to ~2-3s in v0.1.10.
-
-## Language Hints
-
-Whisper can auto-detect language, but providing a hint improves accuracy on short clips:
-
-```python
-text = await backend.transcribe(audio_path, language="en")
+```bash
+python3.12 -m venv .venv-nemotron
+.venv-nemotron/bin/python -m pip install -r backend/requirements-nemotron.txt
+export VOICEBOX_NEMOTRON_PYTHON="$PWD/.venv-nemotron/bin/python"
+export VOICEBOX_NEMOTRON_DEVICE=cpu  # auto or cuda are also supported
+export VOICEBOX_PRELOAD_MODELS=kokoro,nemotron-streaming-en-0.6b
+backend/venv/bin/python -m backend.main
 ```
 
-Accepted language codes are the standard Whisper set (99+ languages). The frontend typically passes the profile's language if available, or lets Whisper detect otherwise.
+`VOICEBOX_NEMOTRON_DELAY_MS` selects the model's streaming lookahead (default `560`; supported values are model-specific). Optional dependencies are not installed by the standard desktop/server environment. For containers, install the extra runtime in your derived image and set the same variables. `runtime_available` checks whether the package/interpreter is present; loading performs the full runtime validation.
 
-## Model Loading
+Administrators download/load models through Model Management or `/models/download` and `/models/load`. Client keys can only use weights already cached. Preload the chosen IDs with `VOICEBOX_PRELOAD_MODELS` and wait for `/health/ready` before accepting calls.
 
-Both backends are lazy: the model is loaded on first use and cached in memory. Switching sizes unloads the previous model.
+## File transcription
 
-On MLX, the model is loaded via `mlx_audio.stt.load(hf_repo)`. On PyTorch, via:
+Both `/transcribe` and `/v1/audio/transcriptions` accept multipart `file`, `model`, `language`, `prompt` and repeated `hotwords` fields. The OpenAI-compatible endpoint also supports `json`, `text`, `verbose_json`, `srt` and `vtt` output.
 
-```python
-WhisperProcessor.from_pretrained(hf_repo)
-WhisperForConditionalGeneration.from_pretrained(hf_repo).to(device)
+```bash
+curl "$VOICEBOX_URL/v1/audio/transcriptions" \
+  -H "Authorization: Bearer $VOICEBOX_CLIENT_KEY" \
+  -F file=@recording.wav -F model=faster-whisper-base -F language=en \
+  -F 'prompt=A discussion about speech software.' \
+  -F hotwords=Voicebox -F hotwords=Pipecat \
+  -F response_format=verbose_json -F 'timestamp_granularities[]=word'
 ```
 
-Both load paths use `model_load_progress()` from `backends/base.py` so the frontend sees live download progress on the first use.
+`prompt` is bounded at 4,096 characters. `hotwords` accepts up to 100 non-empty terms, each at most 100 characters and at most 4,096 characters total. Whisper merges vocabulary into its initial prompt; faster-whisper passes vocabulary to its decoder's hotword option. Hints bias recognition; they do not guarantee a spelling. Unsupported options, including hints or word timing on Nemotron, return a clear error.
 
-On MLX, `MLXSTTBackend._load_model_sync` also patches mlx-audio's tokenizer wrapper. mlx-audio (the pinned 0.4.1, and its main branch) looks the no-speech token up only as `<|nospeech|>`, but the tokenizers before large-v3 call it `<|nocaptions|>`. The lookup fell back to the unknown token, which in Whisper is `<|endoftext|>`, and because decoding suppresses the no-speech token it suppressed end-of-text: Base, Small and Medium decoded every 30 s window up to the token limit, appending invented text to nearly every transcript, and `no_speech_prob` never flagged silence. `_no_speech_token` resolves either name and is installed as `HFTokenizerWrapper.no_speech`; `backend/tests/test_mlx_whisper.py` guards it. Large (v3) and Turbo were never affected. Keep the patch until mlx-audio fixes the lookup upstream.
+Word timings require `response_format=verbose_json`. The returned `words` array contains actual aligned `word`, `start` and `end` values in seconds; no timings are synthesized by distributing text across the clip. Segment timings remain available for subtitle output. Nemotron segments describe decoder emission spans, not forced word alignment.
 
-## Audio Preprocessing
+Audio is decoded and normalized into an inference-owned WAV. Cancelling an upload does not delete that file while a model thread still needs it. Whisper handles recordings longer than its 30-second window through its runtime's long-form path.
 
-Whisper expects mono 16 kHz audio. The audio utility in `backend/utils/audio.py` handles resampling and format conversion transparently:
+## Realtime recognition
 
-- **Formats:** WAV, MP3, FLAC, OGG, M4A (via soundfile / librosa)
-- **Target:** mono, 16 kHz, float32
+`WS /v1/realtime?intent=transcription` serves the OpenAI GA transcription protocol. `/v1/realtime/transcription` serves Voicebox's beta-shaped session events. See the [wire protocol](/overview/api-reference#live-transcription-ws-v1realtime).
 
-Files longer than Whisper's 30-second window are transcribed window by window. On Apple Silicon mlx-audio does this internally; on the PyTorch path `backend/backends/pytorch_backend.py` switches to transformers' long-form generation (`truncation=False`, `return_timestamps=True`) for audio over 30 seconds, while shorter clips use the padded single window.
+Whisper and faster-whisper re-transcribe the accumulated utterance for partial results. Nemotron consumes **only new audio** and retains per-utterance encoder/decoder caches; independent sockets do not share decoder state. Both paths use the same VAD/manual commits, stable partial deltas and authoritative final transcript. The existing 30-second utterance bound applies to all models.
 
-## API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/transcribe` | Transcribe an uploaded audio file |
-| POST | `/v1/audio/transcriptions` | The OpenAI-compatible upload, with `verbose_json`, `srt` and `vtt` output ([API Reference](/overview/api-reference)) |
-| WebSocket | `/v1/realtime?intent=transcription`, `/v1/realtime/transcription` | Live transcription: partial and final transcripts per utterance ([API Reference](/overview/api-reference)) |
-
-Whisper runs outside the generation queue, one call at a time, behind `services/inference_slots.py::whisper_slot`: up to four callers wait (60 s each), the rest get `429`. Every path calls `whisper_slot.run(...)`, which keeps the slot until the worker thread has finished even when the caller is cancelled (a live transcription socket closing mid-utterance, a client hanging up), so two transcriptions never overlap.
-
-### Request
-
-Multipart form data:
-
-```
-POST /transcribe
-Content-Type: multipart/form-data
-
-file: <audio_file>
-language: en         # optional
-model: base          # optional: base, small, medium, large, turbo (default: the loaded size, initially "base")
-```
-
-### Response
+Configure hints and timing inside the transcription object:
 
 ```json
 {
-  "text": "Hello, this is a test transcription.",
-  "duration": 3.5
+  "type": "session.update",
+  "session": {
+    "type": "transcription",
+    "audio": {"input": {
+      "format": {"type": "audio/pcm", "rate": 16000},
+      "transcription": {
+        "model": "whisper-base", "language": "en",
+        "prompt": "Software discussion.", "hotwords": ["Voicebox"],
+        "word_timestamps": true
+      },
+      "turn_detection": null
+    }}
+  }
 }
 ```
 
-## Use Cases
+With `word_timestamps: true`, completed events include `words`. Commit or clear the current audio before changing model, language, hints or timing settings. Already queued utterances retain their original settings. Native models reject unsupported hints/timing.
 
-### Reference Text for Voice Cloning
+## Concurrency and lifecycle
 
-Adding a voice sample triggers transcription automatically:
+All STT work uses the shared `whisper_slot`, including optional engines. At most four callers wait, with a 60-second wait limit; excess work gets `429` or the socket's `whisper_busy` error. A cancelled caller retains its inference slot until its underlying work finishes.
 
-1. User uploads or records audio.
-2. The backend writes the audio file and calls `/transcribe` internally (or the frontend calls it separately).
-3. The returned text becomes `reference_text` on the new `profile_samples` row.
-4. Cloning engines that need reference text (Chatterbox, TADA, etc.) read it from there.
+Native streaming holds the slot per operation, not for a socket's entire lifetime. Each decoder stream pins its model against unload or model switching. Clear, disconnect and finalization release decoder state after any in-flight operation finishes. Model Management, preloading and idle unload use the same guards.
 
-### Quality Tips
-
-- Provide a language hint for short clips (under 5 seconds) — auto-detection is unreliable on little audio.
-- Larger sizes are more accurate on noisy, accented or technical speech; Turbo gives Large-tier accuracy in a fraction of the time. Base is fine for clean speech on both backends.
-- Silence and pure noise transcribe to an empty string on MLX; on the PyTorch path Base tends to return a stray word ("you") for them, so trim long silences before transcribing.
-- Prefer clean audio; transcription errors become reference-text errors, which become cloning errors.
-
-## Memory Management
-
-`unload_model()` drops the model reference and clears the CUDA cache if applicable. `/models/unload` wires this up for manual control.
-
-A singleton per backend is returned by `get_stt_backend()` — multiple callers share one Whisper instance.
-
-## Error Handling
-
-| Error | Cause | Solution |
-|-------|-------|----------|
-| Model not found | First run + network failure | Retry; check connectivity |
-| OOM on load | Large model on low-VRAM GPU | Switch to Small or Turbo |
-| Empty result | No speech in audio | Confirm input has voice; check trim |
-| Wrong language | Auto-detect misfired | Pass `language` hint |
-
-## Next Steps
-
-<Cards>
-  <Card title="Model Management" href="/developer/model-management">
-    Download / load / unload any model
-  </Card>
-  <Card title="Voice Profiles" href="/developer/voice-profiles">
-    How reference text is stored alongside samples
-  </Card>
-  <Card title="GPU Acceleration" href="/overview/gpu-acceleration">
-    Platform-specific acceleration including MLX-Whisper
-  </Card>
-</Cards>
+Use the repository's [speech benchmark walkthrough](https://github.com/jamiepine/voicebox/blob/main/docs/walkthroughs/08-speech-benchmarks.md) to measure accuracy, latency, concurrency and memory on your recordings and deployment hardware. CPU smoke tests establish execution correctness; they do not establish GPU capacity.

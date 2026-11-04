@@ -58,7 +58,7 @@ For a conversational LLM, set `VOICEBOX_LLM=openai` and `OPENAI_API_KEY`, or con
 | `VOICEBOX_LLM` | `openai` | `echo` runs without an external LLM |
 | `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` | OpenAI, `gpt-4.1-mini`, `OPENAI_API_KEY` | Chat provider; custom endpoints use an explicit key or a local placeholder |
 
-Realtime mode streams audio to `/v1/realtime?intent=transcription`. Pipecat's local VAD commits utterances; Voicebox transcribes them with Whisper. This remains utterance-based recognition, rather than a token-streaming ASR model. Batch mode posts VAD-cut recordings to `/v1/audio/transcriptions`.
+Realtime mode streams audio to `/v1/realtime?intent=transcription`. Pipecat's local VAD commits utterances. Whisper and faster-whisper produce rolling partial passes; optional Nemotron uses cached native streaming state between chunks. Set `VOICEBOX_STT_MODEL` to a model ID from `/v1/models` after [installing and preloading its runtime](/developer/transcription). Batch mode posts VAD-cut recordings to `/v1/audio/transcriptions`.
 
 ## Validation and deployment
 

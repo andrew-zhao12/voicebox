@@ -618,3 +618,33 @@ def test_long_utterances_are_cut_at_a_pause_after_the_soft_cap():
         "input_audio_buffer.committed",
     ]
     assert types.count("input_audio_buffer.speech_started") == 2
+
+
+def test_hints_are_snapshotted_for_work_and_require_an_utterance_boundary():
+    cfg = SessionConfig.from_update(
+        SessionConfig(),
+        {
+            "session": {
+                "input_sample_rate": 16000,
+                "turn_detection": None,
+                "input_audio_transcription": {
+                    "prompt": "Database discussion",
+                    "hotwords": ["PostgreSQL"],
+                    "word_timestamps": True,
+                },
+            }
+        },
+    )
+    session = TranscriptionSession(cfg)
+    audio = (np.ones(16000, dtype=np.float32) * 1000).astype("<i2").tobytes()
+    session.append(audio)
+    changed = SessionConfig.from_update(cfg, {"session": {"input_audio_transcription": {"prompt": "New context"}}})
+    with pytest.raises(rt.ProtocolError, match="Commit or clear"):
+        session.update(changed)
+    session.commit()
+    work = session.take_work()[-1]
+    session.update(changed)
+    assert work.prompt == "Database discussion"
+    assert work.hotwords == ("PostgreSQL",)
+    assert work.word_timestamps
+    assert cfg.to_event()["input_audio_transcription"]["hotwords"] == ["PostgreSQL"]

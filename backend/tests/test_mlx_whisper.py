@@ -13,6 +13,7 @@ Usage:
     python -m pytest backend/tests/test_mlx_whisper.py -v
 """
 
+import json
 import platform
 import shutil
 import subprocess
@@ -23,7 +24,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from backend.backends.mlx_backend import _no_speech_token
+from backend.backends.mlx_backend import _install_alignment_heads, _no_speech_token
 
 # whisper-base returns exactly this; without the fix it appended dots or invented words.
 SENTENCE = "The quick brown fox jumps over the lazy dog."
@@ -57,6 +58,25 @@ class FakeHFTokenizer:
 def test_no_speech_token_never_resolves_to_end_of_text(vocab, expected):
     wrapper = SimpleNamespace(hf_tokenizer=FakeHFTokenizer(vocab))
     assert _no_speech_token(wrapper) == expected
+
+
+def test_alignment_uses_cached_model_specific_heads(tmp_path, monkeypatch):
+    config = tmp_path / "generation_config.json"
+    config.write_text(json.dumps({"alignment_heads": [[3, 1], [4, 2]]}))
+    monkeypatch.setattr("huggingface_hub.try_to_load_from_cache", lambda *_args: str(config))
+    model = SimpleNamespace(dims=SimpleNamespace(n_text_layer=6, n_text_head=8))
+    model.set_alignment_heads = lambda heads: setattr(model, "_alignment_heads", heads)
+    assert _install_alignment_heads(model, "openai/whisper-base")
+    assert model.alignment_heads.tolist() == [[3, 1], [4, 2]]
+
+
+@pytest.mark.parametrize("heads", [None, [], [[99, 0]], [[0, -1]], [[True, 1]], [[0]]])
+def test_alignment_rejects_missing_or_invalid_heads(tmp_path, monkeypatch, heads):
+    config = tmp_path / "generation_config.json"
+    config.write_text(json.dumps({"alignment_heads": heads}))
+    monkeypatch.setattr("huggingface_hub.try_to_load_from_cache", lambda *_args: str(config))
+    model = SimpleNamespace(dims=SimpleNamespace(n_text_layer=6, n_text_head=8))
+    assert not _install_alignment_heads(model, "openai/whisper-base")
 
 
 @pytest.fixture(scope="module")
@@ -110,6 +130,17 @@ async def test_transcribe_detailed_keeps_segments_language_and_duration(whisper,
     assert transcript.segments
     assert all(0 <= s.start < s.end <= transcript.duration for s in transcript.segments)
     assert " ".join(s.text for s in transcript.segments) == transcript.text
+
+
+@on_apple_silicon
+async def test_transcribe_detailed_aligns_words_with_vocabulary_hints(whisper, speech):
+    transcript = await whisper.transcribe_detailed(
+        speech(16000), "en", "base", prompt="A familiar sentence.", hotwords=["fox"], word_timestamps=True
+    )
+    assert transcript.text == SENTENCE
+    assert transcript.words
+    assert all(0 <= word.start <= word.end <= transcript.duration for word in transcript.words)
+    assert " ".join(word.word.strip() for word in transcript.words) == SENTENCE
 
 
 @on_apple_silicon

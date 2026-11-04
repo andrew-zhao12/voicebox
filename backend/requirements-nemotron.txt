@@ -1,0 +1,8 @@
+# Install in a SEPARATE Python 3.12 environment; set VOICEBOX_NEMOTRON_PYTHON
+# to its interpreter. Transformers 5 conflicts with the desktop TTS stack.
+transformers==5.13.0
+torch>=2.6,<3
+librosa>=0.11,<0.12
+soundfile>=0.12,<1
+numpy>=1.26,<3
+sentencepiece>=0.2,<0.3

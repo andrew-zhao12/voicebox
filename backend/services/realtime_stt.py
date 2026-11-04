@@ -86,7 +86,9 @@ class SessionConfig:
     input_audio_format: str = "pcm16"
     model: str | None = None
     language: str | None = None
-    prompt: str | None = None  # stored and echoed, not passed to Whisper yet
+    prompt: str | None = None
+    hotwords: tuple[str, ...] = ()
+    word_timestamps: bool = False
     vad: bool = True
     threshold: float = 0.5
     prefix_padding_ms: int = 300
@@ -143,6 +145,12 @@ class SessionConfig:
             raise ProtocolError("invalid_session", "silence_duration_ms must be between 100 and 5000")
         if not 300 <= config.partial_interval_ms <= 10000:
             raise ProtocolError("invalid_session", "partial_interval_ms must be between 300 and 10000")
+        from ..utils.speech_text import validate_hints
+
+        try:
+            validate_hints(config.prompt, config.hotwords)
+        except ValueError as e:
+            raise ProtocolError("invalid_session", str(e)) from e
         return config
 
     def to_event(self) -> dict:
@@ -150,6 +158,10 @@ class SessionConfig:
         transcription = {"model": self.model or "whisper-1", "language": self.language}
         if self.prompt:
             transcription["prompt"] = self.prompt
+        if self.hotwords:
+            transcription["hotwords"] = list(self.hotwords)
+        if self.word_timestamps:
+            transcription["word_timestamps"] = True
         return {
             "input_audio_format": self.input_audio_format,
             "input_sample_rate": self.source_rate,
@@ -175,6 +187,8 @@ class SessionConfig:
                         "model": self.model or "whisper-1",
                         "language": self.language,
                         "prompt": self.prompt,
+                        **({"hotwords": list(self.hotwords)} if self.hotwords else {}),
+                        **({"word_timestamps": True} if self.word_timestamps else {}),
                     },
                     "turn_detection": self._turn_detection(),
                     "noise_reduction": None,
@@ -271,6 +285,18 @@ def _transcription_values(transcription: object, where: str) -> dict:
     for key, cap in (("language", MAX_LANGUAGE_CHARS), ("prompt", MAX_PROMPT_CHARS)):
         if values.get(key) is not None and len(values[key]) > cap:
             raise ProtocolError("invalid_session", f"{where}.{key} is capped at {cap} characters")
+    if "hotwords" in transcription:
+        from ..utils.speech_text import validate_hints
+
+        try:
+            validate_hints(None, transcription["hotwords"])
+        except ValueError as e:
+            raise ProtocolError("invalid_session", str(e)) from e
+        values["hotwords"] = tuple(transcription["hotwords"] or ())
+    if "word_timestamps" in transcription:
+        if not isinstance(transcription["word_timestamps"], bool):
+            raise ProtocolError("invalid_session", "word_timestamps must be a boolean")
+        values["word_timestamps"] = transcription["word_timestamps"]
     return values
 
 
@@ -361,6 +387,9 @@ class Work:
     audio: np.ndarray  # float32 at TARGET_RATE
     language: str | None
     model: str | None
+    prompt: str | None = None
+    hotwords: tuple[str, ...] = ()
+    word_timestamps: bool = False
 
 
 class LocalAgreement:
@@ -442,6 +471,17 @@ class TranscriptionSession:
         return [self._session_event("created")]
 
     def update(self, config: SessionConfig) -> list[dict]:
+        if (
+            self._utterance is not None
+            and self._utterance.samples
+            and any(
+                getattr(config, name) != getattr(self.config, name)
+                for name in ("model", "language", "prompt", "hotwords", "word_timestamps")
+            )
+        ):
+            raise ProtocolError(
+                "utterance_active", "Commit or clear the current audio before changing transcription settings"
+            )
         if config.source_rate != self.config.source_rate:
             # The old filter's lookahead still holds audio already received.
             self._pending = np.concatenate([self._pending, self._resampler.flush()])
@@ -556,6 +596,9 @@ class TranscriptionSession:
                     np.concatenate(utterance.audio),
                     self.config.language,
                     self.config.model,
+                    self.config.prompt,
+                    self.config.hotwords,
+                    self.config.word_timestamps,
                 )
             )
         return events
@@ -575,7 +618,18 @@ class TranscriptionSession:
         audio = np.concatenate(utterance.audio)
         if 0 < trim_samples < audio.size - TARGET_RATE // 10:
             audio = audio[:-trim_samples]
-        self._queue(Work("final", utterance.item_id, audio, self.config.language, self.config.model))
+        self._queue(
+            Work(
+                "final",
+                utterance.item_id,
+                audio,
+                self.config.language,
+                self.config.model,
+                self.config.prompt,
+                self.config.hotwords,
+                self.config.word_timestamps,
+            )
+        )
         self._finals[utterance.item_id] = (utterance.agreement, audio.size / TARGET_RATE)
         return [committed]
 
@@ -632,7 +686,7 @@ class TranscriptionSession:
             return []
         return [_event(DELTA_EVENT, item_id=item_id, content_index=0, delta=delta)]
 
-    def final_text(self, item_id: str, transcript: str) -> list[dict]:
+    def final_text(self, item_id: str, transcript: str, *, words=None) -> list[dict]:
         agreement, seconds = self._finals.pop(item_id, (LocalAgreement(), 0.0))
         text = " ".join(transcript.split())
         events: list[dict] = []
@@ -646,6 +700,7 @@ class TranscriptionSession:
                 content_index=0,
                 transcript=text,
                 usage={"type": "duration", "seconds": round(seconds, 3)},
+                **({"words": words} if words is not None else {}),
             )
         )
         return events
@@ -665,6 +720,13 @@ class TranscriptionSession:
         """A ``failed`` event for every final still pending, when the session closes without them."""
         self.work = []
         return [event for item_id in list(self._finals) for event in self.failed(item_id, code, message)]
+
+    @property
+    def active_item_ids(self) -> set[str]:
+        ids = set(self._finals)
+        if self._utterance is not None:
+            ids.add(self._utterance.item_id)
+        return ids
 
     @property
     def pending_finals(self) -> int:

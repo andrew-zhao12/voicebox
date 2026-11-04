@@ -31,9 +31,11 @@ async def transcribe_audio(
     file: UploadFile = File(...),
     language: str | None = Form(None),
     model: str | None = Form(None),
+    prompt: str | None = Form(None),
+    hotwords: list[str] | None = Form(None),
 ):
     """Transcribe audio file to text."""
-    text, duration = await transcribe_upload(file, language, model)
+    text, duration = await transcribe_upload(file, language, model, prompt=prompt, hotwords=hotwords)
     return models.TranscriptionResponse(text=text, duration=duration)
 
 
@@ -42,12 +44,16 @@ async def _save_upload(file: UploadFile) -> str:
     uploaded_ext = Path(file.filename or "").suffix.lower()
     file_suffix = uploaded_ext if uploaded_ext in ALLOWED_AUDIO_EXTS else ".wav"
     with tempfile.NamedTemporaryFile(suffix=file_suffix, delete=False) as tmp:
-        while chunk := await file.read(UPLOAD_CHUNK_SIZE):
-            tmp.write(chunk)
-        return tmp.name
+        try:
+            while chunk := await file.read(UPLOAD_CHUNK_SIZE):
+                tmp.write(chunk)
+            return tmp.name
+        except BaseException:
+            Path(tmp.name).unlink(missing_ok=True)
+            raise
 
 
-async def transcribe_upload(file: UploadFile, language: str | None, model: str | None) -> tuple[str, float]:
+async def transcribe_upload(file: UploadFile, language: str | None, model: str | None, **options) -> tuple[str, float]:
     """Decode an upload, run Whisper and return ``(text, duration_seconds)``.
 
     Shared by ``POST /transcribe`` and ``POST /v1/audio/transcriptions``;
@@ -56,111 +62,141 @@ async def transcribe_upload(file: UploadFile, language: str | None, model: str |
     """
     tmp_path = await _save_upload(file)
     try:
-        return await transcribe_file(tmp_path, language, model)
+        return await transcribe_file(tmp_path, language, model, **options)
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
 
-async def transcribe_upload_detailed(file: UploadFile, language: str | None, model: str | None):
+async def transcribe_upload_detailed(file: UploadFile, language: str | None, model: str | None, **options):
     """Like ``transcribe_upload`` but returns a ``utils.subtitles.Transcript`` with segment timestamps."""
     tmp_path = await _save_upload(file)
     try:
-        return await transcribe_file_detailed(tmp_path, language, model)
+        return await transcribe_file_detailed(tmp_path, language, model, **options)
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
 
-async def transcribe_file(tmp_path: str, language: str | None, model: str | None) -> tuple[str, float]:
+async def transcribe_file(tmp_path: str, language: str | None, model: str | None, **options) -> tuple[str, float]:
     """Run Whisper on an audio file already on disk (see ``transcribe_upload`` for the errors)."""
-    return await _run_whisper(tmp_path, language, model, detailed=False)
+    return await _run_whisper(tmp_path, language, model, detailed=False, **options)
 
 
-async def transcribe_file_detailed(tmp_path: str, language: str | None, model: str | None):
+async def transcribe_file_detailed(tmp_path: str, language: str | None, model: str | None, **options):
     """Run Whisper on a file and return a ``Transcript`` with segments (errors as ``transcribe_upload``)."""
-    return await _run_whisper(tmp_path, language, model, detailed=True)
+    return await _run_whisper(tmp_path, language, model, detailed=True, **options)
 
 
-async def _run_whisper(tmp_path: str, language: str | None, model: str | None, *, detailed: bool):
-    file_suffix = Path(tmp_path).suffix.lower()
-    stt_path = tmp_path
+async def _run_whisper(
+    tmp_path: str,
+    language: str | None,
+    model: str | None,
+    *,
+    detailed: bool,
+    prompt: str | None = None,
+    hotwords: list[str] | None = None,
+    word_timestamps: bool = False,
+):
+    from ..utils.audio import load_audio, save_audio
+
+    stt_path = None
+    inference_owned = False
     try:
-        from ..backends import WHISPER_HF_REPOS
-        from ..utils.audio import load_audio, save_audio
-
-        audio, sr = await asyncio.to_thread(load_audio, tmp_path)
-        duration = len(audio) / sr
-
-        # The STT backend (mlx_audio.stt -> miniaudio) only decodes
-        # WAV/FLAC/MP3/Vorbis, so browser recordings uploaded as WebM/Opus
-        # fail with "unsupported file format" (issue: web-mode dictation).
-        # librosa already decoded the file above (it falls back to
-        # audioread/ffmpeg for exotic containers), so re-encode that PCM to a
-        # temp WAV and hand *that* to Whisper. WAV inputs pass through
-        # unchanged.
-        if file_suffix != ".wav":
-            stt_path = f"{tmp_path}.stt.wav"
-            await asyncio.to_thread(save_audio, audio, stt_path, sr)
-
-        whisper_model = transcribe.get_whisper_model()
-        model_size = model if model else whisper_model.model_size
-
-        valid_sizes = list(WHISPER_HF_REPOS.keys())
-        if model_size not in valid_sizes:
+        try:
+            backend, size, cfg = transcribe.resolve_stt(model)
+            transcribe.validate_options(cfg, prompt=prompt, hotwords=hotwords, word_timestamps=word_timestamps)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        if hasattr(backend, "runtime_available") and not backend.runtime_available():
             raise HTTPException(
-                status_code=400,
-                detail=f"Invalid model size '{model_size}'. Must be one of: {', '.join(valid_sizes)}",
+                status_code=503,
+                detail=f"{cfg.engine} runtime is not installed or configured; see the transcription setup guide",
             )
-
-        already_loaded = whisper_model.is_loaded() and whisper_model.model_size == model_size
-        if not already_loaded and not whisper_model._is_model_cached(model_size):
+        already_loaded = backend.is_loaded() and backend.model_size == size
+        if not already_loaded and not backend._is_model_cached(size):
             if not get_principal().is_admin:
-                # Downloads are an operator action; client keys only use cached models.
                 raise HTTPException(
-                    status_code=409,
-                    detail=f"Whisper model {model_size} is not downloaded; ask an admin to download it first.",
+                    status_code=409, detail=f"{cfg.model_name} is not downloaded; ask an admin to download it first."
                 )
-            progress_model_name = f"whisper-{model_size}"
             task_manager = get_task_manager()
 
-            async def download_whisper_background():
+            async def download_background():
                 try:
-                    await whisper_model.load_model_async(model_size)
-                    task_manager.complete_download(progress_model_name)
+                    await whisper_slot.run(getattr(backend, "load_model_async", backend.load_model), size)
+                    task_manager.complete_download(cfg.model_name)
                 except Exception as e:
-                    task_manager.error_download(progress_model_name, str(e))
+                    task_manager.error_download(cfg.model_name, str(e))
 
-            task_manager.start_download(progress_model_name)
-            create_background_task(download_whisper_background())
-
+            task_manager.start_download(cfg.model_name)
+            create_background_task(download_background())
             raise HTTPException(
                 status_code=202,
                 detail={
-                    "message": f"Whisper model {model_size} is being downloaded. Please wait and try again.",
-                    "model_name": progress_model_name,
+                    "message": f"{cfg.model_name} is being downloaded. Please wait and try again.",
+                    "model_name": cfg.model_name,
                     "downloading": True,
                 },
             )
+        audio, sr = await _file_io(load_audio, tmp_path)
+        duration = len(audio) / sr
+        # Own a decoded WAV for the entire inference. A cancelled upload/socket can
+        # delete its input while the shielded model thread is still using this copy.
+        with tempfile.NamedTemporaryFile(suffix=".stt.wav", delete=False) as handle:
+            stt_path = handle.name
+        await _file_io(save_audio, audio, stt_path, sr)
+        options = {}
+        if prompt:
+            options["prompt"] = prompt
+        if hotwords:
+            options["hotwords"] = hotwords
+        if word_timestamps:
+            options["word_timestamps"] = True
 
-        # Whisper's thread outlives a cancelled caller (a realtime socket closing
-        # mid-utterance), so run() keeps the slot taken until the call ends.
+        async def infer_owned():
+            try:
+                fn = backend.transcribe_detailed if detailed else backend.transcribe
+                return await fn(stt_path, language, size, **options)
+            finally:
+                Path(stt_path).unlink(missing_ok=True)
+
+        def infer():
+            # InferenceSlot calls this synchronously before scheduling the coroutine.
+            # Transfer ownership now, including cancellation before its first step.
+            nonlocal inference_owned
+            inference_owned = True
+            return infer_owned()
+
         try:
-            if detailed:
-                transcript = await whisper_slot.run(whisper_model.transcribe_detailed, stt_path, language, model_size)
-                if transcript.duration <= 0:
-                    transcript = replace(transcript, duration=duration)
-                return transcript
-            text = await whisper_slot.run(whisper_model.transcribe, stt_path, language, model_size)
+            result = await whisper_slot.run(infer)
         except InferenceBusyError as e:
             raise HTTPException(status_code=429, detail=str(e), headers={"Retry-After": str(e.retry_after_s)}) from e
-
-        return text, duration
-
+        if detailed:
+            return replace(result, duration=duration) if result.duration <= 0 else result
+        return result, duration
     except HTTPException:
         raise
+    except (ImportError, RuntimeError) as e:
+        logger.exception("STT runtime unavailable")
+        raise HTTPException(
+            status_code=503, detail="STT runtime unavailable; check the server model configuration"
+        ) from e
     except Exception as e:
-        # Decoder and model errors can carry temp paths; keep them in the log.
         logger.exception("Transcription failed")
         raise HTTPException(status_code=500, detail="Transcription failed") from e
     finally:
-        if stt_path != tmp_path:
+        if stt_path is not None and not inference_owned:
             Path(stt_path).unlink(missing_ok=True)
+
+
+async def _file_io(fn, *args):
+    """Finish file access before cancellation lets its caller remove the source/destination."""
+    task = asyncio.create_task(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # File decoding/writing is bounded by the upload cap. Retaining this small
+        # IO task avoids deleting a file a thread still needs or recreating a leak.
+        try:
+            await task
+        except Exception:
+            logger.debug("Cancelled transcription file IO failed", exc_info=True)
+        raise

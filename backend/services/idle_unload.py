@@ -16,7 +16,7 @@ import time
 from collections.abc import Callable, Mapping
 
 from . import task_queue
-from .inference_slots import llm_slot, whisper_slot
+from .inference_slots import InferenceBusyError, InferenceSlot, llm_slot, whisper_slot
 
 logger = logging.getLogger(__name__)
 
@@ -39,15 +39,15 @@ def configured_idle_s(environ: Mapping[str, str] = os.environ) -> float | None:
     return value
 
 
-def sweep(
+async def sweep(
     idle_s: float,
     protected: set[str],
     *,
     now: float | None = None,
     tts_backends: Callable[[str], object] | None = None,
     tts_engines: set[str] | None = None,
-    stt_unload: tuple[Callable[[], bool], Callable[[], None]] | None = None,
-    llm_unload: tuple[Callable[[], bool], Callable[[], None]] | None = None,
+    stt_backends: Mapping[str, object] | None = None,
+    llm_backend: object | None = None,
 ) -> list[str]:
     """Unload idle models once; returns the engine names unloaded.
 
@@ -72,26 +72,47 @@ def sweep(
             backend.unload_model()
             unloaded.append(engine)
 
-    if stt_unload is None or llm_unload is None:
-        from . import llm as llm_service, transcribe  # lazy: heavy import
+    if stt_backends is None:
+        from ..backends import STT_ENGINES, get_stt_backend_for_engine  # lazy: heavy import
 
-        stt_unload = (lambda: transcribe.get_whisper_model().is_loaded(), transcribe.unload_whisper_model)
-        llm_unload = (lambda: llm_service.get_llm_model().is_loaded(), llm_service.unload_llm_model)
-    for slot, engine, (is_loaded, unload) in (
-        (whisper_slot, "whisper", stt_unload),
-        (llm_slot, "qwen_llm", llm_unload),
-    ):
-        if engine in protected or slot.busy or slot.last_used is None:
-            continue
-        if now - slot.last_used < idle_s:
-            continue
-        if is_loaded():
-            unload()
-            unloaded.append(engine)
+        stt_backends = {engine: get_stt_backend_for_engine(engine) for engine in STT_ENGINES}
+    if llm_backend is None:
+        from . import llm as llm_service  # lazy: heavy import
+
+        llm_backend = llm_service.get_llm_model()
+
+    unloaded.extend(await _unload_slot(whisper_slot, stt_backends, protected, idle_s, now))
+    unloaded.extend(await _unload_slot(llm_slot, {"qwen_llm": llm_backend}, protected, idle_s, now))
 
     if unloaded:
         logger.info("Idle unload: %s (unused for %.0f s)", ", ".join(unloaded), idle_s)
     return unloaded
+
+
+async def _unload_slot(
+    slot: InferenceSlot, backends: Mapping[str, object], protected: set[str], idle_s: float, now: float
+) -> list[str]:
+    if slot.busy or slot.last_used is None or now - slot.last_used < idle_s:
+        return []
+
+    async def unload() -> list[str]:
+        # A request may have won the slot while we were waiting to acquire it.
+        if slot.last_used is None or now - slot.last_used < idle_s:
+            return []
+        names = []
+        for engine, backend in backends.items():
+            # Native streams retain model state between inference calls, when the slot is idle.
+            if engine in protected or getattr(backend, "active_streams", 0):
+                continue
+            if backend.is_loaded():
+                backend.unload_model()
+                names.append(engine)
+        return names
+
+    try:
+        return await slot.run(unload)
+    except InferenceBusyError:
+        return []
 
 
 async def run_loop(idle_s: float, protected: set[str]) -> None:
@@ -100,6 +121,6 @@ async def run_loop(idle_s: float, protected: set[str]) -> None:
     while True:
         await asyncio.sleep(interval)
         try:
-            await asyncio.to_thread(sweep, idle_s, protected)
+            await sweep(idle_s, protected)
         except Exception:
             logger.exception("Idle unload sweep failed")

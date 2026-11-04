@@ -202,13 +202,15 @@ async def service_info():
 
 
 def _whisper_size(model: str) -> str | None:
-    from ..backends import WHISPER_HF_REPOS  # lazy: heavy import
+    from ..backends import WHISPER_HF_REPOS, get_stt_model_configs  # lazy: heavy import
 
     if model in WHISPER_ALIASES:
         return None
     size = model.removeprefix("whisper-")
     if size in WHISPER_HF_REPOS:
         return size
+    if any(cfg.model_name == model for cfg in get_stt_model_configs()):
+        return model
     raise fail(
         404,
         f"Unknown model '{model}'; use whisper-1 or one of whisper-{', whisper-'.join(WHISPER_HF_REPOS)}.",
@@ -227,14 +229,15 @@ async def create_transcription(
     language: str | None = Form(None),
     response_format: str = Form("json"),
     timestamp_granularities: list[str] = Form([], alias="timestamp_granularities[]"),
+    prompt: str | None = Form(None),
+    hotwords: list[str] | None = Form(None),
 ):
-    """Transcribe an uploaded file with Whisper.
+    """Transcribe audio with a registry STT model, optional vocabulary hints and aligned word timestamps.
 
-    ``whisper-1`` uses the server's current Whisper size; ``whisper-turbo``,
-    ``whisper-large`` and the other registry sizes pick one explicitly.
-    ``response_format`` is ``json`` (default), ``text``, ``verbose_json``
-    (segments with timestamps), ``srt`` or ``vtt``; only segment timestamps
-    exist, so ``timestamp_granularities[]=word`` is refused.
+    ``whisper-1`` uses the current default Whisper size. Explicit model IDs
+    and their capabilities are listed in ``GET /v1/models``. Word timestamps
+    require ``response_format=verbose_json``. Repeat ``hotwords`` form fields
+    to supply domain terms.
     """
     if response_format not in TRANSCRIPTION_FORMATS:
         raise fail(
@@ -243,27 +246,42 @@ async def create_transcription(
             code="unsupported_format",
             param="response_format",
         )
-    unsupported = [g for g in timestamp_granularities if g != "segment"]
+    unsupported = [g for g in timestamp_granularities if g not in ("segment", "word")]
     if unsupported:
         raise fail(
             400,
-            f"timestamp_granularities '{unsupported[0]}' is not available; only segment timestamps are",
+            f"timestamp_granularities '{unsupported[0]}' is not available; use segment or word",
             code="unsupported_value",
             param="timestamp_granularities",
         )
     size = _whisper_size(model)
+    word_timestamps = "word" in timestamp_granularities
+    if word_timestamps and response_format != "verbose_json":
+        raise fail(
+            400,
+            "Word timestamps require response_format=verbose_json",
+            code="unsupported_value",
+            param="response_format",
+        )
+    options = {}
+    if prompt:
+        options["prompt"] = prompt
+    if hotwords:
+        options["hotwords"] = hotwords
+    if word_timestamps:
+        options["word_timestamps"] = True
     if response_format in ("json", "text"):
-        text, _duration = await transcribe_upload(file, language, size)
+        text, _duration = await transcribe_upload(file, language, size, **options)
         if response_format == "text":
             return PlainTextResponse(text)
         return {"text": text}
 
-    transcript = await transcribe_upload_detailed(file, language, size)
+    transcript = await transcribe_upload_detailed(file, language, size, **options)
     if response_format == "srt":
         return PlainTextResponse(subtitles.to_srt(transcript))
     if response_format == "vtt":
         return PlainTextResponse(subtitles.to_vtt(transcript))
-    return subtitles.to_verbose_json(transcript)
+    return subtitles.to_verbose_json(transcript, include_words=word_timestamps)
 
 
 @router.get("/models")
@@ -272,6 +290,7 @@ async def list_models():
     from ..backends import (  # lazy: heavy import
         check_model_loaded,
         engine_has_model_sizes,
+        get_stt_backend_for_engine,
         get_stt_model_configs,
         get_tts_backend_for_engine,
         get_tts_model_configs,
@@ -287,9 +306,11 @@ async def list_models():
             else backend._is_model_cached()
         )
         data.append(_model_entry(cfg, "tts", downloaded, check_model_loaded(cfg)))
-    whisper = transcribe.get_whisper_model()
     for cfg in get_stt_model_configs():
-        data.append(_model_entry(cfg, "stt", whisper._is_model_cached(cfg.model_size), check_model_loaded(cfg)))
+        backend = transcribe.get_whisper_model() if cfg.engine == "whisper" else get_stt_backend_for_engine(cfg.engine)
+        entry = _model_entry(cfg, "stt", backend._is_model_cached(cfg.model_size), check_model_loaded(cfg))
+        entry["runtime_available"] = backend.runtime_available() if hasattr(backend, "runtime_available") else True
+        data.append(entry)
     return {"object": "list", "data": data, "formats": encode.available_formats()}
 
 
@@ -304,6 +325,20 @@ def _model_entry(cfg, kind: str, downloaded: bool, loaded: bool) -> dict:
         "display_name": cfg.display_name,
         "languages": list(cfg.languages),
         "supports_instruct": cfg.supports_instruct,
+        **(
+            {
+                name: getattr(cfg, name, False)
+                for name in (
+                    "supports_streaming",
+                    "supports_prompt",
+                    "supports_hotwords",
+                    "supports_word_timestamps",
+                    "supports_segment_timestamps",
+                )
+            }
+            if kind == "stt"
+            else {}
+        ),
         "downloaded": bool(downloaded),
         "loaded": bool(loaded),
     }

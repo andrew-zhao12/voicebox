@@ -90,9 +90,9 @@ async def _load_one(name: str, done: asyncio.Event) -> None:
             return
         lifecycle.preload_phase(name, "loading")
         load = get_model_load_func(cfg)
-        if cfg.engine == "whisper":
+        if cfg.model_type == "stt":
             slot = whisper_slot
-        elif cfg.engine == "qwen_llm":
+        elif cfg.model_type == "llm":
             slot = llm_slot
         else:
             slot = None

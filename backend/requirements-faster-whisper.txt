@@ -1,0 +1,5 @@
+# Optional in-process CPU/CUDA STT. Existing Whisper remains the default.
+faster-whisper==1.2.1
+ctranslate2>=4.6,<5
+# PyAV 19 removed metadata_errors used by faster-whisper's decoder.
+av==16.1.0

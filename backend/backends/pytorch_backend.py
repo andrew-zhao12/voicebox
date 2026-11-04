@@ -361,6 +361,9 @@ class PyTorchSTTBackend:
         audio_path: str,
         language: Optional[str] = None,
         model_size: Optional[str] = None,
+        *,
+        prompt: str | None = None,
+        hotwords: list[str] | tuple[str, ...] | None = None,
     ) -> str:
         """
         Transcribe audio to text.
@@ -382,6 +385,7 @@ class PyTorchSTTBackend:
             # whose tokenizer calls issue legitimate metadata lookups.
             inputs, long_form, _duration = self._features(audio_path)
             generate_kwargs = self._generate_kwargs(language, long_form, inputs)
+            self._add_prompt(generate_kwargs, prompt, hotwords)
 
             with torch.no_grad():
                 predicted_ids = self.model.generate(
@@ -403,6 +407,10 @@ class PyTorchSTTBackend:
         audio_path: str,
         language: Optional[str] = None,
         model_size: Optional[str] = None,
+        *,
+        prompt: str | None = None,
+        hotwords: list[str] | tuple[str, ...] | None = None,
+        word_timestamps: bool = False,
     ):
         """Transcribe with segment timestamps (``utils.subtitles.Transcript``).
 
@@ -413,9 +421,13 @@ class PyTorchSTTBackend:
 
         await self.load_model_async(model_size)
 
+        if word_timestamps:
+            return await asyncio.to_thread(self._transcribe_words, audio_path, language, prompt, hotwords)
+
         def _transcribe_sync():
             inputs, long_form, duration = self._features(audio_path)
             generate_kwargs = self._generate_kwargs(language, long_form, inputs)
+            self._add_prompt(generate_kwargs, prompt, hotwords)
             generate_kwargs["return_timestamps"] = True
             tokenizer = self.processor.tokenizer
 
@@ -445,3 +457,38 @@ class PyTorchSTTBackend:
             return Transcript(text=text.strip(), segments=segments, language=language, duration=duration)
 
         return await asyncio.to_thread(_transcribe_sync)
+
+    def _add_prompt(self, options: dict, prompt: str | None, hotwords: list[str] | tuple[str, ...] | None) -> None:
+        from ..utils.speech_text import transcription_prompt
+
+        hint = transcription_prompt(prompt, hotwords)
+        if hint:
+            options["prompt_ids"] = self.processor.get_prompt_ids(hint, return_tensors="pt").to(self.device)
+
+    def _transcribe_words(self, audio_path: str, language: str | None, prompt: str | None, hotwords):
+        """Use Transformers' Whisper alignment pipeline with the already-loaded model."""
+        from transformers import pipeline  # lazy: heavy import
+
+        from ..utils.audio import load_audio
+        from ..utils.subtitles import Transcript, segments_from_dicts, words_from_dicts
+
+        audio, rate = load_audio(audio_path, sample_rate=16000)
+        duration = len(audio) / rate
+        options = {"task": "transcribe"}
+        if language:
+            options["language"] = language
+        self._add_prompt(options, prompt, hotwords)
+        recognizer = pipeline(
+            "automatic-speech-recognition", model=self.model,
+            tokenizer=self.processor.tokenizer, feature_extractor=self.processor.feature_extractor,
+            device=self.device,
+        )
+        result = recognizer({"raw": audio, "sampling_rate": rate}, return_timestamps="word", generate_kwargs=options)
+        items = [
+            {"word": chunk["text"], "start": chunk["timestamp"][0], "end": chunk["timestamp"][1]}
+            for chunk in result.get("chunks", ())
+        ]
+        words = words_from_dicts(items, duration=duration)
+        text = result["text"].strip()
+        segments = segments_from_dicts([{"text": text, "start": 0, "end": duration}], duration=duration)
+        return Transcript(text=text, segments=segments, language=language, duration=duration, words=words)

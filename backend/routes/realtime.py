@@ -44,8 +44,10 @@ from .. import lifecycle
 from ..auth import Principal, charge, get_principal
 from ..auth.ratelimit import RateLimited
 from ..observability import metrics
-from ..services import realtime_stt as rt, transcribe
-from ..services.inference_slots import whisper_slot
+from ..services import live_sessions, realtime_stt as rt, transcribe
+from ..services.inference_slots import InferenceBusyError, whisper_slot
+from ..services.native_stt import NativeTranscriber
+from ..utils.subtitles import Transcript, to_verbose_json
 from .openai_compat import WHISPER_ALIASES
 from .transcription import transcribe_file_detailed
 
@@ -78,7 +80,7 @@ CLOSE_ERROR = 1011
 CLOSE_RESTART = 1012
 CLOSE_TRY_LATER = 1013
 
-_sessions_by_key: dict[str, int] = {}
+_sessions_by_key = live_sessions.counts_for_kind("transcription")
 
 
 def max_sessions(environ: Mapping[str, str] = os.environ) -> int:
@@ -115,31 +117,34 @@ def open_sessions() -> int:
 
 def whisper_size(model: str | None) -> str | None:
     """A registry Whisper size from ``whisper-turbo``-style names; ``None`` means the server's current size."""
-    from ..backends import WHISPER_HF_REPOS  # lazy: heavy import
+    from ..backends import WHISPER_HF_REPOS, get_stt_model_configs  # lazy: heavy import
 
     if not model or model in WHISPER_ALIASES:
         return None
     size = model.removeprefix("whisper-")
     if size in WHISPER_HF_REPOS:
         return size
-    raise rt.ProtocolError("model_not_found", f"Unknown model '{model}'; use whisper-1 or whisper-<size>")
+    if any(cfg.model_name == model for cfg in get_stt_model_configs()):
+        return model
+    raise rt.ProtocolError("model_not_found", f"Unknown model '{model}'; GET /v1/models lists STT model IDs")
 
 
 def check_model(model: str | None) -> None:
-    """Raise ``ProtocolError`` when a client key asks for a Whisper size that is not on disk."""
+    """Refuse unavailable runtimes and uncached models before accepting client audio."""
     size = whisper_size(model)
+    whisper, wanted, cfg = transcribe.resolve_stt(size)
+    if hasattr(whisper, "runtime_available") and not whisper.runtime_available():
+        raise rt.ProtocolError("runtime_unavailable", f"{cfg.engine} runtime is not installed or configured")
     if get_principal().is_admin:
         return
-    whisper = transcribe.get_whisper_model()
-    wanted = size or whisper.model_size
     loaded = whisper.is_loaded() and whisper.model_size == wanted
     if not loaded and not whisper._is_model_cached(wanted):
         raise rt.ProtocolError(
-            "model_not_downloaded", f"Whisper model {wanted} is not downloaded; ask an admin to download it first."
+            "model_not_downloaded", f"{cfg.model_name} is not downloaded; ask an admin to download it first."
         )
 
 
-async def transcribe_pcm(audio: np.ndarray, language: str | None, model: str | None) -> str:
+async def transcribe_pcm(audio: np.ndarray, language: str | None, model: str | None, **options) -> str | Transcript:
     """Run Whisper on 16 kHz float32 audio through the shared upload path (temp WAV).
 
     The segment-level path is used on purpose: Whisper pads short audio to
@@ -152,8 +157,8 @@ async def transcribe_pcm(audio: np.ndarray, language: str | None, model: str | N
         tmp_path = tmp.name
     try:
         await asyncio.to_thread(sf.write, tmp_path, audio, rt.TARGET_RATE, subtype="PCM_16")
-        transcript = await transcribe_file_detailed(tmp_path, language, whisper_size(model))
-        return transcript.text
+        transcript = await transcribe_file_detailed(tmp_path, language, whisper_size(model), **options)
+        return transcript if options.get("word_timestamps") else transcript.text
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
@@ -207,6 +212,7 @@ class _Connection:
         self.settled = asyncio.Event()  # set while no final is pending
         self.settled.set()
         self.finishing = False  # the server is ending the session: partials stop
+        self.native = NativeTranscriber()
 
     def emit(self, events: list[dict]) -> None:
         for event in events:
@@ -296,6 +302,14 @@ class _Connection:
             config = rt.SessionConfig.from_update(self.session.config, payload)
             if config.model != self.session.config.model:
                 check_model(config.model)
+            if config.prompt or config.hotwords or config.word_timestamps:
+                try:
+                    _backend, _size, cfg = transcribe.resolve_stt(config.model)
+                    transcribe.validate_options(
+                        cfg, prompt=config.prompt, hotwords=config.hotwords, word_timestamps=config.word_timestamps
+                    )
+                except ValueError as e:
+                    raise rt.ProtocolError("unsupported_value", str(e)) from e
             self.emit(self.session.update(config))
         elif kind == "input_audio_buffer.append":
             audio = payload.get("audio")
@@ -306,6 +320,7 @@ class _Connection:
             self.emit(self.session.commit())
         elif kind == "input_audio_buffer.clear":
             self.emit(self.session.clear())
+            self.work_ready.set()
         else:
             raise rt.ProtocolError("unknown_event", f"unknown event type {kind!r}")
 
@@ -322,11 +337,24 @@ class _Connection:
                     await self._final(work)
                 elif not self.finishing and not whisper_slot.busy:
                     await self._partial(work)  # skipped while busy: a fresher partial will come
+            await self.native.prune(self.session.active_item_ids)
+
+    async def _transcribe(self, work):
+        if self.native.supports(work.model):
+            return await self.native.transcribe(work)
+        options = {}
+        if work.prompt:
+            options["prompt"] = work.prompt
+        if work.hotwords:
+            options["hotwords"] = work.hotwords
+        if work.word_timestamps and work.kind == "final":
+            options["word_timestamps"] = True
+        return await transcribe_pcm(work.audio, work.language, work.model, **options)
 
     async def _partial(self, work: rt.Work) -> None:
         try:
-            hypothesis = await transcribe_pcm(work.audio, work.language, work.model)
-        except HTTPException:
+            hypothesis = await self._transcribe(work)
+        except (HTTPException, InferenceBusyError):
             return
         except Exception:
             logger.exception("Live transcription partial failed")
@@ -335,7 +363,10 @@ class _Connection:
 
     async def _final(self, work: rt.Work) -> None:
         try:
-            transcript = await transcribe_pcm(work.audio, work.language, work.model)
+            transcript = await self._transcribe(work)
+        except InferenceBusyError as e:
+            self.emit(self.session.failed(work.item_id, "whisper_busy", str(e)))
+            return
         except HTTPException as e:
             code = "whisper_busy" if e.status_code == 429 else "transcription_failed"
             detail = e.detail if isinstance(e.detail, str) else json.dumps(e.detail)
@@ -347,7 +378,11 @@ class _Connection:
             self.emit(self.session.failed(work.item_id, "transcription_failed", "Transcription failed"))
             return
         metrics.REALTIME_UTTERANCES.inc()
-        self.emit(self.session.final_text(work.item_id, transcript))
+        if isinstance(transcript, Transcript):
+            words = to_verbose_json(transcript, include_words=True)["words"] if work.word_timestamps else None
+            self.emit(self.session.final_text(work.item_id, transcript.text, words=words))
+        else:
+            self.emit(self.session.final_text(work.item_id, transcript))
 
     async def finish(self, timeout_s: float) -> bool:
         """Commit the open utterance and deliver the pending finals; False when the client left meanwhile.
@@ -383,7 +418,7 @@ def _admit(principal: Principal, model: str | None) -> _End | None:
         return _shutting_down()
     per_key = principal.limits.max_realtime_sessions
     if open_sessions() >= max_sessions() or (
-        per_key is not None and _sessions_by_key.get(principal.key_id, 0) >= per_key
+        per_key is not None and live_sessions.open_for_key(principal.key_id) >= per_key
     ):
         return _End("session_limit_reached", "too many live transcription sessions; retry later", CLOSE_TRY_LATER)
     try:
@@ -414,7 +449,9 @@ async def _serve(websocket: WebSocket, dialect: rt.Dialect) -> None:
 
     session = rt.TranscriptionSession(rt.SessionConfig(model=model), dialect=dialect)
     connection = _Connection(websocket, session)
-    _sessions_by_key[principal.key_id] = _sessions_by_key.get(principal.key_id, 0) + 1
+    live_sessions.reserve(
+        "transcription", principal.key_id, per_key=principal.limits.max_realtime_sessions, max_global=max_sessions()
+    )
     metrics.REALTIME_SESSIONS.set(open_sessions())
     connection.emit(session.created())
     reader = asyncio.create_task(connection.reader())
@@ -438,6 +475,7 @@ async def _serve(websocket: WebSocket, dialect: rt.Dialect) -> None:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        await connection.native.prune(set())
         if end is not None and end.announced(dialect):
             connection.emit([end.event()])
         connection.outbound.put_nowait(None)
@@ -446,11 +484,7 @@ async def _serve(websocket: WebSocket, dialect: rt.Dialect) -> None:
         if end is not None:
             with contextlib.suppress(Exception):
                 await websocket.close(code=end.close_code, reason=end.code)
-        remaining = _sessions_by_key.get(principal.key_id, 0) - 1
-        if remaining > 0:
-            _sessions_by_key[principal.key_id] = remaining
-        else:
-            _sessions_by_key.pop(principal.key_id, None)
+        live_sessions.release("transcription", principal.key_id)
         metrics.REALTIME_SESSIONS.set(open_sessions())
 
 

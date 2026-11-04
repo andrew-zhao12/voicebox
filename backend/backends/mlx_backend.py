@@ -322,12 +322,44 @@ class MLXTTSBackend:
                 yield np.asarray(result.audio, dtype=np.float32), int(result.sample_rate)
 
 
+def _install_alignment_heads(model, repo: str) -> bool:
+    """Load the model's trained alignment heads without downloading on a client's request."""
+    import json
+
+    from huggingface_hub import try_to_load_from_cache
+
+    path = try_to_load_from_cache(repo, "generation_config.json")
+    if not isinstance(path, str):
+        logger.warning("MLX Whisper word timestamps unavailable: %s has no cached generation_config.json", repo)
+        return False
+    try:
+        heads = json.loads(Path(path).read_text()).get("alignment_heads")
+        if not isinstance(heads, list) or not heads or any(
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or any(type(value) is not int for value in pair)
+            or not 0 <= pair[0] < model.dims.n_text_layer
+            or not 0 <= pair[1] < model.dims.n_text_head
+            for pair in heads
+        ):
+            raise ValueError("missing or invalid alignment_heads")
+        model.set_alignment_heads(np.asarray(heads, dtype=np.int64))
+        # mlx-audio 0.4.1 stores _alignment_heads but timing.find_alignment reads the public name.
+        if not hasattr(model, "alignment_heads"):
+            model.alignment_heads = model._alignment_heads
+        return True
+    except (OSError, ValueError, AttributeError) as exc:
+        logger.warning("MLX Whisper word timestamps unavailable for %s: %s", repo, exc)
+        return False
+
+
 class MLXSTTBackend:
     """MLX-based STT backend using mlx-audio Whisper."""
 
     def __init__(self, model_size: str = "base"):
         self.model = None
         self.model_size = model_size
+        self._word_alignment_available = False
 
     def is_loaded(self) -> bool:
         """Check if model is loaded."""
@@ -372,6 +404,7 @@ class MLXSTTBackend:
             logger.info("Loading MLX Whisper model %s...", model_size)
 
             self.model = load(model_name)
+            self._word_alignment_available = _install_alignment_heads(self.model, model_name)
 
         self.model_size = model_size
         logger.info("MLX Whisper model %s loaded successfully", model_size)
@@ -381,6 +414,7 @@ class MLXSTTBackend:
         if self.model is not None:
             del self.model
             self.model = None
+            self._word_alignment_available = False
             logger.info("MLX Whisper model unloaded")
 
     async def transcribe(
@@ -388,6 +422,9 @@ class MLXSTTBackend:
         audio_path: str,
         language: Optional[str] = None,
         model_size: Optional[str] = None,
+        *,
+        prompt: str | None = None,
+        hotwords: list[str] | tuple[str, ...] | None = None,
     ) -> str:
         """
         Transcribe audio to text.
@@ -404,16 +441,31 @@ class MLXSTTBackend:
 
         def _transcribe_sync():
             """Run synchronous transcription in thread pool."""
-            return _result_text(self._generate_sync(audio_path, language))
+            return _result_text(self._generate_sync(audio_path, language, prompt=prompt, hotwords=hotwords))
 
         # Run blocking transcription in thread pool
         return await asyncio.to_thread(_transcribe_sync)
 
-    def _generate_sync(self, audio_path: str, language: Optional[str]):
+    def _generate_sync(
+        self, audio_path: str, language: Optional[str], *, prompt: str | None = None,
+        hotwords: list[str] | tuple[str, ...] | None = None, word_timestamps: bool = False,
+    ):
         """MLX Whisper's ``generate`` on a file path (an ``STTOutput`` with text and segments)."""
         decode_options = {}
         if language:
             decode_options["language"] = language
+        from ..utils.speech_text import transcription_prompt
+
+        hint = transcription_prompt(prompt, hotwords)
+        if hint:
+            decode_options["initial_prompt"] = hint
+        if word_timestamps:
+            if not self._word_alignment_available:
+                raise RuntimeError(
+                    "Word timestamps are unavailable: this MLX Whisper model has no valid cached alignment_heads "
+                    "in generation_config.json; use a model with alignment metadata or faster-whisper"
+                )
+            decode_options["word_timestamps"] = True
 
         # Inference runs with the process's default HF_HUB_OFFLINE
         # state — see the comment in MLXTTSBackend.generate for the
@@ -425,23 +477,32 @@ class MLXSTTBackend:
         audio_path: str,
         language: Optional[str] = None,
         model_size: Optional[str] = None,
+        *,
+        prompt: str | None = None,
+        hotwords: list[str] | tuple[str, ...] | None = None,
+        word_timestamps: bool = False,
     ):
         """Transcribe with segment timestamps (``utils.subtitles.Transcript``)."""
         from ..utils.audio import load_audio
-        from ..utils.subtitles import Transcript, segments_from_dicts, text_of
+        from ..utils.subtitles import Transcript, segments_from_dicts, text_of, words_from_dicts
 
         await self.load_model_async(model_size)
 
         def _transcribe_sync():
             audio, sr = load_audio(str(audio_path))
             duration = len(audio) / sr
-            result = self._generate_sync(audio_path, language)
+            result = self._generate_sync(audio_path, language, prompt=prompt, hotwords=hotwords, word_timestamps=word_timestamps)
             raw_segments = getattr(result, "segments", None) or (result.get("segments") if isinstance(result, dict) else None)
             detected = getattr(result, "language", None) or (result.get("language") if isinstance(result, dict) else None)
             segments = segments_from_dicts(raw_segments or (), duration=duration)
             # Rebuilding the text from the kept segments drops the padding hallucinations too.
             text = text_of(segments) if segments else _result_text(result)
-            return Transcript(text=text, segments=segments, language=language or detected, duration=duration)
+            kept = {segment.id for segment in segments}
+            words = words_from_dicts(
+                (word for i, segment in enumerate(raw_segments or ()) if segment.get("id", i) in kept for word in segment.get("words", ())),
+                duration=duration,
+            ) if word_timestamps else ()
+            return Transcript(text=text, segments=segments, language=language or detected, duration=duration, words=words)
 
         return await asyncio.to_thread(_transcribe_sync)
 

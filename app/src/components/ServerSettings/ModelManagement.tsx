@@ -125,6 +125,13 @@ function formatBytes(bytes: number): string {
   return `${(bytes / k ** i).toFixed(1)} ${sizes[i]}`;
 }
 
+function modelType(model: ModelStatus): 'tts' | 'stt' | 'llm' {
+  if (model.model_type) return model.model_type;
+  // Older servers do not report registry metadata.
+  if (/^(whisper|faster-whisper|nemotron)-/.test(model.model_name)) return 'stt';
+  return model.model_name.startsWith('qwen3-') ? 'llm' : 'tts';
+}
+
 export function ModelManagement() {
   const { t } = useTranslation();
   const { toast } = useToast();
@@ -406,23 +413,15 @@ export function ModelManagement() {
     setDetailOpen(true);
   };
 
-  const voiceModels =
-    modelStatus?.models.filter(
-      (m) =>
-        m.model_name.startsWith('qwen-tts') ||
-        m.model_name.startsWith('qwen-custom-voice') ||
-        m.model_name.startsWith('luxtts') ||
-        m.model_name.startsWith('chatterbox') ||
-        m.model_name.startsWith('tada') ||
-        m.model_name.startsWith('kokoro'),
-    ) ?? [];
-  const whisperModels = modelStatus?.models.filter((m) => m.model_name.startsWith('whisper')) ?? [];
-  const llmModels = modelStatus?.models.filter((m) => m.model_name.startsWith('qwen3-')) ?? [];
+  const voiceModels = modelStatus?.models.filter((model) => modelType(model) === 'tts') ?? [];
+  const transcriptionModels =
+    modelStatus?.models.filter((model) => modelType(model) === 'stt') ?? [];
+  const llmModels = modelStatus?.models.filter((model) => modelType(model) === 'llm') ?? [];
 
   // Build sections
   const sections: { label: string; models: ModelStatus[] }[] = [
     { label: t('models.sections.voiceGeneration'), models: voiceModels },
-    { label: t('models.sections.transcription'), models: whisperModels },
+    { label: t('models.sections.transcription'), models: transcriptionModels },
     { label: t('models.sections.languageModels'), models: llmModels },
   ];
 
@@ -584,6 +583,13 @@ export function ModelManagement() {
 
                       {/* Right side info */}
                       <div className="shrink-0 flex items-center gap-2">
+                        {model.runtime_available === false && (
+                          <Badge variant="outline" className="text-[10px] h-5">
+                            {t('models.status.runtimeMissing', {
+                              defaultValue: 'Runtime not installed',
+                            })}
+                          </Badge>
+                        )}
                         {hasError && (
                           <Badge variant="destructive" className="text-[10px] h-5">
                             {t('common.error')}
@@ -699,6 +705,11 @@ export function ModelManagement() {
               <div className="space-y-4 pt-2">
                 {/* Status badges */}
                 <div className="flex items-center gap-2 flex-wrap">
+                  {freshSelectedModel.supports_streaming && (
+                    <Badge variant="outline" className="text-xs">
+                      {t('models.status.nativeStreaming', { defaultValue: 'Native streaming' })}
+                    </Badge>
+                  )}
                   {freshSelectedModel.loaded && (
                     <Badge className="text-xs bg-accent/15 text-accent border-accent/30 hover:bg-accent/15">
                       <CircleCheck className="h-3 w-3 mr-1" />
@@ -712,6 +723,15 @@ export function ModelManagement() {
                     </Badge>
                   )}
                 </div>
+
+                {freshSelectedModel.runtime_available === false && (
+                  <p className="text-xs text-muted-foreground">
+                    {t('models.detail.runtimeMissing', {
+                      defaultValue:
+                        'Install the optional transcription runtime on the server before downloading this model.',
+                    })}
+                  </p>
+                )}
 
                 {/* HuggingFace model card info */}
                 {hfLoading && freshSelectedModel.hf_repo_id && (
@@ -814,6 +834,7 @@ export function ModelManagement() {
                       <Button
                         size="sm"
                         onClick={() => handleDownload(freshSelectedModel.model_name)}
+                        disabled={freshSelectedModel.runtime_available === false}
                         variant="outline"
                         className="flex-1"
                       >
@@ -912,6 +933,7 @@ export function ModelManagement() {
                     <Button
                       size="sm"
                       onClick={() => handleDownload(freshSelectedModel.model_name)}
+                      disabled={freshSelectedModel.runtime_available === false}
                       className="flex-1"
                     >
                       <Download className="h-4 w-4 mr-2" />

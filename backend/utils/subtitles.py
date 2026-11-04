@@ -30,11 +30,43 @@ class TranscriptSegment:
 
 
 @dataclass(frozen=True)
+class TranscriptWord:
+    """An aligned word and its actual acoustic timing, in seconds."""
+
+    word: str
+    start: float
+    end: float
+    probability: float | None = None
+
+
+@dataclass(frozen=True)
 class Transcript:
     text: str
     segments: tuple[TranscriptSegment, ...] = field(default_factory=tuple)
     language: str | None = None
     duration: float = 0.0
+    words: tuple[TranscriptWord, ...] = field(default_factory=tuple)
+
+
+def words_from_dicts(items: Iterable[Mapping], *, duration: float | None = None) -> tuple[TranscriptWord, ...]:
+    """Normalize model-produced word alignments; never fabricate timings from text."""
+    words = []
+    for item in items:
+        word = str(item.get("word", item.get("text", ""))).strip()
+        start = _finite(item.get("start"), float("nan"))
+        end = _finite(item.get("end"), float("nan"))
+        if not math.isfinite(start) or not math.isfinite(end):
+            continue
+        start = max(0.0, start)
+        end = max(start, end)
+        if not word or (duration is not None and start >= duration):
+            continue
+        if duration is not None:
+            end = min(end, duration)
+        probability = item.get("probability")
+        probability = min(1.0, max(0.0, _finite(probability))) if probability is not None else None
+        words.append(TranscriptWord(word, start, end, probability))
+    return tuple(words)
 
 
 def _clean(text: str) -> str:
@@ -147,9 +179,9 @@ def to_vtt(transcript: Transcript) -> str:
     return "\n".join(lines)
 
 
-def to_verbose_json(transcript: Transcript, *, task: str = "transcribe") -> dict:
-    """OpenAI's ``verbose_json`` shape with segment timestamps (no word timestamps)."""
-    return {
+def to_verbose_json(transcript: Transcript, *, task: str = "transcribe", include_words: bool = False) -> dict:
+    """OpenAI's ``verbose_json`` shape with segments and optional actual word alignments."""
+    result = {
         "task": task,
         "language": transcript.language or "unknown",
         "duration": round(_finite(transcript.duration), 3),
@@ -169,6 +201,12 @@ def to_verbose_json(transcript: Transcript, *, task: str = "transcribe") -> dict
             for segment in transcript.segments
         ],
     }
+    if include_words or transcript.words:
+        result["words"] = [
+            {"word": word.word, "start": round(_finite(word.start), 3), "end": round(_finite(word.end), 3)}
+            for word in transcript.words
+        ]
+    return result
 
 
 def dumps_verbose_json(transcript: Transcript) -> str:

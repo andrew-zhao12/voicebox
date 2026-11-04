@@ -333,6 +333,10 @@ export interface ModelProgress {
 export interface ModelStatus {
   model_name: string;
   display_name: string;
+  model_type?: 'tts' | 'stt' | 'llm';
+  engine?: string | null;
+  supports_streaming?: boolean;
+  runtime_available?: boolean | null;
   hf_repo_id?: string; // HuggingFace repository ID
   downloaded: boolean;
   downloading: boolean; // True if download is in progress

@@ -370,6 +370,12 @@ def test_models_and_voices_lists(api):
     assert by_id["kokoro"]["kind"] == "tts"
     assert by_id["kokoro"]["engine"] == "kokoro"
     assert by_id["whisper-turbo"]["kind"] == "stt"
+    assert len(by_id["whisper-base"]["languages"]) == 99
+    assert "yue" in by_id["whisper-turbo"]["languages"]
+    assert by_id["whisper-base"]["supports_word_timestamps"]
+    assert by_id["faster-whisper-base"]["engine"] == "faster_whisper"
+    assert by_id["nemotron-streaming-en-0.6b"]["supports_streaming"]
+    assert not by_id["nemotron-streaming-en-0.6b"]["supports_hotwords"]
     assert {"downloaded", "loaded", "languages", "supports_instruct"} <= set(by_id["kokoro"])
     assert "wav" in body["formats"]
 
@@ -661,7 +667,7 @@ def test_timestamped_transcription_formats(api, monkeypatch):
 
     detailed_calls = []
 
-    async def fake_detailed(file, language, model):
+    async def fake_detailed(file, language, model, **options):
         detailed_calls.append((file.filename, language, model))
         return Transcript(
             text="Hello world. Second part.",
@@ -707,8 +713,8 @@ def test_timestamped_transcription_formats(api, monkeypatch):
         data={"response_format": "verbose_json", "timestamp_granularities[]": "word"},
         headers=bearer(api.key),
     )
-    assert words.status_code == 400
-    assert words.json()["error"]["param"] == "timestamp_granularities"
+    assert words.status_code == 200
+    assert words.json()["words"] == []
 
 
 class ToneBackend:
