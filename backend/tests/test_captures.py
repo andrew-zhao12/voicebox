@@ -15,10 +15,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend import config
+from backend.auth.principal import KeyLimits, Principal, principal_scope
 from backend.database import Base, Capture as DBCapture
 from backend.services import captures
 from backend.services.inference_slots import InferenceBusyError, InferenceSlot
 from backend.services.refinement import RefinementFlags
+from backend.services.speech_settings import update_settings
+from backend.speech_settings_models import SpeechSettingsUpdate
 
 
 class ThreadCall:
@@ -118,6 +121,34 @@ def stored_capture(db, transcript: str = "old transcript") -> DBCapture:
     db.add(row)
     db.commit()
     return row
+
+
+async def test_capture_and_retranscribe_apply_only_the_callers_saved_vocabulary(db, slots, decoder, monkeypatch):
+    calls = []
+
+    async def recognize(path, language, model_size, **options):
+        assert slots.whisper.busy
+        calls.append(options)
+        return "recognized"
+
+    monkeypatch.setattr(
+        captures, "get_whisper_model", lambda: types.SimpleNamespace(model_size="base", transcribe=recognize)
+    )
+    update_settings(db, "first", SpeechSettingsUpdate(stt_prompt="Names", stt_hotwords=["Acme"]))
+    first = Principal("first", "admin", "header", KeyLimits.defaults_for("admin"))
+    other = Principal("other", "admin", "header", KeyLimits.defaults_for("admin"))
+    with principal_scope(first):
+        created = await captures.create_capture(
+            audio_bytes=b"RIFF", filename="clip.wav", source="dictation", language=None, stt_model=None, db=db
+        )
+        await captures.retranscribe_capture(created.id, stt_model=None, language=None, db=db)
+    with principal_scope(other):
+        await captures.retranscribe_capture(created.id, stt_model=None, language=None, db=db)
+    assert calls == [
+        {"prompt": "Names", "hotwords": ["Acme"]},
+        {"prompt": "Names", "hotwords": ["Acme"]},
+        {},
+    ]
 
 
 async def _hold(slot: InferenceSlot) -> tuple[asyncio.Task, asyncio.Event]:

@@ -7,8 +7,9 @@ bundle always imported as a cloned profile.  Manifest 1.1 adds the voice
 type and everything that makes preset, designed and cloned profiles behave
 the same on another server: ``voice_type``, ``preset_engine``,
 ``preset_voice_id``, ``design_prompt``, ``default_engine``, ``effects_chain``
-and ``personality``, plus the profile ``id``, which an import keeps when no
-other profile has it.  ``import_profile_bundle`` reads both versions,
+and ``personality``, plus optional ``pronunciation_replacements`` and the profile
+``id``, which an import keeps when no other profile has it.
+``import_profile_bundle`` reads both versions,
 validates every sample before it writes a row, and lets the caller decide
 what a name clash means (``rename`` for the UI, ``skip`` for boot-time
 seeding, ``replace`` to update a catalog in place).
@@ -46,7 +47,15 @@ OnConflict = Literal["rename", "skip", "replace"]
 ON_CONFLICT_MODES: tuple[str, ...] = ("rename", "skip", "replace")
 
 # Profile columns that travel in a 1.1 manifest, in addition to name/description/language.
-_PROFILE_FIELDS = ("voice_type", "preset_engine", "preset_voice_id", "design_prompt", "default_engine", "personality")
+_PROFILE_FIELDS = (
+    "voice_type",
+    "preset_engine",
+    "preset_voice_id",
+    "design_prompt",
+    "default_engine",
+    "personality",
+    "pronunciation_replacements",
+)
 
 
 @dataclass(frozen=True)
@@ -113,6 +122,7 @@ def export_profile_to_zip(profile_id: str, db: Session) -> bytes:
             "design_prompt": getattr(profile, "design_prompt", None),
             "default_engine": getattr(profile, "default_engine", None),
             "personality": getattr(profile, "personality", None),
+            "pronunciation_replacements": getattr(profile, "pronunciation_replacements", None),
             "effects_chain": _effects_chain_of(profile),
         }
         manifest = {"version": MANIFEST_VERSION, "profile": profile_data, "has_avatar": has_avatar}
@@ -213,6 +223,8 @@ async def import_profile_bundle(file_bytes: bytes, db: Session, *, on_conflict: 
             raise ValueError(f"Invalid JSON in archive: {e}") from e
 
         original_name = str(profile_data.get("name") or "Imported Profile")
+        # Reject malformed saved speech defaults before a replace removes the old voice.
+        _profile_create_from(profile_data, original_name)
         effects_json = _validate_effects_chain(profile_data.get("effects_chain"))
 
         # Samples first: a bad file must not leave a half-imported profile behind.

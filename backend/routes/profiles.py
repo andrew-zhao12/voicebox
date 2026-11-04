@@ -153,6 +153,26 @@ async def delete_profile(
     return {"message": "Profile deleted successfully"}
 
 
+@router.put("/profiles/{profile_id}/pronunciations", response_model=models.VoiceProfileResponse)
+async def update_profile_pronunciations(
+    profile_id: str,
+    data: models.ProfilePronunciationUpdate,
+    db: Session = Depends(get_db),
+):
+    """Edit a voice dictionary as its owner or an administrator."""
+    principal = get_principal()
+    profile = db.query(DBVoiceProfile).filter_by(id=profile_id).first()
+    if profile is None or not profiles.is_visible(profile, principal):
+        raise HTTPException(status_code=404, detail="Profile not found")
+    if not principal.is_admin and profile.owner_key_id != principal.key_id:
+        raise HTTPException(status_code=403, detail="Only the voice owner or an admin may edit pronunciations")
+    profile.pronunciation_replacements = data.pronunciation_replacements
+    profile.updated_at = utcnow()
+    db.commit()
+    db.refresh(profile)
+    return _profile_to_response(profile)
+
+
 SAMPLE_MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 SAMPLE_UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB
 

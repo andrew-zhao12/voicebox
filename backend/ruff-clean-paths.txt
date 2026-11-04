@@ -100,3 +100,8 @@ backend/stt_preflight.py
 backend/tests/test_stt_preflight.py
 backend/tests/container_stt_smoke.py
 scripts/install_stt_runtimes.py
+backend/speech_settings_models.py
+backend/services/speech_settings.py
+backend/routes/speech_settings.py
+backend/tests/test_speech_settings.py
+backend/tests/test_speech_settings_routes.py

@@ -43,6 +43,7 @@ class VoiceProfile(Base):
     preset_voice_id = Column(String, nullable=True)  # e.g. "am_adam" — only for preset
     design_prompt = Column(Text, nullable=True)      # text description — only for designed (reserved)
     default_engine = Column(String, nullable=True)   # auto-selected engine, locked for preset
+    pronunciation_replacements = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -57,6 +58,14 @@ The `voice_type` column discriminates the three flavors:
 | `designed`   | NULL            | NULL              | None (uses `design_prompt`)  |
 
 The `default_engine` column is set automatically when the profile is created. For preset profiles it's locked to the source engine — switching engines at generation time will skip the profile (and the UI auto-switches back when the user clicks a greyed-out card; see the floating generate box and profile grid).
+
+`pronunciation_replacements` stores a bounded literal dictionary. `null` inherits
+the caller's saved dictionary; `{}` disables inherited replacements. A request
+dictionary overrides the profile. Profile updates preserve this field when it
+is omitted, and voice bundles include it. Administrators can edit it through
+normal profile create/update requests; a voice owner can use
+`PUT /profiles/{profile_id}/pronunciations`. See [saved speech settings](/integrations/speech-settings)
+for client defaults, vocabulary settings, limits, and precedence.
 
 ### ProfileSample Table
 

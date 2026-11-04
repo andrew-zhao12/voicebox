@@ -43,6 +43,7 @@ class VoiceProfile(Base):
     # says and how, orthogonal to how it sounds (handled by the preset /
     # cloning metadata above).
     personality = Column(Text, nullable=True)
+    pronunciation_replacements = Column(JSON, nullable=True)
     # The API key that created the profile through /v1/voices; NULL = shared
     # (created by an admin), visible to every key.
     owner_key_id = Column(String, nullable=True)
@@ -60,6 +61,17 @@ class ProfileSample(Base):
     profile_id = Column(String, ForeignKey("profiles.id"), nullable=False)
     audio_path = Column(String, nullable=False)
     reference_text = Column(Text, nullable=False)
+
+
+class SpeechSettings(Base):
+    """Reusable speech defaults scoped to one authenticated API-key identity."""
+
+    __tablename__ = "speech_settings"
+
+    key_id = Column(String, primary_key=True)
+    pronunciation_replacements = Column(JSON, nullable=False, default=dict)
+    stt_prompt = Column(Text, nullable=False, default="")
+    stt_hotwords = Column(JSON, nullable=False, default=list)
 
 
 class Generation(Base):

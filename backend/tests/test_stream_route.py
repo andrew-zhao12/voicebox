@@ -104,6 +104,9 @@ class FakeDb:
     def query(self, *_args):
         return self
 
+    def get(self, *_args):
+        return None
+
     def filter_by(self, **_kwargs):
         return self
 

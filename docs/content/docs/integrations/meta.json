@@ -4,6 +4,7 @@
   "pages": [
     "livekit",
     "pipecat",
-    "speech-stream"
+    "speech-stream",
+    "speech-settings"
   ]
 }

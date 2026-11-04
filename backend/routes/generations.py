@@ -111,10 +111,12 @@ async def generate_speech(
         await ensure_model_cached_or_raise(engine, model_size or "default")
 
     text, source = await _rewrite_for_personality(data, profile)
+    from ..services.speech_settings import resolve_pronunciations
     from ..utils.speech_text import apply_pronunciations
 
     try:
-        text = apply_pronunciations(text, data.pronunciation_replacements)
+        replacements = resolve_pronunciations(db, profile, principal, data.pronunciation_replacements)
+        text = apply_pronunciations(text, replacements)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     charge("tts_chars", len(text))

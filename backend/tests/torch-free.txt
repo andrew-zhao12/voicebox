@@ -35,3 +35,4 @@ backend/tests/test_model_stt_lifecycle.py
 backend/tests/test_optional_stt_backends.py
 backend/tests/test_speech_text.py
 backend/tests/test_stt_preflight.py
+backend/tests/test_speech_settings.py

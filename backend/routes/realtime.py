@@ -157,7 +157,11 @@ async def transcribe_pcm(audio: np.ndarray, language: str | None, model: str | N
         tmp_path = tmp.name
     try:
         await asyncio.to_thread(sf.write, tmp_path, audio, rt.TARGET_RATE, subtype="PCM_16")
-        transcript = await transcribe_file_detailed(tmp_path, language, whisper_size(model), **options)
+        # A live session already snapshots caller defaults at connection time.
+        # Do not reintroduce saved hints after an explicit session-level clear.
+        transcript = await transcribe_file_detailed(
+            tmp_path, language, whisper_size(model), use_saved_settings=False, **options
+        )
         return transcript if options.get("word_timestamps") else transcript.text
     finally:
         Path(tmp_path).unlink(missing_ok=True)
@@ -200,6 +204,18 @@ def _flush_timeout_s() -> float:
     return FLUSH_TIMEOUT_S
 
 
+def _validate_recognition_options(config: rt.SessionConfig) -> None:
+    """Reject unsupported effective options before any audio reaches a recognizer."""
+    if config.prompt or config.hotwords or config.word_timestamps:
+        try:
+            _backend, _size, cfg = transcribe.resolve_stt(config.model)
+            transcribe.validate_options(
+                cfg, prompt=config.prompt, hotwords=config.hotwords, word_timestamps=config.word_timestamps
+            )
+        except ValueError as exc:
+            raise rt.ProtocolError("unsupported_value", str(exc)) from exc
+
+
 class _Connection:
     """One WebSocket session: reader, receiver, worker and sender tasks around a ``TranscriptionSession``."""
 
@@ -213,6 +229,7 @@ class _Connection:
         self.settled.set()
         self.finishing = False  # the server is ending the session: partials stop
         self.native = NativeTranscriber()
+        self._options_checked = False
 
     def emit(self, events: list[dict]) -> None:
         for event in events:
@@ -302,15 +319,9 @@ class _Connection:
             config = rt.SessionConfig.from_update(self.session.config, payload)
             if config.model != self.session.config.model:
                 check_model(config.model)
-            if config.prompt or config.hotwords or config.word_timestamps:
-                try:
-                    _backend, _size, cfg = transcribe.resolve_stt(config.model)
-                    transcribe.validate_options(
-                        cfg, prompt=config.prompt, hotwords=config.hotwords, word_timestamps=config.word_timestamps
-                    )
-                except ValueError as e:
-                    raise rt.ProtocolError("unsupported_value", str(e)) from e
+            _validate_recognition_options(config)
             self.emit(self.session.update(config))
+            self._options_checked = True
         elif kind == "input_audio_buffer.append":
             audio = payload.get("audio")
             if not isinstance(audio, str):
@@ -325,6 +336,11 @@ class _Connection:
             raise rt.ProtocolError("unknown_event", f"unknown event type {kind!r}")
 
     def _append(self, data: bytes) -> None:
+        if not self._options_checked:
+            # Let the client override saved defaults before checking model
+            # capabilities, but never buffer audio under unsupported settings.
+            _validate_recognition_options(self.session.config)
+            self._options_checked = True
         charge("uploads_bytes", len(data))
         self.emit(self.session.append(data))
 
@@ -447,7 +463,12 @@ async def _serve(websocket: WebSocket, dialect: rt.Dialect) -> None:
         await _refuse(websocket, dialect, refusal)
         return
 
-    session = rt.TranscriptionSession(rt.SessionConfig(model=model), dialect=dialect)
+    from ..services.speech_settings import resolve_transcription_hints
+
+    prompt, hotwords = resolve_transcription_hints(None, None, principal=principal)
+    session = rt.TranscriptionSession(
+        rt.SessionConfig(model=model, prompt=prompt, hotwords=tuple(hotwords)), dialect=dialect
+    )
     connection = _Connection(websocket, session)
     live_sessions.reserve(
         "transcription", principal.key_id, per_key=principal.limits.max_realtime_sessions, max_global=max_sessions()

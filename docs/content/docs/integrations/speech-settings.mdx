@@ -1,0 +1,116 @@
+---
+title: "Saved speech settings"
+description: "Reusable pronunciation dictionaries and recognition vocabulary scoped to a voice or API key"
+---
+
+Save pronunciation and recognition defaults once for each API key. They apply to
+HTTP speech/transcription and the LiveKit/Pipecat integrations, including clients
+that cannot send Voicebox-specific request fields. Each key reads and edits only
+its own settings; administrators can manage any existing key.
+
+## Save or export client defaults
+
+`GET /speech/settings` returns this JSON document for the authenticated caller:
+
+```json
+{
+  "pronunciation_replacements": {"API": "A P I", "Voicebox": "Voice box"},
+  "stt_prompt": "Names and terminology used in this conversation.",
+  "stt_hotwords": ["Voicebox", "Pipecat"]
+}
+```
+
+Send the document back with `PUT /speech/settings` to import it. PUT also accepts
+partial updates: omitted fields remain unchanged, while `null` resets one field
+to its empty default (`{}`, `""`, or `[]`). An empty object updates nothing.
+Unknown fields and oversized values are rejected before anything is saved.
+
+```bash
+curl "$VOICEBOX_URL/speech/settings" \
+  -H "Authorization: Bearer $VOICEBOX_CLIENT_KEY" > speech-settings.json
+
+curl -X PUT "$VOICEBOX_URL/speech/settings" \
+  -H "Authorization: Bearer $VOICEBOX_CLIENT_KEY" \
+  -H 'Content-Type: application/json' --data-binary @speech-settings.json
+```
+
+Administrators use `GET /speech/settings/{key_id}` and
+`PUT /speech/settings/{key_id}` to manage a key listed by `GET /auth/keys`.
+Unknown and revoked keys return 404. The Settings → Speech screen provides the
+same editing and JSON import/export controls. Settings belong to the server's
+data directory and are not synchronized across replicas.
+
+## Pronunciation precedence
+
+Voice profiles have an optional `pronunciation_replacements` field. It travels
+with profile exports, imports, and boot-time voice bundles. Existing profiles
+default to `null` and keep their previous behavior until settings are saved.
+
+The entire dictionary is selected in this order; dictionaries are not merged:
+
+1. A non-null dictionary on the speech request or speech WebSocket session.
+2. A non-null dictionary saved on the selected voice profile.
+3. The authenticated API key's saved dictionary.
+
+`null` or omission inherits the next level. `{}` explicitly disables
+replacements. A built-in preset addressed directly, such as `af_heart`, has no
+profile defaults and therefore inherits the caller's dictionary.
+
+Administrators may set the field in profile create/update requests. The
+dedicated `PUT /profiles/{profile_id}/pronunciations` endpoint accepts:
+
+```json
+{"pronunciation_replacements": {"API": "A P I"}}
+```
+
+The owner of a client-created voice may also use this endpoint. Clients cannot
+edit shared voices or another client's voices. Sending `null` restores
+inheritance; the field must be present in this dedicated endpoint's body.
+
+Replacements are literal, case-sensitive whole terms. Longest matches win, and
+replacement output is not processed again. Substitution happens once after any
+personality rewrite, before synthesis and character-quota charging. Every
+WebSocket flush resolves its dictionary when synthesis starts; an in-flight
+generation keeps the already resolved text. Matches do not span phrase flushes.
+
+Limits are 100 entries, 128 characters per key, 256 per value, and 8192 combined
+characters. Expanded speech must remain within the existing 50000-character
+generation limit.
+
+## Recognition vocabulary
+
+HTTP transcription resolves `prompt` and `hotwords` independently. Missing or
+null values inherit the key's saved `stt_prompt` and `stt_hotwords`; explicit
+values replace the corresponding default. For multipart forms, `prompt=""`
+clears the prompt and one empty `hotwords` field clears the vocabulary list.
+The latter is necessary because omitting a repeated form field cannot encode an
+explicit empty list.
+
+App dictation, saved captures, and capture retranscription also use the
+authenticated caller's saved recognition hints. Each operation snapshots the
+settings before starting Whisper inference.
+
+Realtime transcription snapshots defaults when the socket connects. Subsequent
+settings edits affect new connections. A `session.update` can override or clear
+them for the current connection:
+
+```json
+{
+  "type": "session.update",
+  "session": {
+    "input_audio_transcription": {"prompt": "", "hotwords": []}
+  }
+}
+```
+
+The GA shape at `session.audio.input.transcription` accepts the same fields.
+Clearing hints does not reload saved values on the next utterance. Limits are
+4096 prompt characters, 100 vocabulary terms, 100 characters per term, and 4096
+combined vocabulary characters.
+
+Model capabilities still apply. Whisper and faster-whisper accept hints;
+Nemotron does not. Unsupported saved hints produce the same explicit error as
+unsupported request hints. A realtime connection can clear inherited hints in
+its first session update before sending audio, including when its URL selects
+Nemotron. The server validates the effective settings before accepting audio.
+Hints guide recognition; they do not force words into the transcript.

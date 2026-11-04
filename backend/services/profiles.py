@@ -193,6 +193,7 @@ def _profile_to_response(
         design_prompt=getattr(profile, "design_prompt", None),
         default_engine=getattr(profile, "default_engine", None),
         personality=getattr(profile, "personality", None),
+        pronunciation_replacements=getattr(profile, "pronunciation_replacements", None),
         owner_key_id=getattr(profile, "owner_key_id", None),
         generation_count=generation_count,
         sample_count=sample_count,
@@ -328,6 +329,7 @@ async def create_profile(
         design_prompt=data.design_prompt,
         default_engine=default_engine,
         personality=data.personality,
+        pronunciation_replacements=data.pronunciation_replacements,
         owner_key_id=owner_key_id,
         created_at=utcnow(),
         updated_at=utcnow(),
@@ -554,6 +556,8 @@ async def update_profile(
     profile.description = data.description
     profile.language = data.language
     profile.personality = data.personality
+    if "pronunciation_replacements" in data.model_fields_set:
+        profile.pronunciation_replacements = data.pronunciation_replacements
     if data.default_engine is not None:
         profile.default_engine = data.default_engine or None  # empty string → NULL
     profile.updated_at = utcnow()

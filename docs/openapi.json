@@ -526,6 +526,56 @@
         }
       }
     },
+    "/profiles/{profile_id}/pronunciations": {
+      "put": {
+        "summary": "Update Profile Pronunciations",
+        "description": "Edit a voice dictionary as its owner or an administrator.",
+        "operationId": "update_profile_pronunciations_profiles__profile_id__pronunciations_put",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Profile Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfilePronunciationUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VoiceProfileResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/profiles/{profile_id}/samples": {
       "post": {
         "summary": "Add Profile Sample",
@@ -4827,6 +4877,162 @@
           }
         }
       }
+    },
+    "/speech/settings": {
+      "get": {
+        "tags": [
+          "speech settings"
+        ],
+        "summary": "Get Own Settings",
+        "description": "Read or export the authenticated caller's reusable speech settings.",
+        "operationId": "get_own_settings_speech_settings_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpeechSettingsResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "speech settings"
+        ],
+        "summary": "Update Own Settings",
+        "description": "Update supplied fields, or import a previously exported settings document.",
+        "operationId": "update_own_settings_speech_settings_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpeechSettingsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpeechSettingsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/speech/settings/{key_id}": {
+      "get": {
+        "tags": [
+          "speech settings"
+        ],
+        "summary": "Get Key Settings",
+        "description": "Read one existing API key's settings as an administrator.",
+        "operationId": "get_key_settings_speech_settings__key_id__get",
+        "parameters": [
+          {
+            "name": "key_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Key Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpeechSettingsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "speech settings"
+        ],
+        "summary": "Update Key Settings",
+        "description": "Update one existing API key; deleted or unknown identities cannot create settings rows.",
+        "operationId": "update_key_settings_speech_settings__key_id__put",
+        "parameters": [
+          {
+            "name": "key_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Key Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpeechSettingsUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpeechSettingsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -7838,6 +8044,30 @@
         "title": "ProfileEffectsUpdate",
         "description": "Request to update the default effects chain on a profile."
       },
+      "ProfilePronunciationUpdate": {
+        "properties": {
+          "pronunciation_replacements": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pronunciation Replacements"
+          }
+        },
+        "type": "object",
+        "required": [
+          "pronunciation_replacements"
+        ],
+        "title": "ProfilePronunciationUpdate",
+        "description": "Replace one voice's dictionary; null resumes inherited client defaults."
+      },
       "ProfileSampleResponse": {
         "properties": {
           "id": {
@@ -8028,6 +8258,81 @@
         ],
         "title": "SpeakRequest",
         "description": "Body for POST /speak \u2014 non-MCP REST surface that mirrors voicebox.speak."
+      },
+      "SpeechSettingsResponse": {
+        "properties": {
+          "pronunciation_replacements": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Pronunciation Replacements"
+          },
+          "stt_prompt": {
+            "type": "string",
+            "title": "Stt Prompt",
+            "default": ""
+          },
+          "stt_hotwords": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Stt Hotwords"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "SpeechSettingsResponse",
+        "description": "A JSON settings document that can be exported and PUT back unchanged."
+      },
+      "SpeechSettingsUpdate": {
+        "properties": {
+          "pronunciation_replacements": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pronunciation Replacements"
+          },
+          "stt_prompt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 4096
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stt Prompt"
+          },
+          "stt_hotwords": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stt Hotwords"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "SpeechSettingsUpdate",
+        "description": "Omitted fields retain their values; null resets one field to its empty default."
       },
       "StoryCreate": {
         "properties": {
@@ -8837,6 +9142,21 @@
               }
             ],
             "title": "Personality"
+          },
+          "pronunciation_replacements": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pronunciation Replacements",
+            "description": "Saved pronunciation dictionary; null inherits caller settings, {} disables them"
           }
         },
         "type": "object",
@@ -8955,6 +9275,20 @@
               }
             ],
             "title": "Personality"
+          },
+          "pronunciation_replacements": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pronunciation Replacements"
           },
           "owner_key_id": {
             "anyOf": [

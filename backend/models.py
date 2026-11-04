@@ -32,6 +32,15 @@ class VoiceProfileCreate(BaseModel):
     design_prompt: Optional[str] = Field(None, max_length=2000)
     default_engine: Optional[str] = Field(None, max_length=50)
     personality: Optional[str] = Field(None, max_length=2000)
+    pronunciation_replacements: dict[str, str] | None = Field(
+        None, description="Saved pronunciation dictionary; null inherits caller settings, {} disables them"
+    )
+
+    @field_validator("pronunciation_replacements")
+    @classmethod
+    def check_pronunciations(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        """Validate saved substitutions with the same limits as speech requests."""
+        return validate_pronunciations(value)
 
 
 class VoiceProfileResponse(BaseModel):
@@ -49,6 +58,7 @@ class VoiceProfileResponse(BaseModel):
     design_prompt: Optional[str] = None
     default_engine: Optional[str] = None
     personality: Optional[str] = None
+    pronunciation_replacements: dict[str, str] | None = None
     owner_key_id: Optional[str] = None
     generation_count: int = 0
     sample_count: int = 0
@@ -95,6 +105,12 @@ class PronunciationRequest(BaseModel):
     def check_pronunciations(cls, value: dict[str, str] | None) -> dict[str, str] | None:
         """Bound dictionary size and replacement expansion inputs."""
         return validate_pronunciations(value)
+
+
+class ProfilePronunciationUpdate(PronunciationRequest):
+    """Replace one voice's dictionary; null resumes inherited client defaults."""
+
+    pronunciation_replacements: dict[str, str] | None = Field(...)
 
 
 class GenerationRequest(PronunciationRequest):

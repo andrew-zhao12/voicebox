@@ -26,6 +26,7 @@ from ..database import Capture as DBCapture
 from ..models import CaptureResponse, RefinementFlagsModel
 from .inference_slots import llm_slot, whisper_slot
 from .refinement import RefinementFlags, refine_transcript
+from .speech_settings import resolve_transcription_hints
 from .transcribe import get_whisper_model
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,12 @@ VALID_SOURCES = {"dictation", "recording", "file"}
 # this set has to go through librosa for decode + a soundfile transcode
 # before whisper sees it.
 WHISPER_NATIVE_FORMATS = (".wav", ".mp3", ".flac", ".ogg")
+
+
+def _transcription_options(db: Session) -> dict:
+    """Snapshot caller vocabulary before handing inference to its independent slot."""
+    prompt, hotwords = resolve_transcription_hints(None, None, db=db)
+    return {name: value for name, value in (("prompt", prompt), ("hotwords", hotwords)) if value}
 
 
 def _to_response(row: DBCapture) -> CaptureResponse:
@@ -131,7 +138,8 @@ async def create_capture(
 
         whisper = get_whisper_model()
         resolved_stt = stt_model or whisper.model_size
-        transcript = await whisper_slot.run(whisper.transcribe, str(audio_path), language, resolved_stt)
+        options = _transcription_options(db)
+        transcript = await whisper_slot.run(whisper.transcribe, str(audio_path), language, resolved_stt, **options)
 
         row = DBCapture(
             id=capture_id,
@@ -234,7 +242,8 @@ async def retranscribe_capture(
 
     whisper = get_whisper_model()
     resolved_stt = stt_model or whisper.model_size
-    transcript = await whisper_slot.run(whisper.transcribe, str(resolved), language, resolved_stt)
+    options = _transcription_options(db)
+    transcript = await whisper_slot.run(whisper.transcribe, str(resolved), language, resolved_stt, **options)
 
     row.transcript_raw = transcript
     row.stt_model = resolved_stt

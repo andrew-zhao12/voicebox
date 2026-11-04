@@ -620,9 +620,11 @@ async def open_stream(
 
     text, _source = await rewrite_for_personality(data, profile)
     from ..utils.speech_text import apply_pronunciations
+    from .speech_settings import resolve_pronunciations
 
     try:
-        text = apply_pronunciations(text, data.pronunciation_replacements)
+        replacements = resolve_pronunciations(db, profile, principal, data.pronunciation_replacements)
+        text = apply_pronunciations(text, replacements)
     except ValueError as e:
         raise GenerationRefused(400, str(e), code="invalid_value", param="pronunciation_replacements") from e
     charge("tts_chars", len(text))

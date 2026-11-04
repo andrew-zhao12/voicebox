@@ -225,6 +225,7 @@ TRANSCRIPTION_FORMATS = ("json", "text", "verbose_json", "srt", "vtt")
 
 @router.post("/audio/transcriptions")
 async def create_transcription(
+    request: Request,
     file: UploadFile = File(...),
     model: str = Form("whisper-1"),
     language: str | None = Form(None),
@@ -264,10 +265,13 @@ async def create_transcription(
             code="unsupported_value",
             param="response_format",
         )
+    from .transcription import explicit_form_hints
+
+    prompt, hotwords = await explicit_form_hints(request, prompt, hotwords)
     options = {}
-    if prompt:
+    if prompt is not None:
         options["prompt"] = prompt
-    if hotwords:
+    if hotwords is not None:
         options["hotwords"] = hotwords
     if word_timestamps:
         options["word_timestamps"] = True

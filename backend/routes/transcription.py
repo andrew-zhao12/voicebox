@@ -6,7 +6,7 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 
 from .. import models
 from ..auth import get_principal
@@ -28,6 +28,7 @@ ALLOWED_AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".ogg", ".flac", ".aac", ".webm", 
 
 @router.post("/transcribe", response_model=models.TranscriptionResponse)
 async def transcribe_audio(
+    request: Request,
     file: UploadFile = File(...),
     language: str | None = Form(None),
     model: str | None = Form(None),
@@ -35,8 +36,22 @@ async def transcribe_audio(
     hotwords: list[str] | None = Form(None),
 ):
     """Transcribe audio file to text."""
+    prompt, hotwords = await explicit_form_hints(request, prompt, hotwords)
     text, duration = await transcribe_upload(file, language, model, prompt=prompt, hotwords=hotwords)
     return models.TranscriptionResponse(text=text, duration=duration)
+
+
+async def explicit_form_hints(
+    request: Request, prompt: str | None, hotwords: list[str] | None
+) -> tuple[str | None, list[str] | None]:
+    """Retain explicit empty form values that FastAPI otherwise converts to missing fields."""
+    form = await request.form()
+    if "prompt" in form and prompt is None:
+        prompt = ""
+    # An empty repeated form field is the multipart representation of an empty list.
+    if "hotwords" in form and (hotwords is None or hotwords == [""]):
+        hotwords = []
+    return prompt, hotwords
 
 
 async def _save_upload(file: UploadFile) -> str:
@@ -95,13 +110,17 @@ async def _run_whisper(
     prompt: str | None = None,
     hotwords: list[str] | None = None,
     word_timestamps: bool = False,
+    use_saved_settings: bool = True,
 ):
+    from ..services.speech_settings import resolve_transcription_hints
     from ..utils.audio import load_audio, save_audio
 
     stt_path = None
     inference_owned = False
     try:
         try:
+            if use_saved_settings:
+                prompt, hotwords = resolve_transcription_hints(prompt, hotwords)
             backend, size, cfg = transcribe.resolve_stt(model)
             transcribe.validate_options(cfg, prompt=prompt, hotwords=hotwords, word_timestamps=word_timestamps)
         except ValueError as e:

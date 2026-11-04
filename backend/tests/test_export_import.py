@@ -71,6 +71,7 @@ async def test_round_trip_keeps_every_field_of_a_preset_profile(db):
             preset_engine="kokoro",
             preset_voice_id="af_heart",
             personality="Speaks warmly.",
+            pronunciation_replacements={"API": "A P I"},
         ),
         db,
     )
@@ -83,6 +84,7 @@ async def test_round_trip_keeps_every_field_of_a_preset_profile(db):
         manifest = json.loads(zip_file.read("manifest.json"))
     assert manifest["version"] == "1.1"
     assert manifest["profile"]["preset_voice_id"] == "af_heart"
+    assert manifest["profile"]["pronunciation_replacements"] == {"API": "A P I"}
     assert manifest["profile"]["effects_chain"][0]["type"] == "reverb"
 
     await profiles.delete_profile(created.id, db)
@@ -96,6 +98,7 @@ async def test_round_trip_keeps_every_field_of_a_preset_profile(db):
     assert imported.default_engine == "kokoro"
     assert imported.description == "Warm narrator"
     assert imported.personality == "Speaks warmly."
+    assert imported.pronunciation_replacements == {"API": "A P I"}
     assert [e.type for e in imported.effects_chain] == ["reverb"]
     assert imported.id == created.id  # the id travels with the bundle when it is free
 
